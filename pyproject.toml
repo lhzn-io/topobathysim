@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "topobathysim"
 version = "0.1.0"
-description = "The definitive high-performance fusion engine that seamlessly merges global bathymetry and sub-meter lidar into unified, simulation-ready digital worlds."
+description = "A high-performance engine fusing global bathymetry and sub-meter lidar into unified, simulation-ready digital worlds."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

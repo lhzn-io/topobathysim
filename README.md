@@ -79,21 +79,21 @@ TopoBathySim acts as a central broker between simulation clients (Game Engines, 
 
 ```mermaid
 graph TD
-    Client[Simulation Client] -->|Get Tile (XYZ)| API[TopoBathyServe]
+    Client["Simulation Client"] -->|"Get Tile (XYZ)"| API[TopoBathyServe]
     API --> Manager[BathyManager]
 
-    subgraph Data Sources
-        L[USGS Lidar]
-        B[NOAA BlueTopo]
-        G[GEBCO 2025]
+    subgraph "Data Sources"
+        L["USGS Lidar"]
+        B["NOAA BlueTopo"]
+        G["GEBCO 2025"]
     end
 
-    Manager -->|Fusion| Fusion[Fusion Engine]
+    Manager -->|Fusion| Fusion["Fusion Engine"]
     L --> Fusion
     B --> Fusion
     G --> Fusion
 
-    Fusion -->|Fused DEM| Cache[Disk Cache]
+    Fusion -->|"Fused DEM"| Cache["Disk Cache"]
     Cache --> API
 ```
 
