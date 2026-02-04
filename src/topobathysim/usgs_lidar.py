@@ -56,7 +56,7 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
         return None
 
 
-class LidarProvider:
+class UsgsLidarProvider:
     """
     Fetches and processes Lidar data from NOAA LAZ files.
     Filters for 'Bare Earth' (Class 2) and rasterizes to GeoTIFF.

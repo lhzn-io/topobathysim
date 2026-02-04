@@ -105,6 +105,11 @@ graph TD
 
 This project uses data and methodologies from:
 
+- **Data Sources**: For a complete list of specific surveys and citatations (e.g. Long Island Sound, BlueTopo), see [DATA_SOURCES.md](DATA_SOURCES.md).
+
+- **Research**:
+  - *Continuously Updated Digital Elevation Models (CUDEMs) to
+Support Coastal Inundation Modeling*. <https://doi.org/10.3390/rs15061702>
 - **csdms/bmi-topography**: This library relies heavily on the `bmi-topography` package for standardized data fetching. A special thanks to the CSDMS community.
   > **Note**: This project has a potential fragility regarding `bmi-topography` versions. Please ensure compatibility when upgrading.
 - **USGS 3DEP & CoNED**: Adaptive Topobathymetric Fusion logic.

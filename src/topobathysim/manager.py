@@ -3,10 +3,12 @@ from pathlib import Path
 
 import xarray as xr
 
-from .bluetopo import BlueTopoProvider
-from .gebco import GEBCO2025
-from .land import LandProvider
-from .lidar import LidarProvider
+from .fusion import FusionEngine
+from .gebco_2025 import GEBCO2025Provider
+from .noaa_bluetopo import NoaaBlueTopoProvider
+from .noaa_topobathy import NoaaTopobathyProvider
+from .usgs_3dep import Usgs3DepProvider
+from .usgs_lidar import UsgsLidarProvider
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ class BathyManager:
         self,
         cache_dir: str = "~/.cache/topobathysim",
         use_blue_topo: bool = True,
+        use_topobathy: bool = True,
         use_lidar: bool = True,
         use_land: bool = True,
         offline_mode: bool = False,
@@ -40,28 +43,32 @@ class BathyManager:
         self.use_lidar = use_lidar
         self.use_land = use_land
 
-        self.gebco: GEBCO2025
-        self.blue_topo: BlueTopoProvider | None = None
-        self.lidar: LidarProvider | None = None
-        self.land: LandProvider | None = None
+        self.gebco: GEBCO2025Provider
+        self.blue_topo: NoaaBlueTopoProvider | None = None
+        self.topobathy: NoaaTopobathyProvider | None = None
+        self.lidar: UsgsLidarProvider | None = None
+        self.land: Usgs3DepProvider | None = None
 
         # Initialize providers
         # GEBCO is always fallback
         # Note: GEBCO currently lacks offline_mode flag in its init, will ignoring for now or TODO
-        self.gebco = GEBCO2025(cache_dir=str(self.cache_dir))
+        self.gebco = GEBCO2025Provider(cache_dir=str(self.cache_dir))
 
         if use_blue_topo:
-            self.blue_topo = BlueTopoProvider(cache_dir=str(self.cache_dir))
+            self.blue_topo = NoaaBlueTopoProvider(cache_dir=str(self.cache_dir))
+
+        if use_topobathy:
+            self.topobathy = NoaaTopobathyProvider(cache_dir=str(self.cache_dir))
 
         if use_lidar:
-            self.lidar = LidarProvider(cache_dir=str(self.cache_dir), offline_mode=offline_mode)
+            self.lidar = UsgsLidarProvider(cache_dir=str(self.cache_dir), offline_mode=offline_mode)
 
         if use_land:
-            # LandProvider usually just fetches, assuming we pass offline mode if supported
-            # For now just init. LandProvider doesn't take offline_mode yet?
-            # Let's check LandProvider init. It usually takes cache_dir.
-            # We should update LandProvider too if we want true offline support.
-            self.land = LandProvider(cache_dir=str(self.cache_dir))
+            # Usgs3DepProvider usually just fetches, assuming we pass offline mode if supported
+            # For now just init. Usgs3DepProvider doesn't take offline_mode yet?
+            # Let's check Usgs3DepProvider init. It usually takes cache_dir.
+            # We should update Usgs3DepProvider too if we want true offline support.
+            self.land = Usgs3DepProvider(cache_dir=str(self.cache_dir))
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """
@@ -112,7 +119,7 @@ class BathyManager:
         # We re-instantiate or explicitly set properties if supported.
         # Topography usually expects init params.
         # For this agent/PoC, we create a new instance or assume the manager handles a 'primary' AOI.
-        self.gebco = GEBCO2025(north=north, south=south, west=west, east=east)
+        self.gebco = GEBCO2025Provider(north=north, south=south, west=west, east=east)
         self.gebco.fetch()
 
     def get_grid(self, south: float, north: float, west: float, east: float) -> "xr.DataArray":
@@ -120,8 +127,18 @@ class BathyManager:
         Returns the best available bathymetry grid for the bbox.
         Prioritizes BlueTopo.
         """
+        # 0. Fetch Topobathy Lidar (Tier 0 - Intertidal/Land-Sea)
+        topobathy_da = None
+        if self.topobathy:
+            # Try to fetch topobathy logic
+            try:
+                topobathy_da = self.topobathy.get_grid(west, south, east, north)
+            except Exception as e:
+                logger.warning(f"Topobathy Lidar Fetch Failed: {e}")
+
         # 1. Try BlueTopo
         # Check for intersecting tiles
+        base_da = None
         tile_ids = []
         if self.blue_topo:
             tile_ids = self.blue_topo.resolve_tiles_in_bbox(west, south, east, north)
@@ -130,14 +147,6 @@ class BathyManager:
             # Load all tiles
             das = []
             for tid in tile_ids:
-                # We load the FULL tile first (no clip) to ensure we have data to merge
-                # But load_tile_as_da clips by default.
-                # We should probably load full tiles and then merge, then clip.
-                # Or pass a larger bbox?
-                # Actually, load_tile_as_da's clip is safe if we merge later?
-                # No, if we clip individually to the target BBOX, we get pieces.
-                # Merging pieces of the target bbox is fine.
-                # So we can reuse load_tile_as_da.
                 d = self.blue_topo.load_tile_as_da(tid, (west, south, east, north))
                 if d is not None:
                     das.append(d)
@@ -147,36 +156,50 @@ class BathyManager:
                     d = das[0]
                     if not d.rio.crs:
                         d.rio.write_crs("EPSG:4326", inplace=True)
-                    return d
+                    base_da = d
+                else:
+                    try:
+                        from rioxarray.merge import merge_arrays
 
+                        merged_da = merge_arrays(das)
+                        if not merged_da.rio.crs:
+                            merged_da.rio.write_crs("EPSG:4326", inplace=True)
+                        base_da = merged_da
+                    except Exception as e:
+                        logger.warning(f"BlueTopo Merge Failed: {e}")
+
+        # 2. Fallback GEBCO if BlueTopo missing
+        if base_da is None:
+            g = GEBCO2025Provider(south=south, north=north, west=west, east=east)
+            da = g.fetch()
+            if "lat" in da.coords:
+                da = da.rename({"lat": "y", "lon": "x"})
+
+            # Ensure CRS for rioxarray operations
+            if da.rio.crs is None:
+                # Force 4326 for GEBCO
                 try:
-                    from rioxarray.merge import merge_arrays
+                    da.rio.write_crs("EPSG:4326", inplace=True)
+                except Exception:
+                    da.rio.write_crs("EPSG:4326", inplace=True)
+            base_da = da
 
-                    merged_da = merge_arrays(das)
-                    # Merge returns a DataArray.
-                    # It might lose CRS or Attributes, so we re-ensure?
-                    if not merged_da.rio.crs:
-                        merged_da.rio.write_crs("EPSG:4326", inplace=True)
-                    return merged_da
+        # 3. Fusion: Topobathy > Base
+        if topobathy_da is not None and base_da is not None:
+            # Ensure Topobathy is in same CRS as Base
+            if topobathy_da.rio.crs != base_da.rio.crs:
+                try:
+                    topobathy_da = topobathy_da.rio.reproject_match(base_da)
                 except Exception as e:
-                    logger.warning(f"BlueTopo Merge Failed: {e}")
-                    # Fallback to GEBCO
-                    pass
+                    logger.warning(f"Reprojection failed for Topobathy Lidar: {e}")
+                    return base_da
 
-        # 2. Fallback GEBCO
-        # Re-init GEBCO for this bbox?
-        g = GEBCO2025(south=south, north=north, west=west, east=east)
-        da = g.fetch()
-        if "lat" in da.coords:
-            da = da.rename({"lat": "y", "lon": "x"})
-
-        # Ensure CRS for rioxarray operations
-        # Use simple assignment if write_crs fails or is ambiguous
-        if da.rio.crs is None:
-            # Force 4326 for GEBCO
+            engine = FusionEngine()
             try:
-                da.rio.write_crs("EPSG:4326", inplace=True)
-            except Exception:
-                da.rio.write_crs("EPSG:4326", inplace=True)
+                fused = engine.fuse_seamline(lidar_da=topobathy_da, bathy_da=base_da)
+                return fused
+            except Exception as e:
+                logger.error(f"Fusion Failed: {e}")
+                return base_da
 
-        return da
+        return base_da

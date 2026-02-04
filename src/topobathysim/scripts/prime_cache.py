@@ -62,10 +62,10 @@ def get_bluetopo_coverage(west: float, south: float, east: float, north: float) 
         from shapely.geometry import box
         from shapely.ops import unary_union
 
-        from topobathysim.bluetopo import BlueTopoProvider
+        from topobathysim.noaa_bluetopo import NoaaBlueTopoProvider
 
         print("Loading BlueTopo Scheme for guided priming...")
-        bt = BlueTopoProvider()
+        bt = NoaaBlueTopoProvider()
         bt._ensure_scheme_loaded()
 
         if bt._gdf is None:

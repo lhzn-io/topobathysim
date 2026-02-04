@@ -7,7 +7,7 @@ from bmi_topography import Topography
 logger = logging.getLogger(__name__)
 
 
-class GEBCO2025(Topography):
+class GEBCO2025Provider(Topography):
     """
     BMI-compliant interface for GEBCO 2025 data.
     Wraps bmi-topography to fetch from OPeNDAP with specific corrections.

@@ -14,7 +14,7 @@ from .vdatum import VDatumResolver
 logger = logging.getLogger(__name__)
 
 
-class BlueTopoProvider:
+class NoaaBlueTopoProvider:
     """
     Provider for NOAA BlueTopo High-Resolution Bathymetry.
     Accesses Cloud Optimized GeoTIFFs (COGs) from AWS S3.

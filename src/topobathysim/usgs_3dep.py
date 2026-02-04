@@ -25,7 +25,7 @@ def _query_land_collection(bbox: tuple[float, float, float, float], collection_i
     stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
     try:
-        logger.debug(f"LandProvider querying (Cached) {collection_id} for {bbox}")
+        logger.debug(f"Usgs3DepProvider querying (Cached) {collection_id} for {bbox}")
         catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
         search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
         items = list(search.items())
@@ -55,7 +55,7 @@ def _query_land_collection(bbox: tuple[float, float, float, float], collection_i
         return None
 
 
-class LandProvider:
+class Usgs3DepProvider:
     """
     Provider for Mid-Resolution Land Topography.
     Tier 2: USGS 3DEP (10m)
@@ -185,7 +185,7 @@ class LandProvider:
                 items = _query_land_collection(bbox_tuple, collection_id)
 
             if not items:
-                logger.debug(f"LandProvider found 0 items for {collection_id}")
+                logger.debug(f"Usgs3DepProvider found 0 items for {collection_id}")
                 return None
 
             # Record found items to Manifest (if online)
@@ -198,9 +198,7 @@ class LandProvider:
                         properties=item.get("properties"),
                     )
 
-            logger.debug(f"LandProvider found {len(items)} items for {collection_id}")
-
-            logger.debug(f"LandProvider found {len(items)} items for {collection_id}")
+            logger.debug(f"Usgs3DepProvider found {len(items)} items for {collection_id}")
 
             das = []
             for item in items:

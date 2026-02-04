@@ -18,10 +18,10 @@ from fastapi.responses import Response
 from rasterio.enums import Resampling
 
 from topobathysim.fusion import FusionEngine
-from topobathysim.land import LandProvider
-from topobathysim.lidar import LidarProvider
 from topobathysim.manager import BathyManager
 from topobathysim.quality import source_report
+from topobathysim.usgs_3dep import Usgs3DepProvider
+from topobathysim.usgs_lidar import UsgsLidarProvider
 
 from .models import ElevationResponse, TIDReportResponse
 
@@ -289,7 +289,7 @@ def get_fused_tile(
         # Fallback if manager.lidar is None (e.g. use_lidar=False)?
         if lidar_provider is None:
             # Just create one locally, though this ignores offline_mode if manager doesn't have it
-            lidar_provider = LidarProvider()
+            lidar_provider = UsgsLidarProvider()
 
         if ept_url:
             from pyproj import Transformer
@@ -319,7 +319,7 @@ def get_fused_tile(
         # 1.5 Fetch Intermediate Land (Tier 3)
         # We fetch it but apply it LAST as a background fill.
 
-        land_provider = LandProvider()
+        land_provider = Usgs3DepProvider()
         land_da = land_provider.fetch_dem(bounds=(b_west, b_south, b_east, b_north))
 
         if land_da is not None:

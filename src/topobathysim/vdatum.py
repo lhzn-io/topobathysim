@@ -1,66 +1,79 @@
+import logging
 from functools import lru_cache
+from typing import Any
 
 import requests  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 class VDatumResolver:
     """
     Resolves vertical datum offsets between NAVD88 and Local Mean Sea Level (LMSL)
-    using NOAA's VDatum API.
+    using NOAA's VDatum API. Supports GEOID18 for Ellipsoid to NAVD88 conversions.
     """
 
-    VDATUM_API = "https://vdatum.noaa.gov/vdatumweb/api/datum"
+    VDATUM_API = "https://vdatum.noaa.gov/vdatumweb/api/convert"
 
     @staticmethod
     @lru_cache(maxsize=1024)
     def get_navd88_to_lmsl_offset(lat: float, lon: float) -> float:
         """
         Calculates the vertical shift to convert NAVD88 elevation to LMSL.
-
-        Formula: LMSL = NAVD88 - Offset
-        (The VDatum API returns the height of the Target relative to the Source.
-         Wait, let's verify standard VDatum usage.
-         Usually transformation is: T_Z = Transformation Value.
-         Target = Source - (Source - Target) ...
-         Actually VDatum output 't_z' is usually the converted height if you pass a height,
-         OR it provides a transformation grid value.
-
-         The user provided snippet says: "The 'height' in the response is the shift value"
-         Wait, looking at the user snippet:
-         float(response['t_z'])
-
-         If we pass s_z (source height) = 0, t_z will be the height of NAVD88 zero in standard LMSL?
-         Or is it the shift?
-
-         Let's stick to the User's provided snippet logic:
-         "return float(response['t_z'])"
-
-         However, the user snippet calls `requests.get` without `s_z` (source height).
-         The VDatum API implies transforming a point.
-         If no height is passed, it might default to 0.
-
-         Let's implement exactly as the user specified in the prompt.
+        LMSL = NAVD88 - Offset
         """
-        params = {
+        # API requires source/target/region
+        params: dict[str, Any] = {
             "s_x": lon,
             "s_y": lat,
-            "s_hframe": "NAD83_2011",  # Standard BlueTopo horizontal frame
-            "s_vframe": "NAVD88",  # BlueTopo source vertical datum
-            "t_vframe": "LMSL",  # Target simulation datum
-            "region": "contiguous",  # US Conterminous region
+            "s_z": 0.0,  # Explicitly convert 0
+            "s_hframe": "NAD83_2011",
+            "s_vframe": "NAVD88",
+            "t_hframe": "NAD83_2011",
+            "t_vframe": "LMSL",
+            "region": "contiguous",
+            "result_format": "json",
         }
 
         try:
-            # We set a timeout to be safe
-            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)  # type: ignore
+            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
             response.raise_for_status()
             data = response.json()
 
-            # The user code: return float(response['t_z'])
-            # We trust this returns the necessary offset or converted 0-height.
-            return float(data.get("t_z", 0.0))
+            if "t_z" in data:
+                return float(data["t_z"])
+            return 0.0
 
+        except Exception as e:
+            logger.warning(f"Datum conversion failed for ({lat}, {lon}): {e}")
+            return 0.0
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def get_ellipsoid_to_navd88_offset(lat: float, lon: float) -> float:
+        """
+        Calculates shift from NAD83(2011) Ellipsoid to NAVD88 using GEOID18.
+        NAVD88 = Ellipsoid - GeoidHeight
+        """
+        params: dict[str, Any] = {
+            "s_x": lon,
+            "s_y": lat,
+            "s_z": 0.0,
+            "s_hframe": "NAD83_2011",
+            "s_vframe": "NAD83_2011",  # Ellipsoid
+            "t_hframe": "NAD83_2011",
+            "t_vframe": "NAVD88",
+            "region": "contiguous",
+            "geoid": "GEOID18",  # Explicitly request GEOID18
+            "result_format": "json",
+        }
+
+        try:
+            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if "t_z" in data:
+                return float(data["t_z"])
+            return 0.0
         except Exception:
-            # Log warning in real app
-            # print(f"Datum conversion failed: {e}")
-            return 0.0  # Fallback to no offset
+            return 0.0
