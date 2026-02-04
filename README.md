@@ -18,7 +18,7 @@
   - **Asset Manifests**: Records online assets for true offline playback.
   - **Smart Caching**: Local caching of COGs, LAZ files, and tile schemes.
 - **Microservice Ready**: Includes `TopoBathyServe`, a FastAPI-based tile server offering:
-  - Standard XYZ interpolation (`/tiles/{z}/{x}/{y}.tif`).
+  - Standard XYZ interpolation (`/tiles/{z}/{x}/{y}.png`).
   - Raw NumPy buffers (`format=npy`) for direct ingestion into physics engines (e.g., NVIDIA Warp).
 - **Geodetic Accuracy**: Automated vertical datum transformation (NAVD88 ↔ LMSL ↔ WGS84) using VDatum.
 
