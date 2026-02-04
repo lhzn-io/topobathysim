@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>TopoBathy Viewer</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 15px;
+            z-index: 1000;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 300px;
+        }
+
+        h3 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        p {
+            font-size: 14px;
+            margin-bottom: 5px;
+            color: #555;
+        }
+
+        .legend {
+            font-size: 12px;
+            margin-top: 10px;
+        }
+
+        .colorbar {
+            height: 10px;
+            background: linear-gradient(to right, #000080, #0000FF, #00FFFF, #FFFF00, #FF0000, #800000);
+            /* Approx jet/turbo/terrain */
+            margin-top: 5px;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div id="controls">
+        <h3>TopoBathy Viewer</h3>
+        <p>Fused Elevation (Lidar + Bathymetry)</p>
+        <p><i>Auto-Lookup active for US Coastal Lidar (STAC/3DEP)</i></p>
+        <div class="legend">
+            Elevation (Terrain Colormap)
+            <div class="colorbar"></div>
+            <div style="display:flex; justify-content:space-between; margin-top:2px;">
+                <span>Low</span>
+                <span>High</span>
+            </div>
+        </div>
+        <div id="debug-info"
+            style="margin-top:10px; border-top:1px solid #ccc; padding-top:5px; font-family:monospace; font-size:11px; color:#333;">
+            <b>Debug Info:</b><br />
+            Zoom: <span id="debug-zoom">-</span><br />
+            Center: <span id="debug-center">-</span><br />
+            Bounds: <span id="debug-bounds">-</span>
+        </div>
+    </div>
+    <script>
+        // Parse URL Params
+        const params = new URLSearchParams(window.location.search);
+        var startLat = 40.88;
+        var startLon = -73.73;
+        var startZoom = 13;
+        var initBounds = null;
+
+        if (params.has('lat') && params.has('lon') && params.has('zoom')) {
+            startLat = parseFloat(params.get('lat'));
+            startLon = parseFloat(params.get('lon'));
+            startZoom = parseInt(params.get('zoom'));
+        } else if (params.has('bbox')) {
+            // bbox=minx,miny,maxx,maxy (West,South,East,North)
+            var parts = params.get('bbox').split(',').map(parseFloat);
+            if (parts.length === 4) {
+                initBounds = [[parts[1], parts[0]], [parts[3], parts[2]]]; // [[S,W], [N,E]]
+            }
+        }
+
+        var map = L.map('map');
+
+        if (initBounds) {
+            map.fitBounds(initBounds);
+        } else {
+            map.setView([startLat, startLon], startZoom);
+        }
+
+        function updateDebug() {
+            document.getElementById('debug-zoom').innerText = map.getZoom();
+            var c = map.getCenter();
+            document.getElementById('debug-center').innerText = c.lat.toFixed(4) + ", " + c.lng.toFixed(4);
+            var b = map.getBounds();
+            document.getElementById('debug-bounds').innerText =
+                b.getSouth().toFixed(3) + "," + b.getWest().toFixed(3) + " to " +
+                b.getNorth().toFixed(3) + "," + b.getEast().toFixed(3);
+        }
+
+        function updateUrl() {
+            var c = map.getCenter();
+            var z = map.getZoom();
+            var url = new URL(window.location);
+            url.searchParams.set('lat', c.lat.toFixed(5));
+            url.searchParams.set('lon', c.lng.toFixed(5));
+            url.searchParams.set('zoom', z);
+            // Optional: also set bbox for easy sharing with other tools
+            var b = map.getBounds();
+            url.searchParams.set('bbox', [b.getWest().toFixed(5), b.getSouth().toFixed(5), b.getEast().toFixed(5), b.getNorth().toFixed(5)].join(','));
+
+            window.history.replaceState({}, '', url);
+        }
+
+        map.on('moveend', function () {
+            updateDebug();
+            updateUrl();
+        });
+        map.on('zoomend', function () {
+            updateDebug();
+            updateUrl();
+        });
+        updateDebug();
+        updateUrl();
+
+        var osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        var satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri'
+        });
+
+        // TopoBathyServe Tile Layer
+        // format=png triggers server-side rendering
+        var bathyLayer = L.tileLayer('/tiles/{z}/{x}/{y}?format=png', {
+            maxZoom: 20,
+            opacity: 0.7,
+            attribution: 'TopoBathyServe'
+        }).addTo(map);
+
+        var baseMaps = {
+            "OpenStreetMap": osm,
+            "Satellite": satellite
+        };
+
+        var overlayMaps = {
+            "Fused Elevation": bathyLayer
+        };
+
+        L.control.layers(baseMaps, overlayMaps).addTo(map);
+    </script>
+</body>
+
+</html>

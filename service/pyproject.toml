@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "topobathyserve"
+version = "0.1.0"
+description = "Microservice wrapping topobathysim"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "fastapi-cache2[redis]",
+  "click",
+  "topobathysim @ file://../../topobathysim"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.hatch.envs.default]
+dependencies = [
+  "pytest",
+  "httpx"
+]

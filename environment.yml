@@ -1,0 +1,31 @@
+name: topobathysim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pdal
+  - python-pdal
+  - gdal
+  - rasterio
+  - xarray
+  - rioxarray
+  - numpy
+  - scipy
+  - laspy
+  - pystac-client
+  - planetary-computer
+  - s3fs
+  - requests
+  - bmi-topography
+  - rich
+  - pyproj
+  - joblib
+  # Dev dependencies
+  - pytest
+  - pre-commit
+  - ruff
+  - mypy
+  - pandas-stubs
+  - types-PyYAML
+  - ipykernel

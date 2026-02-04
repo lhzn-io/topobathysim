@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "topobathysim"
+version = "0.1.0"
+description = "The definitive high-performance fusion engine that seamlessly merges global bathymetry and sub-meter lidar into unified, simulation-ready digital worlds."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Antigravity Agent", email = "agent@deepmind.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+  "bmi-topography",
+  "xarray",
+  "rioxarray",
+  "numpy",
+  "pydap",
+  "fsspec",
+  "s3fs",
+  "requests",
+  "geopandas",
+  "pdal",
+  "httpx",
+  "matplotlib",
+  "planetary-computer",
+  "pystac-client",
+]
+
+[project.urls]
+Documentation = "https://github.com/lhzn-io/biologger-sim/tree/main/bathysim"
+Issues = "https://github.com/lhzn-io/biologger-sim/issues"
+Source = "https://github.com/lhzn-io/biologger-sim/tree/main/bathysim"
+
+[tool.hatch.envs.default]
+dependencies = [
+  "coverage[toml]>=6.5",
+  "pytest",
+]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest {args:tests}"
+cov = "pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=src/topobathysim --cov=tests {args:tests}"
+
+[tool.pytest.ini_options]
+addopts = "-v"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "integration: mark a test as an integration test",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["topobathysim"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true

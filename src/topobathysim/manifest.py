@@ -1,0 +1,91 @@
+import fcntl
+import json
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class OfflineManifest:
+    """
+    Thread-safe persistent manifest for tracking cached STAC assets.
+    Maps spatial bounds/collections to Asset URLs, enabling offline lookup.
+    """
+
+    def __init__(self, cache_dir: Path) -> None:
+        self.manifest_path = cache_dir / "manifest.json"
+        self._ensure_manifest()
+
+    def _ensure_manifest(self) -> None:
+        if not self.manifest_path.exists():
+            with open(self.manifest_path, "w") as f:
+                json.dump({"items": []}, f)
+
+    def add_item(
+        self, collection_id: str, bbox: tuple, asset_href: str, properties: dict | None = None
+    ) -> None:
+        """
+        Records a STAC item in the manifest.
+        """
+        entry = {
+            "collection": collection_id,
+            "bbox": bbox,  # [minx, miny, maxx, maxy]
+            "href": asset_href,
+            "properties": properties or {},
+        }
+
+        # Lock and Update
+        try:
+            with open(self.manifest_path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                data = json.load(f)
+
+                # Check for duplicate (by href)
+                # We overwrite if exists to update properties/bbox if changed
+                existing_idx = next((i for i, x in enumerate(data["items"]) if x["href"] == asset_href), None)
+
+                if existing_idx is not None:
+                    data["items"][existing_idx] = entry
+                else:
+                    data["items"].append(entry)
+
+                f.seek(0)
+                json.dump(data, f, indent=2)
+                f.truncate()
+                fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            logger.error(f"Failed to update manifest: {e}")
+
+    def find_items(self, collection_id: str, search_bbox: tuple) -> list[dict]:
+        """
+        Finds items in the manifest that intersect the search_bbox.
+        search_bbox: (minx, miny, maxx, maxy)
+        """
+        try:
+            # Shared lock for reading? Or just quick read.
+            # "r" open doesn't blocking-wait on lock usually unless we flock it.
+            # Let's be safe and use shared lock.
+            with open(self.manifest_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                data = json.load(f)
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+            matches = []
+            s_minx, s_miny, s_maxx, s_maxy = search_bbox
+
+            for item in data.get("items", []):
+                if item["collection"] != collection_id and collection_id != "*":
+                    continue
+
+                # Intersect Check
+                i_minx, i_miny, i_maxx, i_maxy = item["bbox"]
+
+                # Standard AABB intersection
+                if i_minx <= s_maxx and i_maxx >= s_minx and i_miny <= s_maxy and i_maxy >= s_miny:
+                    matches.append(item)
+
+            return matches
+
+        except Exception as e:
+            logger.error(f"Failed to read manifest: {e}")
+            return []
