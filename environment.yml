@@ -13,6 +13,8 @@ dependencies:
   - numpy
   - scipy
   - laspy
+  - lazrs-python
+  - pystac-client
   - pystac-client
   - planetary-computer
   - s3fs
@@ -21,6 +23,9 @@ dependencies:
   - rich
   - pyproj
   - joblib
+  - uvicorn
+  - fastapi
+  - python-dotenv
   # Dev dependencies
   - pytest
   - pre-commit

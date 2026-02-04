@@ -35,6 +35,11 @@ dependencies = [
   "matplotlib",
   "planetary-computer",
   "pystac-client",
+  "lazrs-python",
+  "uvicorn",
+  "uvicorn",
+  "fastapi",
+  "python-dotenv",
 ]
 
 [project.urls]

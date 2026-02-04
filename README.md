@@ -39,8 +39,12 @@ pip install -e .
 The topobathymetry microservice exposes fused data via HTTP.
 
 ```bash
-cd service
-python -m uvicorn app.main:app --host 0.0.0.0 --port 9595 --workers 4
+```bash
+# Navigate to root
+cd topobathysim
+
+# Ensure src is in PYTHONPATH and run module
+PYTHONPATH=src python -m uvicorn service.app.main:app --host 0.0.0.0 --port 9595 --workers 4
 ```
 
 *Access the viewer at `http://localhost:9595/viewer`*
