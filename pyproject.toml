@@ -21,7 +21,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-  "bmi-topography",
+  "bmi-topography==0.9.0",
   "xarray",
   "rioxarray",
   "numpy",
@@ -36,6 +36,7 @@ dependencies = [
   "planetary-computer",
   "pystac-client",
   "lazrs-python",
+  "h5py",
   "uvicorn",
   "uvicorn",
   "fastapi",

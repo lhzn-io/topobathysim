@@ -14,12 +14,13 @@ dependencies:
   - scipy
   - laspy
   - lazrs-python
+  - h5py
   - pystac-client
   - pystac-client
   - planetary-computer
   - s3fs
   - requests
-  - bmi-topography
+  - bmi-topography=0.9.0
   - rich
   - pyproj
   - joblib
