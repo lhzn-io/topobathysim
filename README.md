@@ -1,5 +1,9 @@
 # TopoBathySim
 
+<p align="center">
+  <img src="docs/source/_static/repo-logo.png" width="300" alt="TopoBathySim Logo">
+</p>
+
 **High-Fidelity Topobathymetric Fusion Engine for Digital Twins.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
