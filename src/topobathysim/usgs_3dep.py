@@ -302,7 +302,17 @@ class Usgs3DepProvider:
                         # Test open to check for corruption
                         # Test open to check for corruption
                         # Use chunks for lazy loading (Avoid OOM)
-                        da = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
+                        da_raw = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
+                        if isinstance(da_raw, list):
+                            da = da_raw[0]
+                        elif isinstance(da_raw, xr.Dataset):
+                            da = da_raw.to_array().isel(variable=0)
+                        else:
+                            da = da_raw
+
+                        from typing import cast
+
+                        da = cast(xr.DataArray, da)
                         if "band" in da.dims:
                             da = da.isel(band=0).drop_vars("band")
 

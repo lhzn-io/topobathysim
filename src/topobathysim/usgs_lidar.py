@@ -530,9 +530,17 @@ class UsgsLidarProvider:
             logger.debug(f"PDAL executed. Points: {count}")
 
             if Path(output_filename).exists():
-                with rxr.open_rasterio(output_filename, masked=True) as da:  # type: ignore
-                    if isinstance(da, list):
-                        da = da[0]
+                with rxr.open_rasterio(output_filename, masked=True) as da_raw:  # type: ignore
+                    if isinstance(da_raw, list):
+                        da = da_raw[0]
+                    elif isinstance(da_raw, xr.Dataset):
+                        da = da_raw.to_array().isel(variable=0)
+                    else:
+                        da = da_raw
+
+                    from typing import cast
+
+                    da = cast(xr.DataArray, da)
 
                     da = da.rename({"band": "variable"}).squeeze("variable")
                     da.name = "elevation"
@@ -551,7 +559,7 @@ class UsgsLidarProvider:
                     da.load()
 
                 Path(output_filename).unlink()
-                from typing import cast
+                # from typing import cast (already imported)
 
                 return cast(xr.DataArray, da)
 

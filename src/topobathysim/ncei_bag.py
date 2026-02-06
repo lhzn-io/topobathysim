@@ -31,7 +31,17 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
         # Reading entire 50cm BAGs (GBs) into memory causes OOM crashes.
         # Open with Dask chunks for lazy loading
         with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
-            da = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+            da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+            if isinstance(da_raw, list):
+                da = da_raw[0]
+            elif isinstance(da_raw, xr.Dataset):
+                da = da_raw.to_array().isel(variable=0)
+            else:
+                da = da_raw
+
+            from typing import cast
+
+            da = cast(xr.DataArray, da)
 
         # BAGs usually have 'elevation' and 'uncertainty'.
         # Rasterio usually reads band 1 as elevation.

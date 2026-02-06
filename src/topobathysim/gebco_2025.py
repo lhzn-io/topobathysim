@@ -100,6 +100,8 @@ class GEBCO2025Provider(Topography):
         # but bmi-topography usually writes usage.
         # We will assume this is the 'load_to_memory' part.
 
+        if self._da is None:
+            raise KeyError("Failed to load elevation data")
         return self._da
 
     def load(self) -> xr.DataArray:

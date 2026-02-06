@@ -1,4 +1,3 @@
-import io
 import logging
 import math
 import os
@@ -7,6 +6,7 @@ import tempfile
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 
@@ -92,14 +92,20 @@ GLOBAL_VMAX = 20.0
 # Feature Flags
 # Set to True to skip querying Microsoft Planetary Computer (3DEP/Copernicus)
 # Useful if API is throttled or to speed up local dev where land is not needed.
-SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in ("true", "1", "yes")
+SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 
 def render_png(
-    da: xr.DataArray, style: str = "default", vmin: float | None = None, vmax: float | None = None
+    da: xr.DataArray,
+    style: str = "default",
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> bytes:
     """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
-    from io import BytesIO
 
     import matplotlib.colors as mcolors
     import matplotlib.image as mpimg
@@ -126,8 +132,8 @@ def render_png(
     eff_vmax = vmax if vmax is not None else GLOBAL_VMAX
 
     # Adaptive Colormap Logic
-    cmap = plt.cm.terrain
-    norm = None
+    cmap = plt.get_cmap("terrain")
+    norm: mcolors.Normalize | None = None
 
     # Logic:
     # 1. If Explicit/Global bounds cross zero: Use TwoSlopeNorm (Standard TopoBathy)
@@ -201,18 +207,28 @@ def render_png(
 
         # Check if we are strictly land
         elif eff_vmin >= 0:
-            land_colors = plt.cm.terrain(np.linspace(0.5, 1.0, 256))
-            land_cmap = mcolors.LinearSegmentedColormap.from_list("terrain_land", land_colors)
+            # Manually sample terrain colormap for land part
+            _terrain = plt.get_cmap("terrain")
+            land_rgba = _terrain(np.linspace(0.5, 1.0, 256))
+            land_cmap = mcolors.LinearSegmentedColormap.from_list("terrain_land", land_rgba)
             cmap = land_cmap
             norm = mcolors.Normalize(vmin=eff_vmin, vmax=eff_vmax)
 
         # Mixed / Standard Case (Crossing Zero)
         else:
-            cmap = plt.cm.terrain
+            cmap = plt.get_cmap("terrain")
             # TwoSlopeNorm ensures 0 is always the transition from Blue to Green
             norm = mcolors.TwoSlopeNorm(vmin=eff_vmin, vcenter=0, vmax=eff_vmax)
     try:
-        rgb = ls.shade(vals, cmap=cmap, norm=norm, vert_exag=10, dx=1.0, dy=1.0, blend_mode="overlay")
+        rgb = ls.shade(
+            vals,
+            cmap=cmap,
+            norm=norm,
+            vert_exag=10,
+            dx=1.0,
+            dy=1.0,
+            blend_mode="overlay",
+        )
         mpimg.imsave(buf, rgb, format="png")
 
     except Exception as e:
@@ -242,7 +258,7 @@ async def get_source_info(
     """
     Returns metadata about the active data source for the coordinate.
     """
-    return manager.get_source_info(lat, lon)
+    return dict(manager.get_source_info(lat, lon))
 
 
 @app.get("/metadata", response_model=TIDReportResponse)
@@ -506,7 +522,11 @@ def get_fused_tile(
                 # Use the buffered bounds (b_west, etc) which are slightly larger than target_grid
                 # clip_box handles CRS transformation of bounds
                 bathy_da = bathy_da.rio.clip_box(
-                    minx=b_west, miny=b_south, maxx=b_east, maxy=b_north, crs="EPSG:4326"
+                    minx=b_west,
+                    miny=b_south,
+                    maxx=b_east,
+                    maxy=b_north,
+                    crs="EPSG:4326",
                 )
                 logger.info("Clipped bathy_da to standard bounds.")
             except Exception as e:
@@ -575,8 +595,15 @@ def get_fused_tile(
             return Response(content=png_data, media_type="image/png")
 
         elif format == "npy":
-            buf = io.BytesIO()
+            buf = BytesIO()
             np.save(buf, fused_da.values.astype(np.float32))
+            buf.seek(0)
+            return Response(content=buf.read(), media_type="application/octet-stream")
+
+        elif format == "npz":
+            buf = BytesIO()
+            # Save as compressed archive. Client accesses via ['elevation'] or ['arr_0']
+            np.savez_compressed(buf, elevation=fused_da.values.astype(np.float32))
             buf.seek(0)
             return Response(content=buf.read(), media_type="application/octet-stream")
 
@@ -651,7 +678,11 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
 
         # Re-create structure if needed (lazy done by services usually)
 
-        return {"status": "success", "cleared": deleted, "message": f"Cleared cache types: {type}"}
+        return {
+            "status": "success",
+            "cleared": deleted,
+            "message": f"Cleared cache types: {type}",
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

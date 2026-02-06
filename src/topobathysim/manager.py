@@ -273,7 +273,9 @@ class BathyManager:
 
             engine = FusionEngine()
             try:
-                fused = engine.fuse_seamline(lidar_da=topobathy_da, bathy_da=base_da)
+                from typing import cast
+
+                fused = engine.fuse_seamline(lidar_da=cast(xr.DataArray, topobathy_da), bathy_da=base_da)
                 return fused
             except Exception as e:
                 logger.error(f"Fusion Failed: {e}")

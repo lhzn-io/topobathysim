@@ -255,7 +255,15 @@ class NoaaBlueTopoProvider:
                 return None
 
             # Open with rioxarray
-            da = rioxarray.open_rasterio(local_path)
+            da_raw = rioxarray.open_rasterio(local_path)
+            from typing import cast
+
+            if isinstance(da_raw, list):
+                da = cast(xr.DataArray, da_raw[0])
+            elif isinstance(da_raw, xr.Dataset):
+                da = cast(xr.DataArray, da_raw.to_array().isel(variable=0))
+            else:
+                da = cast(xr.DataArray, da_raw)
 
             # Sample
             sample_x, sample_y = lon, lat
@@ -298,7 +306,17 @@ class NoaaBlueTopoProvider:
                 return None
 
             # Load Lazy for memory efficiency
-            da = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
+            da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
+            if isinstance(da_raw, list):
+                da = da_raw[0]
+            elif isinstance(da_raw, xr.Dataset):
+                da = da_raw.to_array().isel(variable=0)
+            else:
+                da = da_raw
+
+            from typing import cast
+
+            da = cast(xr.DataArray, da)
 
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")
@@ -356,7 +374,7 @@ class NoaaBlueTopoProvider:
         if local_path:
             try:
                 # Use rioxarray/rasterio as osgeo.gdal is unreliable in this env
-                with rioxarray.open_rasterio(local_path, masked=True) as da:
+                with rioxarray.open_rasterio(local_path, masked=True) as da:  # type: ignore
                     # Reproject point to tile CRS
                     import numpy as np
                     from pyproj import Transformer
