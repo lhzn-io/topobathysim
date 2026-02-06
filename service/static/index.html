@@ -198,7 +198,7 @@
         var styleSelect = document.getElementById('style-select');
         styleSelect.value = initStyle;
 
-        styleSelect.addEventListener('change', function() {
+        styleSelect.addEventListener('change', function () {
             var newStyle = this.value;
             // Update Layer
             bathyLayer.options.style = newStyle;
@@ -226,6 +226,48 @@
         };
 
         L.control.layers(baseMaps, overlayMaps).addTo(map);
+
+        // --- Click to Identify ---
+        function latLonToTile(lat, lon, zoom) {
+            var xtile = Math.floor((lon + 180) / 360 * (1 << zoom));
+            var ytile = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * (1 << zoom));
+            return { x: xtile, y: ytile, z: zoom };
+        }
+
+        map.on('click', function (e) {
+            var lat = e.latlng.lat;
+            var lng = e.latlng.lng;
+            var zoom = map.getZoom();
+            var tile = latLonToTile(lat, lng, zoom);
+
+            var currentStyle = document.getElementById('style-select').value;
+
+            // Construct URLs
+            var tileUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=npy&style=${currentStyle}`;
+            var viewUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=png&style=${currentStyle}`;
+
+            var content = `
+                <div style="font-family: monospace; font-size: 13px;">
+                    <b>Location Info</b><br/>
+                    <div style="margin-top:5px">
+                        Lat: <input type="text" value="${lat.toFixed(6)}" style="width: 100px;" onclick="this.select()"><br/>
+                        Lon: <input type="text" value="${lng.toFixed(6)}" style="width: 100px;" onclick="this.select()">
+                    </div>
+                    <div style="margin-top:5px">
+                        Tile Z/X/Y: <b>${tile.z}/${tile.x}/${tile.y}</b>
+                    </div>
+                    <div style="margin-top:5px; display:flex; gap:5px;">
+                        <a href="${tileUrl}" target="_blank">Download .npy</a> |
+                        <a href="${viewUrl}" target="_blank">View Tile</a>
+                    </div>
+                </div>
+            `;
+
+            L.popup()
+                .setLatLng(e.latlng)
+                .setContent(content)
+                .openOn(map);
+        });
     </script>
 </body>
 
