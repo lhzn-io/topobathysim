@@ -1,3 +1,4 @@
+import fcntl
 import logging
 
 # Caching setup
@@ -17,42 +18,94 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=128)
-def _query_land_collection(bbox: tuple[float, float, float, float], collection_id: str) -> list[dict] | None:
+def _query_stac_cached(
+    bbox: tuple[float, float, float, float],
+    collection_id: str,
+    cache_dir_str: str,
+) -> list[dict] | None:
     """
     Cached STAC query for Land Collections (3DEP, NASADEM).
     Returns list of item dicts (href only) to avoid pickling.
     """
+    import random
+    import time
+    from pathlib import Path
+
+    cache_dir = Path(cache_dir_str)
+
+    # Global Concurrency Lock (One STAC query at a time across all processes)
+    # This prevents 4-8 workers from bursting the API simultaneously on cold start.
+    lock_file_path = cache_dir / "stac_query.lock"
+
+    logger.debug(f"Querying STAC collection {collection_id} for bbox={bbox}")
     stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
-    try:
-        logger.debug(f"Usgs3DepProvider querying (Cached) {collection_id} for {bbox}")
-        catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-        search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
-        items = list(search.items())
+    max_retries = 4
 
-        if not items:
-            return None
+    with open(lock_file_path, "w") as lock_file:
+        # Blocking Exclusive Lock - Only one worker can query at a time
+        # Downloads are not locked, just the metadata query/signing.
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    logger.debug(
+                        f"Usgs3DepProvider querying (Cached) {collection_id} "
+                        f"for {bbox} (Attempt {attempt + 1})"
+                    )
 
-        results = []
-        for item in items:
-            # Extract asset href
-            asset_key = "data"
-            if asset_key not in item.assets and "elevation" in item.assets:
-                asset_key = "elevation"
+                    # We MUST sign inplace to get SAS tokens for blob access
+                    # Note: Client.open might make a network call
+                    catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
 
-            if asset_key in item.assets:
-                results.append(
-                    {
-                        "href": item.assets[asset_key].href,
-                        "bbox": item.bbox,
-                        "properties": item.properties,
-                    }
-                )
+                    # Search
+                    search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
+                    items = list(search.items())
 
-        return results
-    except Exception as e:
-        logger.warning(f"Error fetching {collection_id}: {e}")
-        return None
+                    if not items:
+                        return None
+
+                    results = []
+                    for item in items:
+                        # Extract asset href
+                        asset_key = "data"
+                        if asset_key not in item.assets and "elevation" in item.assets:
+                            asset_key = "elevation"
+
+                        if asset_key in item.assets:
+                            results.append(
+                                {
+                                    "href": item.assets[asset_key].href,
+                                    "bbox": item.bbox,
+                                    "properties": item.properties,
+                                }
+                            )
+
+                    return results
+
+                except Exception as e:
+                    # Check if it's a timeout or throttling error
+                    is_last_attempt = attempt == max_retries
+                    log_level = logging.WARNING
+                    if is_last_attempt:
+                        log_level = logging.ERROR
+
+                    logger.log(
+                        log_level,
+                        f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
+                    )
+
+                    if is_last_attempt:
+                        return None
+
+                    # Exponential Backoff with Jitter: 1s, 2s, 4s, 8s...
+                    sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
+                    logger.debug(f"Sleeping {sleep_time:.2f}s before retry...")
+                    time.sleep(sleep_time)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    return None
 
 
 class Usgs3DepProvider:
@@ -72,16 +125,27 @@ class Usgs3DepProvider:
 
         self.manifest = OfflineManifest(self.cache_dir)
 
+    def _query_land_collection(
+        self,
+        bbox: tuple[float, float, float, float],
+        collection_id: str,
+        datetime_range: str | None = None,
+    ) -> list[dict] | None:
+        return _query_stac_cached(bbox, collection_id, str(self.cache_dir))
+
     def _download_and_cache(self, url: str) -> Path | None:
-        import fcntl
         import hashlib
 
         import requests
 
         # Create a safe filename from URL
-        url_hash = hashlib.md5(url.encode()).hexdigest()
+        # Strip query parameters (SAS tokens) for stable hashing
+        # URL: https://.../blob.core.windows.net/.../file.tif?sv=...
+        url_base = url.split("?")[0]
+        logger.debug(f"Hashing URL Base: {url_base} (Original: {url[:50]}...)")
+        url_hash = hashlib.md5(url_base.encode()).hexdigest()
         ext = ".tif"
-        if ".tiff" in url:
+        if ".tiff" in url_base:
             ext = ".tiff"
 
         filename = f"{url_hash}{ext}"
@@ -137,15 +201,13 @@ class Usgs3DepProvider:
             # We'll leave it to be safe and simple.
             pass
 
-    def fetch_dem(
-        self, bounds: tuple[float, float, float, float], target_crs: str = "EPSG:4326"
-    ) -> xr.DataArray | None:
+    def fetch_dem(self, bounds: tuple[float, float, float, float]) -> xr.DataArray | None:
+        logger.debug(f"fetch_dem called with bounds={bounds}")
         """
         Fetches best available land DEM for the bbox.
-        1. 3DEP (US)
-        2. Copernicus/NASADEM (Global)
+        Search priority: 3DEP (US), then Copernicus (Global), then NASADEM (Global)
         """
-        # 1. Try USGS 3DEP
+        # 1. 3DEP Seamless (10m) - Best for US
         da = self._fetch_collection(bounds, "3dep-seamless")
         if da is not None:
             logger.debug("Found USGS 3DEP Coverage")
@@ -169,20 +231,27 @@ class Usgs3DepProvider:
         try:
             items = None
 
-            # 1. Offline Mode / Manifest Lookup
-            if self.offline_mode:
-                logger.debug(f"Offline Mode: Checking Manifest for {collection_id} in {bounds}")
-                manifest_items = self.manifest.find_items(collection_id, bounds)
-                if manifest_items:
-                    # Convert manifest dicts back to minimal item structure for loop
-                    items = [{"href": m["href"]} for m in manifest_items]
-                    logger.info(f"Offline Manifest found {len(items)} items.")
+            # 1. Always Check Manifest First (Local STAC Cache)
+            # This allows us to skip throttled API calls if we already know the assets for this bbox.
+            # We trust our local cache of "resolution" (mapping from bbox -> assets)
+            logger.debug(f"Checking Local Manifest for {collection_id} in {bounds}")
+            manifest_items = self.manifest.find_items(collection_id, bounds)
 
-            # 2. Online Mode (if not found in manifest or not offline)
+            if manifest_items:
+                # Convert manifest items to the list structure used below
+                items = [
+                    {"href": m["href"], "bbox": m["bbox"], "properties": m.get("properties")}
+                    for m in manifest_items
+                ]
+                logger.info(
+                    f"Manifest Cache Hit: Found {len(items)} items for {collection_id} (Skipping API)."
+                )
+
+            # 2. Online Mode - Only Query API if Manifest Miss AND Not Offline
             if not items and not self.offline_mode:
                 # Use cached query
                 bbox_tuple = tuple(bounds)
-                items = _query_land_collection(bbox_tuple, collection_id)
+                items = self._query_land_collection(bbox_tuple, collection_id)
 
             if not items:
                 logger.debug(f"Usgs3DepProvider found 0 items for {collection_id}")
@@ -213,7 +282,7 @@ class Usgs3DepProvider:
                     except requests.HTTPError as e:
                         if e.response is not None and e.response.status_code == 403:
                             logger.warning(f"403 Forbidden for {href}. Clearing STAC cache and retrying...")
-                            _query_land_collection.cache_clear()
+                            _query_stac_cached.cache_clear()
                             # Retry THIS item? We need to re-query everything actually.
                             # But we are inside a loop over OLD items.
                             # We should probably break out and restart the entire _fetch_collection logic?
@@ -231,12 +300,16 @@ class Usgs3DepProvider:
                     # Open local file
                     try:
                         # Test open to check for corruption
-                        with rioxarray.open_rasterio(local_path) as da:
-                            if "band" in da.dims:
-                                da = da.isel(band=0).drop_vars("band")
-                            # Load data into memory
-                            da.load()
-                            das.append(da)
+                        # Test open to check for corruption
+                        # Use chunks for lazy loading (Avoid OOM)
+                        da = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
+                        if "band" in da.dims:
+                            da = da.isel(band=0).drop_vars("band")
+
+                        # Verify we can read metadata, but DO NOT load data eagerley
+                        # da.load()  <-- REMOVED to prevent OOM
+                        das.append(da)
+
                         break  # Success
                     except Exception as e:
                         logger.warning(

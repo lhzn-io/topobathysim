@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import fsspec
@@ -13,6 +14,15 @@ from shapely.geometry import box
 from .vdatum import VDatumResolver
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _fetch_index_cached(url: str) -> str:
+    """Cached fetch of the index page (Standalone)."""
+    logger.info("Fetching NOAA Coastal Lidar PDS Index...")
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    return response.text
 
 
 class NoaaTopobathyProvider:
@@ -38,6 +48,10 @@ class NoaaTopobathyProvider:
         self._tile_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
 
+    def _fetch_index(self) -> str:
+        """Cached fetch of the index page."""
+        return _fetch_index_cached(self.INDEX_URL)
+
     def _ensure_project_list(self) -> None:
         """
         Parses the main index to map ID -> Project Folder Name.
@@ -46,15 +60,13 @@ class NoaaTopobathyProvider:
             return
 
         try:
-            logger.info("Fetching NOAA Coastal Lidar PDS Index...")
-            response = requests.get(self.INDEX_URL, timeout=10)
-            response.raise_for_status()
+            text = self._fetch_index()
 
             # Simple regex parser for Bulk Download links
             # Link: [Bulk Download](https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NY_LakeOntario_DEM_2023_10402/index.html)
             # Regex: dem/([^/]+)/index\.html
             pattern = r"dem/([^/]+)/index\.html"
-            for match in re.finditer(pattern, response.text):
+            for match in re.finditer(pattern, text):
                 folder_name_match = match.group(1)
                 # Extract ID from end of folder name
                 # e.g. NY_LakeOntario_DEM_2023_10402 -> 10402
@@ -197,7 +209,8 @@ class NoaaTopobathyProvider:
         vsi_path = f"/vsicurl/{http_url}"
 
         try:
-            da = rioxarray.open_rasterio(vsi_path)
+            # Lazy loading to prevent OOM
+            da = rioxarray.open_rasterio(vsi_path, chunks={"x": 2048, "y": 2048})
             return da
         except Exception as e:
             logger.warning(f"Failed to stream tile {vsi_path}: {e}")

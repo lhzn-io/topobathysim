@@ -5,6 +5,7 @@ import xarray as xr
 
 from .fusion import FusionEngine
 from .gebco_2025 import GEBCO2025Provider
+from .ncei_bag import BAGDiscovery, BAGProvider
 from .noaa_bluetopo import NoaaBlueTopoProvider
 from .noaa_topobathy import NoaaTopobathyProvider
 from .usgs_3dep import Usgs3DepProvider
@@ -48,11 +49,14 @@ class BathyManager:
         self.topobathy: NoaaTopobathyProvider | None = None
         self.lidar: UsgsLidarProvider | None = None
         self.land: Usgs3DepProvider | None = None
+        self.bag: BAGProvider | None = None
 
         # Initialize providers
         # GEBCO is always fallback
         # Note: GEBCO currently lacks offline_mode flag in its init, will ignoring for now or TODO
         self.gebco = GEBCO2025Provider(cache_dir=str(self.cache_dir))
+
+        self.bag = BAGProvider(cache_dir=str(self.cache_dir))
 
         if use_blue_topo:
             self.blue_topo = NoaaBlueTopoProvider(cache_dir=str(self.cache_dir))
@@ -136,40 +140,113 @@ class BathyManager:
             except Exception as e:
                 logger.warning(f"Topobathy Lidar Fetch Failed: {e}")
 
-        # 1. Try BlueTopo
+        # 1. Try BAG Bridge (NCEI Deep Sea Precision)
+        # Attempt to resolve survey ID at center point or corners
+        # For simplicity, check center
+        bag_da = None
+        if self.blue_topo and self.bag:
+            center_lat = (south + north) / 2
+            center_lon = (west + east) / 2
+            survey_id = self.blue_topo.get_source_survey_id(center_lat, center_lon)
+            if survey_id:
+                logger.info(f"BAG Survey Detected: {survey_id}. Attempting high-fidelity fetch.")
+                bag_da = self.bag.fetch_bag(survey_id)
+
+                if bag_da is None:
+                    logger.info("ID-based fetch failed. Attempting spatial fallback...")
+                    bag_url = BAGDiscovery.find_bag_by_location(center_lat, center_lon)
+                    if bag_url:
+                        logger.info(f"Spatial fallback successful: {bag_url}")
+                        bag_da = self.bag.fetch_bag(survey_id, download_url=bag_url)
+
+                # Ensure CRS is 4326 for consistency downstream?
+                # NO! Reprojecting the full 1.8GB BAG to 4326 here is expensive and unncesary.
+                # main.py does 'reproject_match' which warping from Source->Target CRS automatically.
+                # So we return the Native (UTM) BAG.
+                # if bag_da is not None and bag_da.rio.crs and bag_da.rio.crs != "EPSG:4326":
+                #    try:
+                #        bag_da = bag_da.rio.reproject("EPSG:4326")
+                #    except Exception as e:
+                #        logger.warning(f"BAG Reprojection Failed: {e}")
+
+        # 1.5 Try BlueTopo
         # Check for intersecting tiles
+        # We always attempt to fetch BlueTopo now, even if BAG exists,
+        # to use it as a "Gap Fill" (Background) layer.
+        blue_topo_da = None
         base_da = None
-        tile_ids = []
+
         if self.blue_topo:
+            logger.info("Attempting to resolve BlueTopo tiles.")
             tile_ids = self.blue_topo.resolve_tiles_in_bbox(west, south, east, north)
+            if tile_ids:
+                logger.info(f"Found {len(tile_ids)} BlueTopo tiles.")
+                # Load all tiles
+                das = []
+                for tid in tile_ids:
+                    # logger.info(f"Loading BlueTopo tile: {tid}")
+                    # Reduce log spam
+                    d = self.blue_topo.load_tile_as_da(tid, (west, south, east, north))
+                    if d is not None:
+                        das.append(d)
 
-        if tile_ids and self.blue_topo:
-            # Load all tiles
-            das = []
-            for tid in tile_ids:
-                d = self.blue_topo.load_tile_as_da(tid, (west, south, east, north))
-                if d is not None:
-                    das.append(d)
+                if das:
+                    if len(das) == 1:
+                        d = das[0]
+                        if not d.rio.crs:
+                            d.rio.write_crs("EPSG:4326", inplace=True)
+                        blue_topo_da = d
+                        logger.info("BlueTopo single tile loaded.")
+                    else:
+                        try:
+                            from rioxarray.merge import merge_arrays
 
-            if das:
-                if len(das) == 1:
-                    d = das[0]
-                    if not d.rio.crs:
-                        d.rio.write_crs("EPSG:4326", inplace=True)
-                    base_da = d
-                else:
-                    try:
-                        from rioxarray.merge import merge_arrays
+                            logger.info(f"Merging {len(das)} BlueTopo tiles.")
+                            merged_da = merge_arrays(das)
+                            if not merged_da.rio.crs:
+                                merged_da.rio.write_crs("EPSG:4326", inplace=True)
+                            blue_topo_da = merged_da
+                            logger.info("BlueTopo tiles merged successfully.")
+                        except Exception as e:
+                            logger.warning(f"BlueTopo Merge Failed: {e}")
+            else:
+                logger.info("No BlueTopo tiles found for the bbox.")
 
-                        merged_da = merge_arrays(das)
-                        if not merged_da.rio.crs:
-                            merged_da.rio.write_crs("EPSG:4326", inplace=True)
-                        base_da = merged_da
-                    except Exception as e:
-                        logger.warning(f"BlueTopo Merge Failed: {e}")
+        if bag_da is not None:
+            # GAP FILLING STRATEGY
+            if blue_topo_da is not None:
+                logger.info("Fusing BAG (Priority) with BlueTopo (Background Fill)...")
+                try:
+                    # Reproject BlueTopo to match BAG (High Res is master)
+                    # We use nearest neighbor or bilinear? User said "step changes",
+                    # so maybe nearest ensures we don't smooth edges?
+                    # But verifying alignment is better with bilinear for the background itself.
+                    # The "step change" comes from the transition from BAG to BlueTopo.
+                    # Let's align BlueTopo to BAG.
+                    from rasterio.enums import Resampling
 
-        # 2. Fallback GEBCO if BlueTopo missing
+                    bg_fill = blue_topo_da.rio.reproject_match(bag_da, resampling=Resampling.nearest)
+
+                    # Fill NaNs in BAG with BlueTopo
+                    # combine_first: "Combine two DataArray objects by filling null values in the first..."
+                    base_da = bag_da.combine_first(bg_fill)
+
+                    # Ensure metadata is preserved or updated
+                    base_da.attrs["source"] = f"Fused: {bag_da.attrs.get('survey_source', 'BAG')} + BlueTopo"
+                except Exception as e:
+                    logger.error(f"Gap Fill Fusion Failed: {e}")
+                    base_da = bag_da
+            else:
+                base_da = bag_da
+
+            logger.info("Manager returning Bathy Grid (Base DA) from BAG data (possibly fused).")
+            return base_da
+
+        # 1.6 Use BlueTopo as Base if no BAG
+        if base_da is None and blue_topo_da is not None:
+            base_da = blue_topo_da
         if base_da is None:
+            logger.info("No BlueTopo or BAG data found. Falling back to GEBCO 2025.")
             g = GEBCO2025Provider(south=south, north=north, west=west, east=east)
             da = g.fetch()
             if "lat" in da.coords:

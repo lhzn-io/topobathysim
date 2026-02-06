@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from typing import Any
 
 import fsspec
 import geopandas as gpd
@@ -265,7 +266,8 @@ class NoaaBlueTopoProvider:
             if not path:
                 return None
 
-            da = rioxarray.open_rasterio(path)
+            # Load Lazy for memory efficiency
+            da = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
 
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")
@@ -276,15 +278,304 @@ class NoaaBlueTopoProvider:
             # We return the full tile and let main.py's reproject_match handle the cropping.
             return da
 
-            # try:
-            #     # Pass crs="EPSG:4326" so rioxarray handles projection of bounds to raster CRS
-            #     return da.rio.clip_box(
-            #         minx=bbox[0], miny=bbox[1], maxx=bbox[2], maxy=bbox[3], crs="EPSG:4326"
-            #     )
-            # except Exception as e:
-            #     logger.warning(f"Clip failed, returning full tile: {e}")
-            #     return da
-
         except Exception as e:
             logger.error(f"Load Tile Error: {e}")
             return None
+
+    def get_tile_id(self, lat: float, lon: float) -> str | None:
+        """
+        Returns the BlueTopo tile ID covering the given coordinate.
+        """
+        self._ensure_scheme_loaded()
+        if self._gdf is None:
+            return None
+
+        from shapely.geometry import Point
+
+        p = Point(lon, lat)
+        # Assuming _gdf is in 4326
+        matches = self._gdf[self._gdf.contains(p)]
+
+        if matches.empty:
+            return None
+
+        row = matches.iloc[0]
+        return str(row.get("tile_id", row.get("tile")))
+
+    def get_source_survey_id(self, lat: float, lon: float) -> str | None:
+        """
+        Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
+
+        Strategy Cascade:
+        1. **Embedded RAT**: Inspects Band 3 of the local GeoTIFF.
+        2. **Sidecar RAT**: Downloads the linked .vat.dbf from the Tile Scheme.
+        3. **HSMDB API**: Queries the NOAA NCEI spatial API directly.
+        """
+
+        # 1. Tile Resolution
+        tile_id = self.get_tile_id(lat, lon)
+        if not tile_id:
+            logger.debug("No BlueTopo tile found. Fallback to API.")
+            return self._resolve_from_hsmdb_api(lat, lon)
+
+        # 2. Local File Inspection (Embedded RAT + Pixel Value)
+        local_path = self._ensure_tile_cached(tile_id)
+        pixel_val: int | None = None
+
+        if local_path:
+            try:
+                # Use rioxarray/rasterio as osgeo.gdal is unreliable in this env
+                with rioxarray.open_rasterio(local_path, masked=True) as da:
+                    # Reproject point to tile CRS
+                    import numpy as np
+                    from pyproj import Transformer
+
+                    # da.rio.crs must be present
+                    if da.rio.crs:
+                        logger.debug(f"CRS: {da.rio.crs}")
+
+                        # Handle potential Compound CRS (Horiz + Vert) which causes failure without geoids
+                        from pyproj import CRS
+
+                        target_crs = da.rio.crs
+                        try:
+                            crs_obj = CRS.from_user_input(da.rio.crs)
+                            if crs_obj.is_compound:
+                                logger.debug("Compound CRS detected, extracting horizontal component.")
+                                # Assuming first sub-crs is horizontal (standard)
+                                target_crs = crs_obj.sub_crs_list[0]
+                                if target_crs.to_epsg():
+                                    target_crs = f"EPSG:{target_crs.to_epsg()}"
+                                    logger.debug(f"Using EPSG Code: {target_crs}")
+                        except Exception as e:
+                            logger.warning(f"CRS parsing warning: {e}")
+
+                        transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+
+                        xx, yy = transformer.transform(lon, lat)
+                        if np.isinf(xx) or np.isinf(yy):
+                            logger.warning("Transformation returned INF! Retrying with hardcoded EPSG:26918")
+                            t2 = Transformer.from_crs("EPSG:4326", "EPSG:26918", always_xy=True)
+                            xx, yy = t2.transform(lon, lat)
+
+                        logger.debug(
+                            f"Rio Pixel Check: {lat},{lon} -> {xx:.2f}, {yy:.2f} in bounds {da.rio.bounds()}"
+                        )
+
+                        # Select from Band 3 (Contributor)
+                        # Use nearest neighbor lookup
+                        try:
+                            # band=3 (1-based index in rioxarray usually)
+                            val = da.sel(x=xx, y=yy, method="nearest").sel(band=3).item()
+                            # Check masking
+                            if val is not None and not np.isnan(val):
+                                pixel_val = int(val)
+                                logger.debug(f"Resolved Pixel Value: {pixel_val}")
+                        except Exception:
+                            # Point might be out of bounds
+                            pass
+            except Exception as e:
+                logger.warning(f"Error inspecting local tile (rioxarray) {tile_id}: {e}")
+
+        # 3. Sidecar Fallback
+        if pixel_val is not None:
+            survey_id = self._resolve_from_sidecar_rat(tile_id, pixel_val)
+            if survey_id:
+                logger.debug(f"Resolved from Sidecar RAT: {survey_id}")
+                return survey_id
+
+        # 4. API Fallback
+        logger.info(f"Fallback to HSMDB API for {lat}, {lon}")
+        return self._resolve_from_hsmdb_api(lat, lon)
+
+    def _geo_to_pixel(self, ds: Any, lat: float, lon: float) -> tuple[int | None, int | None]:
+        """Helper to transform lat/lon to pixel coordinates."""
+        try:
+            from osgeo import gdal, osr
+
+            gt = ds.GetGeoTransform()
+            logger.debug(f"GeoTransform: {gt}")
+            proj = ds.GetProjection()
+            x_geo, y_geo = lon, lat
+
+            if proj:
+                src_srs = osr.SpatialReference()
+                src_srs.ImportFromEPSG(4326)
+                if hasattr(osr, "OAMS_TRADITIONAL_GIS_ORDER"):
+                    src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                dst_srs = osr.SpatialReference()
+                dst_srs.ImportFromWkt(proj)
+                transform = osr.CoordinateTransformation(src_srs, dst_srs)
+                # Traditional: Lon, Lat
+                point = transform.TransformPoint(x_geo, y_geo)
+                x_geo, y_geo = point[0], point[1]
+
+            inv_gt = gdal.InvGeoTransform(gt)
+            if inv_gt:
+                x_pix = int(inv_gt[0] + x_geo * inv_gt[1] + y_geo * inv_gt[2])
+                y_pix = int(inv_gt[3] + x_geo * inv_gt[4] + y_geo * inv_gt[5])
+
+                logger.debug(f"GeoToPixel: {lat},{lon} -> {x_geo},{y_geo} (proj) -> {x_pix},{y_pix} (pix)")
+
+                if 0 <= x_pix < ds.RasterXSize and 0 <= y_pix < ds.RasterYSize:
+                    return x_pix, y_pix
+        except Exception as e:
+            logger.warning(f"GeoToPixel Error: {e}")
+            pass
+        return None, None
+
+    def _lookup_rat(self, rat: Any, pixel_val: int) -> str | None:
+        """Helper to query a GDAL RAT."""
+        for i in range(rat.GetColumnCount()):
+            col_name = rat.GetNameOfCol(i)
+            if (
+                col_name.lower() in ["survey_id", "source_survey_id", "source_id"]
+                and 0 <= pixel_val < rat.GetRowCount()
+            ):
+                val = rat.GetValueAsString(pixel_val, i)
+                if val:
+                    survey_id = str(val)
+                    return survey_id
+        return None
+
+    def _resolve_from_sidecar_rat(self, tile_id: str, pixel_val: int) -> str | None:
+        """Downloads and parses the sidecar RAT linked in the GPKG."""
+        self._ensure_scheme_loaded()
+        if self._gdf is None:
+            return None
+
+        try:
+            # Use 'tile' column (common in geopackage)
+            # Check columns first
+            tile_col = "tile" if "tile" in self._gdf.columns else "Tile_Name"
+            matches = self._gdf[self._gdf[tile_col] == tile_id]
+            if matches.empty:
+                logger.warning(f"Tile {tile_id} not found in scheme index.")
+                return None
+
+            tile_row = matches.iloc[0]
+            rat_link = tile_row.get("RAT_Link") or tile_row.get("rat_link")
+            # Download Sidecar
+            filename = Path(rat_link).name
+            sidecar_dir = Path(self.cache_dir) / "bluetopo" / "sidecars"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_file = sidecar_dir / filename
+
+            if not sidecar_file.exists():
+                logger.info(f"Downloading Sidecar RAT: {rat_link}")
+                r = requests.get(rat_link, timeout=30)
+                if r.status_code == 200:
+                    with open(sidecar_file, "wb") as f:
+                        f.write(r.content)
+                else:
+                    logger.warning(f"Failed to download sidecar: {r.status_code}")
+                    return None
+
+            # Parse based on extension
+            if sidecar_file.suffix.lower() == ".xml":
+                return self._parse_aux_xml_rat(sidecar_file, pixel_val)
+
+            # Default .dbf parser (geopandas)
+            df = gpd.read_file(sidecar_file)
+            # Normalize columns
+            df.columns = [c.lower() for c in df.columns]
+
+            val_col = next((c for c in df.columns if c in ["value", "oid", "id"]), None)
+            survey_col = next(
+                (c for c in df.columns if c in ["survey_id", "source_survey_id", "source_id"]), None
+            )
+
+            if val_col and survey_col:
+                match = df[df[val_col] == pixel_val]
+                if not match.empty:
+                    return str(match.iloc[0][survey_col])
+
+        except Exception as e:
+            logger.warning(f"Sidecar parsing failed: {e}")
+
+    def _parse_aux_xml_rat(self, xml_path: Path, pixel_val: int) -> str | None:
+        """Parses GDAL PAM XML to find Survey ID."""
+        import xml.etree.ElementTree as Et
+
+        try:
+            tree = Et.parse(xml_path)
+            root = tree.getroot()
+
+            # Look for Band 3 RAT
+            rat_node = None
+            for band in root.findall("PAMRasterBand"):
+                if band.get("band") == "3":
+                    rat_node = band.find("GDALRasterAttributeTable")
+                    break
+
+            # Fallback
+            if rat_node is None:
+                rat_node = root.find("GDALRasterAttributeTable")
+
+            if rat_node is None:
+                return None
+
+            # Map Columns
+            field_map = {}
+            for fd in rat_node.findall("FieldDefn"):
+                idx_str = fd.get("index")
+                if not idx_str:
+                    continue
+                idx = int(idx_str)
+                name_tag = fd.find("Name")
+                if name_tag is not None and name_tag.text:
+                    field_map[idx] = name_tag.text.lower()
+
+            val_idx = next((i for i, n in field_map.items() if n in ["value", "id"]), None)
+            survey_idx = next(
+                (i for i, n in field_map.items() if n in ["survey_id", "source_survey_id", "source_id"]), None
+            )
+
+            if val_idx is None or survey_idx is None:
+                return None
+
+            # Search Rows
+            for row in rat_node.findall("Row"):
+                fs = row.findall("F")
+                if len(fs) <= max(val_idx, survey_idx):
+                    continue
+
+                v_txt = fs[val_idx].text
+                if v_txt:
+                    try:
+                        v = int(float(str(v_txt)))
+                        if v == pixel_val:
+                            s_txt = fs[survey_idx].text
+                            return str(s_txt) if s_txt else None
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as e:
+            logger.warning(f"XML Parsing Error: {e}")
+
+        return None
+
+    def _resolve_from_hsmdb_api(self, lat: float, lon: float) -> str | None:
+        """Tertiary fallback: Query NCEI HSMDB API."""
+        url = (
+            "https://gis.ngdc.noaa.gov/arcgis/rest/services/web_mercator/nos_hydro_dynamic/MapServer/0/query"
+        )
+        params = {
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "SURVEY_ID",
+            "returnGeometry": "false",
+            "f": "json",
+        }
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                features = data.get("features", [])
+                if features:
+                    # Return first match
+                    val = features[0]["attributes"].get("SURVEY_ID")
+                    return str(val) if val else None
+        except Exception as e:
+            logger.warning(f"HSMDB API Query failed: {e}")
+        return None

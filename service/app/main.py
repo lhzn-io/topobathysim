@@ -13,7 +13,7 @@ from typing import Annotated
 import numpy as np
 import xarray as xr
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import Response
 from rasterio.enums import Resampling
 
@@ -82,19 +82,143 @@ def get_manager() -> BathyManager:
     return bathy_manager
 
 
-def render_png(da: xr.DataArray) -> bytes:
-    """Renders DataArray to PNG bytes using a terrain colormap."""
+# Visualization Constants
+# Reasonable Global Defaults to prevent checkerboarding on slippy maps
+# Visualization Constants
+# Reasonable Global Defaults to prevent checkerboarding on slippy maps
+GLOBAL_VMIN = -50.0
+GLOBAL_VMAX = 20.0
+
+# Feature Flags
+# Set to True to skip querying Microsoft Planetary Computer (3DEP/Copernicus)
+# Useful if API is throttled or to speed up local dev where land is not needed.
+SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in ("true", "1", "yes")
+
+
+def render_png(
+    da: xr.DataArray, style: str = "default", vmin: float | None = None, vmax: float | None = None
+) -> bytes:
+    """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
     from io import BytesIO
 
+    import matplotlib.colors as mcolors
     import matplotlib.image as mpimg
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LightSource
 
     buf = BytesIO()
-    vals = da.values
-    # Check for empties or nans?
-    # Terrain cmap: Blue -> Green -> Brown
-    # Normalize approx -10m to 30m for coastal contrast
-    # Use vmin/vmax to avoid flickering colors between tiles
-    mpimg.imsave(buf, vals, cmap="terrain", vmin=-20, vmax=40, format="png")
+    vals = da.values.astype(np.float32)
+
+    # Hillshade Calculation
+    ls = LightSource(azdeg=315, altdeg=45)
+
+    if style == "hillshade":
+        # Pure Grayscale Hillshade
+        hillshade = ls.hillshade(vals, vert_exag=10, dx=1.0, dy=1.0)
+        mpimg.imsave(buf, hillshade, cmap="gray", format="png")
+        buf.seek(0)
+        return buf.getvalue()
+
+    # Default: Color + Hillshade Overlay
+    # Determine bounds: Explicit -> Global Default
+    # To fix checkerboarding, we default to the Global Sane Range if no explicit bounds are given.
+    eff_vmin = vmin if vmin is not None else GLOBAL_VMIN
+    eff_vmax = vmax if vmax is not None else GLOBAL_VMAX
+
+    # Adaptive Colormap Logic
+    cmap = plt.cm.terrain
+    norm = None
+
+    # Logic:
+    # 1. If Explicit/Global bounds cross zero: Use TwoSlopeNorm (Standard TopoBathy)
+    # 2. If Purely Underwater: Use Turbo (High Contrast)
+    # 3. If Purely Land: Use Texture
+
+    # Logic:
+    # 1. If Explicit/Global bounds cross zero: Use TwoSlopeNorm (Standard TopoBathy)
+    # 2. If Purely Underwater: Use Turbo (High Contrast)
+    # 3. If Purely Land: Use Texture
+
+    if style in ["chart", "default"]:
+        # Chart Style (Refined Hybrid) - NOW DEFAULT
+        # Water: Blues (Dark -> Light)
+        # Land: Yellow (Shore) -> Green (Low) -> Dark Green (High) -> Brown -> White (Peak)
+
+        # 1. Sample 'Blues_r' for the bottom half (0.0 to 0.5)
+        # Blues_r goes from Dark Blue to Light Blue/White.
+        # We want Dark Blue (Deep) -> Light Blue (Shallow).
+        blues = plt.get_cmap("Blues_r")
+
+        # 2. Create Custom Land Colormap for top half (0.5 to 1.0)
+        # Nodes relative to the land section (0.0 to 1.0 of the land part)
+        # 0.0 (Shore) -> Pale Yellow
+        # 0.2 (Lowland) -> Light Green
+        # 0.5 (Mid) -> Forest Green
+        # 0.8 (Mountain) -> Brown
+        # 1.0 (Peak) -> White
+        land_colors = [
+            (0.0, "#F7E5B5"),  # Pale Yellow (Sand/Shore)
+            (0.2, "lightgreen"),  # Lowland
+            (0.5, "forestgreen"),  # Mid/Hills
+            (0.8, "sienna"),  # Mountain
+            (1.0, "snow"),  # Peak
+        ]
+        land_cmap = mcolors.LinearSegmentedColormap.from_list("land_custom", land_colors)
+
+        # 3. Combine them
+        # We need to construct a new colormap that stacks them.
+        # We sample N colors from each and stack.
+        n_bins = 256
+        colors_water = blues(np.linspace(0.0, 1.0, n_bins))
+        colors_land = land_cmap(np.linspace(0.0, 1.0, n_bins))
+
+        # Stack: Water then Land
+        colors_combined = np.vstack((colors_water, colors_land))
+
+        cmap = mcolors.LinearSegmentedColormap.from_list("chart_hybrid", colors_combined)
+
+        # 4. Use TwoSlopeNorm to ensure the center of the combined map (0.5) aligns with Z=0
+        norm = mcolors.TwoSlopeNorm(vmin=eff_vmin, vcenter=0, vmax=eff_vmax)
+
+    elif style == "blues":
+        # Blues Scale:
+        # VMin (Deep) -> Dark Blue
+        # VMax (Shallow/Surface) -> Light Blue
+        # This is essentially 'Blues_r' (Reverse Blues)
+        cmap = plt.get_cmap("Blues_r")
+        norm = mcolors.Normalize(vmin=eff_vmin, vmax=eff_vmax)
+
+    else:
+        # "Classic" / Adaptive Fallback (was old default)
+
+        # Check if we are strictly underwater (Global or Explicit)
+        if eff_vmax <= 0:
+            try:
+                cmap = plt.get_cmap("turbo")
+            except ValueError:
+                cmap = plt.get_cmap("jet")
+            norm = mcolors.Normalize(vmin=eff_vmin, vmax=eff_vmax)
+
+        # Check if we are strictly land
+        elif eff_vmin >= 0:
+            land_colors = plt.cm.terrain(np.linspace(0.5, 1.0, 256))
+            land_cmap = mcolors.LinearSegmentedColormap.from_list("terrain_land", land_colors)
+            cmap = land_cmap
+            norm = mcolors.Normalize(vmin=eff_vmin, vmax=eff_vmax)
+
+        # Mixed / Standard Case (Crossing Zero)
+        else:
+            cmap = plt.cm.terrain
+            # TwoSlopeNorm ensures 0 is always the transition from Blue to Green
+            norm = mcolors.TwoSlopeNorm(vmin=eff_vmin, vcenter=0, vmax=eff_vmax)
+    try:
+        rgb = ls.shade(vals, cmap=cmap, norm=norm, vert_exag=10, dx=1.0, dy=1.0, blend_mode="overlay")
+        mpimg.imsave(buf, rgb, format="png")
+
+    except Exception as e:
+        logger.warning(f"Shade failed: {e}")
+        mpimg.imsave(buf, vals, cmap="terrain", format="png")
+
     buf.seek(0)
     return buf.getvalue()
 
@@ -165,6 +289,9 @@ def get_xyz_tile(
     lidar_url: str | None = None,
     ept_url: str | None = None,
     use_seam_blending: bool = True,
+    style: str = Query("default", description="Visualization style"),
+    vmin: float | None = Query(None, description="Explicit Min Elevation for colormap normalization"),
+    vmax: float | None = Query(None, description="Explicit Max Elevation for colormap normalization"),
 ) -> Response:
     """
     XYZ Tile Endpoint (Slippy Map / Web Mercator).
@@ -191,7 +318,19 @@ def get_xyz_tile(
     cache_dir = Path("/home/lhzn/.cache/topobathysim/tiles")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    tile_filename = f"{z}_{x}_{y}.{format}"
+    # Differentiate cache by style/vmin/vmax params if rendering PNG
+    if format == "png":
+        parts = [str(z), str(x), str(y)]
+        if style != "default":
+            parts.append(style)
+        if vmin is not None:
+            parts.append(f"min{vmin}")
+        if vmax is not None:
+            parts.append(f"max{vmax}")
+        tile_filename = "_".join(parts) + ".png"
+    else:
+        tile_filename = f"{z}_{x}_{y}.{format}"
+
     tile_path = cache_dir / tile_filename
 
     # Check cache
@@ -216,6 +355,9 @@ def get_xyz_tile(
         ept_url=ept_url,
         use_seam_blending=use_seam_blending,
         manager=manager,
+        style=style,
+        vmin=vmin,
+        vmax=vmax,
     )
 
     # Save to cache if successful
@@ -249,6 +391,9 @@ def get_fused_tile(
     lidar_url: str | None = None,
     ept_url: str | None = None,
     use_seam_blending: bool = True,
+    style: str = "default",
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> Response:
     """
     Returns a Logistic-Fused GeoTIFF merging NOAA Lidar (Land) and BlueTopo (Sea).
@@ -319,8 +464,15 @@ def get_fused_tile(
         # 1.5 Fetch Intermediate Land (Tier 3)
         # We fetch it but apply it LAST as a background fill.
 
-        land_provider = Usgs3DepProvider()
-        land_da = land_provider.fetch_dem(bounds=(b_west, b_south, b_east, b_north))
+        land_da = None
+        if not SKIP_LAND_BACKGROUND:
+            try:
+                land_provider = Usgs3DepProvider()
+                land_da = land_provider.fetch_dem(bounds=(b_west, b_south, b_east, b_north))
+            except Exception as e:
+                logger.warning(f"Background Land Fetch failed (Soft Skip): {e}")
+        else:
+            logger.debug("Skipping Background Land (Configured SKIP_LAND_BACKGROUND=True)")
 
         if land_da is not None:
             logger.debug(f"DEBUG: Land DA CRS: {land_da.rio.crs}")
@@ -343,13 +495,27 @@ def get_fused_tile(
         elif land_da is not None:
             combined_land = land_da
 
-        # 2. Fetch Bathymetry (Sea)
-        # Manager usually fetches a grid covering the area
+        logger.info("Main calling manager.get_grid...")
         bathy_da = manager.get_grid(b_south, b_north, b_west, b_east)
+        logger.info("Main received bathy_da from manager.")
 
         # FORCE ALIGNMENT: Reproject Bathy to Target Grid
         if bathy_da is not None:
-            logger.debug(f"DEBUG: Bathy DA stats: min={bathy_da.min().values}, max={bathy_da.max().values}")
+            # Optimization: Clip to target bounding box (+ buffer) to minimize data loading during reproject
+            try:
+                # Use the buffered bounds (b_west, etc) which are slightly larger than target_grid
+                # clip_box handles CRS transformation of bounds
+                bathy_da = bathy_da.rio.clip_box(
+                    minx=b_west, miny=b_south, maxx=b_east, maxy=b_north, crs="EPSG:4326"
+                )
+                logger.info("Clipped bathy_da to standard bounds.")
+            except Exception as e:
+                logger.warning(f"Clip failed (likely no overlap), proceeding: {e}")
+
+            logger.info("Main starting reproject_match...")
+            # Avoid computing stats on full Dask array, it triggers full read!
+            # logger.debug(f"DEBUG: Bathy DA stats: min={bathy_da.min().values}, max={bathy_da.max().values}")
+            logger.debug("DEBUG: Bathy DA found. Reprojecting...")
             bathy_da = bathy_da.rio.reproject_match(target_grid, resampling=Resampling.bilinear)
         else:
             logger.debug("DEBUG: Bathy DA is None!")
@@ -359,19 +525,34 @@ def get_fused_tile(
 
         if combined_land is not None:
             # Check if land is actually present (not just all NaNs)
+            # Check if land is actually present (not just all NaNs)
+            # This check requires computation if combined_land is Dask.
+            # But combined_land might be small (fused)? NO, it's reprojected (512x512).
+            # So 512x512 computation is cheap.
+            # However, safer to skip strict check if it causes issues.
+            # But let's keep it for now as it helps logic.
+            # Wait, np.all(np.isnan(combined_land.values)) computes it.
+            # If combined_land came from LandProvider (lazy dask), this triggers compute.
+            # But it's 512x512 now (after reproject). So it's fast.
+            # The Bathy stats above were on the FULL 15GB array BEFORE reproject.
+
+            # Let's keep this check but log safely.
+            # logger.debug(f"DEBUG: Combined Land Stats: ...")
+            # We removed the stats logging above, let's remove strict value check if possible?
+            # No, logic depends on it: if all NaN -> combined_land = None.
+            # This is fine for 512x512.
+
             if not np.all(np.isnan(combined_land.values)):
-                logger.debug(
-                    f"DEBUG: Combined Land Stats: "
-                    f"Min={np.nanmin(combined_land.values)}, Max={np.nanmax(combined_land.values)}"
-                )
+                pass  # Valid
             else:
                 logger.debug("DEBUG: Combined Land is All-NaN (Water Only) -> Treating as None")
                 combined_land = None
 
         if bathy_da is not None:
-            logger.debug(
-                f"DEBUG: Bathy DA Stats: Min={np.nanmin(bathy_da.values)}, Max={np.nanmax(bathy_da.values)}"
-            )
+            # logger.debug(
+            #    f"DEBUG: Bathy DA Stats: Min={np.nanmin(bathy_da.values)}, Max={np.nanmax(bathy_da.values)}"
+            # )
+            pass
 
         if combined_land is not None and bathy_da is not None:
             if use_seam_blending:
@@ -390,7 +571,7 @@ def get_fused_tile(
 
         # 4. Serialize
         if format == "png":
-            png_data = render_png(fused_da)
+            png_data = render_png(fused_da, style=style, vmin=vmin, vmax=vmax)
             return Response(content=png_data, media_type="image/png")
 
         elif format == "npy":
@@ -402,7 +583,15 @@ def get_fused_tile(
         elif format == "tif":
             with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
                 tmp_name = tmp.name
-                fused_da.rio.to_raster(tmp_name)
+
+                # Add Progress Indicator for serialization
+                from dask.diagnostics import ProgressBar
+
+                logger.debug("Starting raster serialization (compute)...")
+                with ProgressBar():
+                    fused_da.rio.to_raster(tmp_name)
+                logger.debug("Raster serialization complete.")
+
                 tmp.seek(0)
                 tif_data = tmp.read()
 
