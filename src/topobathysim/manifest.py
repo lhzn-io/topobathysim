@@ -40,9 +40,15 @@ class OfflineManifest:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 data = json.load(f)
 
-                # Check for duplicate (by href)
-                # We overwrite if exists to update properties/bbox if changed
-                existing_idx = next((i for i, x in enumerate(data["items"]) if x["href"] == asset_href), None)
+                # Check for duplicate (by Base URL - ignoring SAS tokens)
+                # This prevents accumulation of the same asset with different expiring signatures.
+                asset_base = asset_href.split("?")[0]
+
+                existing_idx = None
+                for i, x in enumerate(data["items"]):
+                    if x["href"].split("?")[0] == asset_base:
+                        existing_idx = i
+                        break
 
                 if existing_idx is not None:
                     data["items"][existing_idx] = entry

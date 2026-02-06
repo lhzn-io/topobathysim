@@ -18,6 +18,13 @@ We utilize the NOAA NGS Coastal Lidar Data Service for high-resolution nearshore
     > NOAA Office of Coast Survey. BlueTopo™: BlueTopo is a compilation of the best available public bathymetric data of U.S. waters.
     > [BlueTopo Portal](https://nauticalcharts.noaa.gov/data/bluetopo.html)
 
+## NOAA National Centers for Environmental Information (NCEI)
+
+* **Bathymetric Attributed Grid (BAG)**
+    > NOAA National Centers for Environmental Information. "Bathymetric Attributed Grid (BAG) File Format."
+    > Used for high-fidelity overrides where raw sonar survey data (e.g., *H13385*) is available.
+    > [NCEI Bathymetry Data Viewer](https://www.ncei.noaa.gov/maps/bathymetry/)
+
 ## U.S. Geological Survey (USGS)
 
 * **3D Elevation Program (3DEP)**

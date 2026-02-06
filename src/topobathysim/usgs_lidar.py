@@ -428,7 +428,10 @@ class UsgsLidarProvider:
                 if self.offline_mode:
                     logger.warning("Offline Mode: No Lidar coverage found in manifest.")
                 else:
-                    logger.warning("No Lidar coverage found in STAC for this region.")
+                    logger.warning(
+                        f"No 3DEP COPC Lidar found in Planetary Computer STAC for bbox={bounds}. "
+                        "Region may be covered by legacy datasets not yet indexed as COPC."
+                    )
                 return None
 
             href = result["href"]

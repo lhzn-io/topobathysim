@@ -12,7 +12,7 @@
 - **Multi-Source Fusion**: Automatically harmonizes data from best-available sources:
   - **Terrestrial**: USGS Lidar (via EPT/PDAL) & 3DEP (10m).
   - **Coastal Interface**: NOAA NGS Topobathy Lidar (Green-wavelength).
-  - **Aquatic**: NOAA BlueTopo (High-Res Bathymetry) & GEBCO 2025 (Global).
+  - **Aquatic**: NOAA BlueTopo (High-Res Bathymetry), NCEI BAG (Deep-Sea Precision) & GEBCO 2025 (Global).
 - **Intelligent Blending**: Uses logistic weight functions to seamlessly merge datasets at coastlines (seamline blending), eliminating sharp artifacts.
 - **Offline-First Architecture**:
   - **Asset Manifests**: Records online assets for true offline playback.
