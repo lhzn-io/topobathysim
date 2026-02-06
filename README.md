@@ -1,8 +1,4 @@
-# TopoBathySim
-
-<p align="center">
-  <img src="docs/source/_static/repo-logo.png" width="300" alt="TopoBathySim Logo">
-</p>
+# <img src="docs/source/_static/repo-logo.png" height="40" alt="TopoBathySim Logo" align="top"/> TopoBathySim
 
 **High-Fidelity Topobathymetric Fusion Engine for Digital Twins.**
 
