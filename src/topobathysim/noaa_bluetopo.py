@@ -26,10 +26,10 @@ class NoaaBlueTopoProvider:
     BUCKET_BASE = "noaa-ocs-nationalbathymetry-pds/BlueTopo"  # Bucket path for s3fs
     S3_URI_BASE = "s3://noaa-ocs-nationalbathymetry-pds/BlueTopo"
 
-    # Official Tile Scheme URL
+    # Official Tile Scheme URL (Fallback)
     TILE_SCHEME_URL = (
         "https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/"
-        "BlueTopo/_BlueTopo_Tile_Scheme/BlueTopo_Tile_Scheme_20260130_200842.gpkg"
+        "BlueTopo/_BlueTopo_Tile_Scheme/BlueTopo_Tile_Scheme_20260206_112953.gpkg"
     )
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
@@ -40,6 +40,34 @@ class NoaaBlueTopoProvider:
         # Tile Scheme stays in root or moves? Let's move to bluetopo dir too to be clean.
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
+
+    def _resolve_scheme_url(self) -> str:
+        """
+        Resolves the latest BlueTopo Tile Scheme GPKG URL from S3.
+        """
+        try:
+            fs = fsspec.filesystem("s3", anon=True)
+            pattern = f"{self.BUCKET_BASE}/_BlueTopo_Tile_Scheme/*.gpkg"
+            files = fs.glob(pattern)
+
+            if not files:
+                logger.warning("No BlueTopo scheme files found via S3 glob.")
+                return self.TILE_SCHEME_URL
+
+            # Sort by name (timestamps are in filename)
+            latest = sorted(files)[-1]
+            filename = Path(latest).name
+
+            logger.info(f"Resolved latest BlueTopo Scheme: {filename}")
+
+            # Construct HTTPS URL
+            return (
+                "https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/"
+                f"BlueTopo/_BlueTopo_Tile_Scheme/{filename}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to resolve dynamic scheme URL: {e}")
+            return self.TILE_SCHEME_URL
 
     def _ensure_scheme_loaded(self) -> None:
         """
@@ -53,7 +81,10 @@ class NoaaBlueTopoProvider:
                 # Ensure directory exists (it might have been cleared runtime)
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-                response = requests.get(self.TILE_SCHEME_URL, stream=True)
+                # Dynamic Resolution
+                download_url = self._resolve_scheme_url()
+
+                response = requests.get(download_url, stream=True)
                 response.raise_for_status()
                 with open(self.scheme_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
