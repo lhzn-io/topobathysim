@@ -315,7 +315,7 @@ def get_xyz_tile(
     south = math.degrees(lat_rad_south)
 
     # Implement simple disk cache
-    cache_dir = Path("/home/lhzn/.cache/topobathysim/tiles")
+    cache_dir = Path.home() / ".cache" / "topobathysim" / "tiles"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Differentiate cache by style/vmin/vmax params if rendering PNG

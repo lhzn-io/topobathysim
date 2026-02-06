@@ -37,6 +37,8 @@ class GEBCO2025Provider(Topography):
         output_format: str = "GTiff",
         cache_dir: str = "~/.cache/topobathysim",
     ):
+        p = Path(cache_dir).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
         super().__init__(
             dem_type="SRTMGL3",  # Pass valid type to satisfy validation; we override fetch() anyway
             south=south,
@@ -44,7 +46,7 @@ class GEBCO2025Provider(Topography):
             west=west,
             east=east,
             output_format=output_format,
-            cache_dir=str(Path(cache_dir).expanduser()),
+            cache_dir=str(p),
         )
         self.tid_data: xr.DataArray | None = None
         self._da: xr.DataArray | None = None
