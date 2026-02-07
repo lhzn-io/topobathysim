@@ -346,7 +346,15 @@ class UsgsLidarProvider:
 
             # Load Result
             if Path(output_filename).exists():
-                da = rxr.open_rasterio(output_filename, masked=True)
+                da_raw = rxr.open_rasterio(output_filename, masked=True)
+                da: xr.DataArray
+                if isinstance(da_raw, list):
+                    da = cast(xr.DataArray, da_raw[0])
+                elif isinstance(da_raw, xr.Dataset):
+                    da = da_raw.to_array().isel(variable=0)
+                else:
+                    da = cast(xr.DataArray, da_raw)
+
                 da = da.rename({"band": "variable"}).squeeze("variable")
                 da.name = "elevation"
                 da.attrs.pop("long_name", None)

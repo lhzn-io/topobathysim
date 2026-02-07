@@ -40,12 +40,24 @@ pip install -e .
 The topobathymetry microservice exposes fused data via HTTP.
 
 ```bash
-```bash
 # Navigate to root
 cd topobathysim
 
-# Ensure src is in PYTHONPATH and run module
-PYTHONPATH=src python -m uvicorn service.app.main:app --host 0.0.0.0 --port 9595 --workers 4
+# Run using the helper script (Recommended)
+python service/run_server.py
+
+# OR run module directly
+python -m uvicorn topobathyserve.main:app --host 0.0.0.0 --port 9595 --workers 4
+```
+
+### 2. Running via Docker
+
+```bash
+# Build the image
+docker build -f service/Dockerfile -t topobathyserve .
+
+# Run the container
+docker run -p 9595:8000 topobathyserve
 ```
 
 *Access the viewer at `http://localhost:9595/viewer`*

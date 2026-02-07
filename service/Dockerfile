@@ -21,7 +21,7 @@ COPY service/pyproject.toml /app/
 RUN pip install .
 
 # Copy App Source
-COPY service/app /app/app
+COPY service/topobathyserve /app/topobathyserve
 
 # Run
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "topobathyserve.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

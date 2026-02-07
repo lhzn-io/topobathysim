@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import fsspec
 import geopandas as gpd
@@ -307,16 +307,13 @@ class NoaaBlueTopoProvider:
 
             # Load Lazy for memory efficiency
             da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
+            da: xr.DataArray
             if isinstance(da_raw, list):
-                da = da_raw[0]
+                da = cast(xr.DataArray, da_raw[0])
             elif isinstance(da_raw, xr.Dataset):
                 da = da_raw.to_array().isel(variable=0)
             else:
-                da = da_raw
-
-            from typing import cast
-
-            da = cast(xr.DataArray, da)
+                da = cast(xr.DataArray, da_raw)
 
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")

@@ -4,10 +4,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import xarray as xr
+from fastapi.testclient import TestClient
 
 # ensure can import app
-from app.main import app
-from fastapi.testclient import TestClient
+from topobathyserve.main import app
 
 # client = TestClient(app)
 # We use context manager in tests to ensure startup events run
@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def mock_managers() -> Generator[tuple[MagicMock, MagicMock, MagicMock], None, None]:
     with (
-        patch("app.main.BathyManager") as mock_bm,
+        patch("topobathyserve.main.BathyManager") as mock_bm,
         patch("topobathysim.lidar.LidarProvider") as mock_lp,
         patch("topobathysim.fusion.FusionEngine") as mock_fe,
     ):

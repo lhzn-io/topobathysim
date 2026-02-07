@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 import requests
 import xarray as xr
@@ -32,16 +33,13 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
         # Open with Dask chunks for lazy loading
         with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
             da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+            da: xr.DataArray
             if isinstance(da_raw, list):
-                da = da_raw[0]
+                da = cast(xr.DataArray, da_raw[0])
             elif isinstance(da_raw, xr.Dataset):
                 da = da_raw.to_array().isel(variable=0)
             else:
-                da = da_raw
-
-            from typing import cast
-
-            da = cast(xr.DataArray, da)
+                da = cast(xr.DataArray, da_raw)
 
         # BAGs usually have 'elevation' and 'uncertainty'.
         # Rasterio usually reads band 1 as elevation.
@@ -81,7 +79,7 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
             logger.warning(f"Failed to apply VDatum correction: {e}")
 
         elev.attrs["survey_source"] = filename
-        return elev
+        return cast(xr.DataArray, elev)
 
     except Exception as e:
         logger.error(f"Error reading BAG {local_path}: {e}")

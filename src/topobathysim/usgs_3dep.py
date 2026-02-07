@@ -4,6 +4,7 @@ import logging
 # Caching setup
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 import planetary_computer
 import requests  # type: ignore
@@ -269,7 +270,7 @@ class Usgs3DepProvider:
 
             logger.debug(f"Usgs3DepProvider found {len(items)} items for {collection_id}")
 
-            das = []
+            das: list[xr.DataArray] = []
             for item in items:
                 href = item["href"]
                 logger.debug(f"Fetching Land Asset: {href}")
@@ -304,13 +305,11 @@ class Usgs3DepProvider:
                         # Use chunks for lazy loading (Avoid OOM)
                         da_raw = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
                         if isinstance(da_raw, list):
-                            da = da_raw[0]
+                            da = cast(xr.DataArray, da_raw[0])
                         elif isinstance(da_raw, xr.Dataset):
                             da = da_raw.to_array().isel(variable=0)
                         else:
                             da = da_raw
-
-                        from typing import cast
 
                         da = cast(xr.DataArray, da)
                         if "band" in da.dims:

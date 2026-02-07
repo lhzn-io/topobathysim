@@ -32,10 +32,10 @@ def main() -> None:
     # Uvicorn handles reload with workers=1?? No, reload excludes workers argument.
     if args.reload:
         print("Reload enabled: Forcing workers=1")
-        uvicorn.run("app.main:app", host=args.host, port=args.port, reload=True)
+        uvicorn.run("topobathyserve.main:app", host=args.host, port=args.port, reload=True)
     else:
         print(f"Starting BathyServe on {args.host}:{args.port} with {args.workers} workers.")
-        uvicorn.run("app.main:app", host=args.host, port=args.port, workers=args.workers)
+        uvicorn.run("topobathyserve.main:app", host=args.host, port=args.port, workers=args.workers)
 
 
 if __name__ == "__main__":

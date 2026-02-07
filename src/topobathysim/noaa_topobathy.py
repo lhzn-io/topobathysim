@@ -3,6 +3,7 @@ import logging
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 import fsspec
 import geopandas as gpd
@@ -211,7 +212,7 @@ class NoaaTopobathyProvider:
         try:
             # Lazy loading to prevent OOM
             da = rioxarray.open_rasterio(vsi_path, chunks={"x": 2048, "y": 2048})
-            return da
+            return cast(xr.DataArray, da)
         except Exception as e:
             logger.warning(f"Failed to stream tile {vsi_path}: {e}")
             return None

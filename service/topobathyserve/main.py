@@ -258,7 +258,7 @@ async def get_source_info(
     """
     Returns metadata about the active data source for the coordinate.
     """
-    return dict(manager.get_source_info(lat, lon))
+    return manager.get_source_info(lat, lon)
 
 
 @app.get("/metadata", response_model=TIDReportResponse)

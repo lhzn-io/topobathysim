@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["app"]
+packages = ["topobathyserve"]
 
 [tool.hatch.envs.default]
 dependencies = [
