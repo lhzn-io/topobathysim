@@ -5,6 +5,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+![TopoBathySim Screenshot](docs/source/_static/topobathyscreenshot.png)
+
 **TopoBathySim** is a Python library and microservice designed to generate seamless, high-resolution Digital Elevation Models (DEMs) by fusing disparate geospatial datasets. Originally developed for amphibious robotics simulations, it intelligently merges terrestrial Lidar, coastal bathymetry, and global terrain data into cohesive, unified tiles.
 
 ## Key Features
