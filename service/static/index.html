@@ -79,15 +79,33 @@
                 <option value="chart">Chart (Forced Hybrid)</option>
                 <option value="blues">Blues (Monochromatic)</option>
                 <option value="hillshade">Hillshade (Grayscale)</option>
+                <option value="source">Source Map (Debug)</option>
             </select>
         </div>
 
-        <div class="legend">
+        <!-- Default Legend -->
+        <div id="legend-default" class="legend">
             Elevation (Terrain Colormap)
             <div class="colorbar"></div>
             <div style="display:flex; justify-content:space-between; margin-top:2px;">
                 <span>Low</span>
                 <span>High</span>
+            </div>
+        </div>
+
+        <!-- Source Legend (Hidden by default) -->
+        <div id="legend-source" class="legend" style="display: none;">
+            <b>Source Map Legend</b>
+            <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 5px; font-size: 11px;">
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:red; margin-right:5px; border:1px solid #ccc;"></span> BAG (Tier 0)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(255,128,0); margin-right:5px; border:1px solid #ccc;"></span> Fused Lidar/Topo (Tier 1)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(0,255,0); margin-right:5px; border:1px solid #ccc;"></span> Airborne Lidar</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(128,255,0); margin-right:5px; border:1px solid #ccc;"></span> Topobathy Lidar</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:blue; margin-right:5px; border:1px solid #ccc;"></span> CUDEM (Tier 2)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:cyan; margin-right:5px; border:1px solid #ccc;"></span> BlueTopo (Tier 3)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(153,102,51); margin-right:5px; border:1px solid #ccc;"></span> Land (Tier 3)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:gray; margin-right:5px; border:1px solid #ccc;"></span> GEBCO (Tier 4)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:black; margin-right:5px; border:1px solid #ccc;"></span> No Data</div>
             </div>
         </div>
         <div id="debug-info"
@@ -196,7 +214,21 @@
 
         // Style Selector Logic
         var styleSelect = document.getElementById('style-select');
+        var legendDefault = document.getElementById('legend-default');
+        var legendSource = document.getElementById('legend-source');
+
+        function updateLegend(style) {
+            if (style === 'source') {
+                legendDefault.style.display = 'none';
+                legendSource.style.display = 'block';
+            } else {
+                legendDefault.style.display = 'block';
+                legendSource.style.display = 'none';
+            }
+        }
+
         styleSelect.value = initStyle;
+        updateLegend(initStyle);
 
         styleSelect.addEventListener('change', function () {
             var newStyle = this.value;
@@ -212,6 +244,8 @@
             // Re-construct URL with new style
             // We use 'setUrl' but we need to keep the xyz placeholders.
             bathyLayer.setUrl('/tiles/{z}/{x}/{y}?format=png&style=' + newStyle);
+
+            updateLegend(newStyle);
 
             updateUrl();
         });

@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import numpy as np
 import xarray as xr
@@ -114,6 +114,37 @@ def render_png(
 
     buf = BytesIO()
     vals = da.values.astype(np.float32)
+
+    # Source Visualization Style
+    if style == "source":
+        # Create categorical colormap for IDs
+        # 0=Canvas (Black), 10=BAG (Red), 20=Lidar (Green), 21=Topobathy (Lime),
+        # 22=Fused (Orange), 30=CUDEM (Blue), 40=BlueTopo (Cyan), 50=Land (Brown), 60=GEBCO (Gray)
+
+        # Colors dict
+        cd = {
+            0: (0, 0, 0, 1),  # Black
+            10: (1, 0, 0, 1),  # Red (BAG)
+            20: (0, 1, 0, 1),  # Green (Lidar)
+            21: (0.5, 1, 0, 1),  # Lime (Topobathy)
+            22: (1, 0.5, 0, 1),  # Orange (Fused) (Actually confusing, but lets stick to standard)
+            30: (0, 0, 1, 1),  # Blue (CUDEM)
+            40: (0, 1, 1, 1),  # Cyan (BlueTopo)
+            50: (0.6, 0.4, 0.2, 1),  # Brown (Land)
+            60: (0.5, 0.5, 0.5, 1),  # Gray (GEBCO)
+        }
+
+        # Create output RGBA
+        h, w = vals.shape
+        rgba = np.zeros((h, w, 4), dtype=np.float32)
+
+        for pid, color in cd.items():
+            mask = np.isclose(vals, pid)
+            rgba[mask] = color
+
+        mpimg.imsave(buf, rgba, format="png")
+        buf.seek(0)
+        return buf.getvalue()
 
     # Hillshade Calculation
     ls = LightSource(azdeg=315, altdeg=45)
@@ -512,8 +543,34 @@ def get_fused_tile(
             combined_land = land_da
 
         logger.info("Main calling manager.get_grid...")
-        bathy_da = manager.get_grid(b_south, b_north, b_west, b_east)
+
+        # Determine if we need source mask
+        need_source = style == "source"
+
+        result = manager.get_grid(b_south, b_north, b_west, b_east, return_source_mask=need_source)
+
+        source_da = None
+        if need_source:
+            # Check if result is tuple
+            if isinstance(result, tuple):
+                bathy_da, source_da = result
+            else:
+                logger.warning("Expected tuple from get_grid but got DA. Source mask missing.")
+                bathy_da = cast(xr.DataArray, result)
+        else:
+            bathy_da = cast(xr.DataArray, result)
+
         logger.info("Main received bathy_da from manager.")
+
+        if need_source and source_da is not None:
+            # Reproject to target
+            # Use nearest neighbor to preserve IDs
+            source_da = cast(
+                xr.DataArray,
+                source_da.rio.reproject_match(target_grid, resampling=Resampling.nearest),
+            )
+            png_data = render_png(source_da, style="source")
+            return Response(content=png_data, media_type="image/png")
 
         # FORCE ALIGNMENT: Reproject Bathy to Target Grid
         if bathy_da is not None:

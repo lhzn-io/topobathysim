@@ -14,6 +14,17 @@ from .usgs_lidar import UsgsLidarProvider
 logger = logging.getLogger(__name__)
 
 
+SOURCE_ID_BAG = 10
+SOURCE_ID_LIDAR = 20
+SOURCE_ID_TOPOBATHY = 21
+SOURCE_ID_FUSION = 22
+SOURCE_ID_CUDEM = 30
+SOURCE_ID_BLUETOPO = 40
+SOURCE_ID_LAND = 50
+SOURCE_ID_GEBCO = 60
+SOURCE_ID_CANVAS = 0
+
+
 class BathyManager:
     """
     Orchestrates bathymetry data access, intelligently switching between
@@ -126,11 +137,21 @@ class BathyManager:
         self.gebco = GEBCO2025Provider(north=north, south=south, west=west, east=east)
         self.gebco.fetch()
 
-    def get_grid(self, south: float, north: float, west: float, east: float) -> "xr.DataArray":
+    def get_grid(
+        self,
+        south: float,
+        north: float,
+        west: float,
+        east: float,
+        target_shape: tuple[int, int] | None = None,
+        return_source_mask: bool = False,
+    ) -> "xr.DataArray | tuple[xr.DataArray, xr.DataArray | None]":
         """
         Returns the best available bathymetry grid for the bbox.
         Prioritizes BlueTopo.
         """
+        import numpy as np
+
         # 0. Fetch Topobathy Lidar (Tier 0 - Intertidal/Land-Sea)
         topobathy_da = None
         if self.topobathy:
@@ -176,6 +197,9 @@ class BathyManager:
         blue_topo_da = None
         base_da = None
 
+        # Track effective source for base_da
+        # base_sid = SOURCE_ID_GEBCO
+
         if self.blue_topo:
             logger.info("Attempting to resolve BlueTopo tiles.")
             tile_ids = self.blue_topo.resolve_tiles_in_bbox(west, south, east, north)
@@ -212,39 +236,58 @@ class BathyManager:
             else:
                 logger.info("No BlueTopo tiles found for the bbox.")
 
+        # Construct Base DA Logic + Source Mask Logic
+        source_da = None
+
         if bag_da is not None:
             # GAP FILLING STRATEGY
             if blue_topo_da is not None:
                 logger.info("Fusing BAG (Priority) with BlueTopo (Background Fill)...")
                 try:
-                    # Reproject BlueTopo to match BAG (High Res is master)
-                    # We use nearest neighbor or bilinear? User said "step changes",
-                    # so maybe nearest ensures we don't smooth edges?
-                    # But verifying alignment is better with bilinear for the background itself.
-                    # The "step change" comes from the transition from BAG to BlueTopo.
-                    # Let's align BlueTopo to BAG.
                     from rasterio.enums import Resampling
 
                     bg_fill = blue_topo_da.rio.reproject_match(bag_da, resampling=Resampling.nearest)
-
-                    # Fill NaNs in BAG with BlueTopo
-                    # combine_first: "Combine two DataArray objects by filling null values in the first..."
                     base_da = bag_da.combine_first(bg_fill)
-
-                    # Ensure metadata is preserved or updated
                     base_da.attrs["source"] = f"Fused: {bag_da.attrs.get('survey_source', 'BAG')} + BlueTopo"
+
+                    if return_source_mask:
+                        # Construct mask
+                        # Default is BAG (10)
+                        source_da = xr.full_like(base_da, SOURCE_ID_BAG)
+                        # Where BAG is NaN, we used BlueTopo (40)
+                        # Identify where bag_da was NaN but bg_fill was Valid
+                        mask_fill = np.isnan(bag_da) & ~np.isnan(bg_fill)
+                        source_da = source_da.where(~mask_fill, SOURCE_ID_BLUETOPO)
+                        # Where both are NaN is implicitly BAG ID but valid check later will handle it?
+                        # Or set to 0?
+                        # Let's update NaNs to 0 (Canvas)
+                        source_da = source_da.where(~np.isnan(base_da), SOURCE_ID_CANVAS)
+
                 except Exception as e:
                     logger.error(f"Gap Fill Fusion Failed: {e}")
                     base_da = bag_da
+                    if return_source_mask:
+                        source_da = xr.full_like(base_da, SOURCE_ID_BAG).where(
+                            ~np.isnan(base_da), SOURCE_ID_CANVAS
+                        )
             else:
                 base_da = bag_da
+                if return_source_mask:
+                    source_da = xr.full_like(base_da, SOURCE_ID_BAG).where(
+                        ~np.isnan(base_da), SOURCE_ID_CANVAS
+                    )
 
             logger.info("Manager returning Bathy Grid (Base DA) from BAG data (possibly fused).")
-            return base_da
+            # We defer return to handle source tracking return structure
 
         # 1.6 Use BlueTopo as Base if no BAG
         if base_da is None and blue_topo_da is not None:
             base_da = blue_topo_da
+            if return_source_mask:
+                source_da = xr.full_like(base_da, SOURCE_ID_BLUETOPO).where(
+                    ~np.isnan(base_da), SOURCE_ID_CANVAS
+                )
+
         if base_da is None:
             logger.info("No BlueTopo or BAG data found. Falling back to GEBCO 2025.")
             g = GEBCO2025Provider(south=south, north=north, west=west, east=east)
@@ -261,6 +304,9 @@ class BathyManager:
                     da.rio.write_crs("EPSG:4326", inplace=True)
             base_da = da
 
+            if return_source_mask:
+                source_da = xr.full_like(base_da, SOURCE_ID_GEBCO)
+
         # 3. Fusion: Topobathy > Base
         if topobathy_da is not None and base_da is not None:
             # Ensure Topobathy is in same CRS as Base
@@ -269,16 +315,58 @@ class BathyManager:
                     topobathy_da = topobathy_da.rio.reproject_match(base_da)
                 except Exception as e:
                     logger.warning(f"Reprojection failed for Topobathy Lidar: {e}")
+                    # Only return base_da if failure
+                    # We need to handle source mask return structure
+                    if return_source_mask:
+                        return base_da, source_da
                     return base_da
 
             engine = FusionEngine()
             try:
                 from typing import cast
 
+                # We need to intersect logic to update source mask
+                # If fusion happens, it's confusing.
+                # Simple logic for source mask:
+                # If topobathy is valid, it overwrites base_da?
+                # FusionEngine 'fuse_seamline' does blending.
+                # Let's say: if weight > 0.5 -> Topobathy(21), else Base(XX).
+                # This requires access to the weight mask.
+                # For now, simplistic approach: "Fused" (22) everywhere they overlap?
+                # Fused source ID = 22
+
                 fused = engine.fuse_seamline(lidar_da=cast(xr.DataArray, topobathy_da), bathy_da=base_da)
+
+                if return_source_mask:
+                    # Update source mask to reflect 'Fused' or 'Topobathy'
+                    # Align source mask to fused result (which usually matches bathy_da geometry)
+                    # Note: fuse_seamline returns matching bathy_da geometry
+
+                    if source_da is not None:
+                        # Overwrite with Topobathy ID where Topobathy valid?
+                        # Or verify overlap.
+                        valid_topo = ~np.isnan(cast(xr.DataArray, topobathy_da))
+
+                        # Ideally we know the 'weight' but we don't here.
+                        if source_da.shape != fused.shape:
+                            # Should match base_da which matches fused
+                            pass
+
+                        source_da = source_da.where(~valid_topo, SOURCE_ID_TOPOBATHY)
+                        # This implies Topobathy dominance.
+                    else:
+                        # Should exist if base_da exists
+                        source_da = xr.full_like(fused, SOURCE_ID_TOPOBATHY)  # fallback
+
+                if return_source_mask:
+                    return fused, source_da
                 return fused
             except Exception as e:
                 logger.error(f"Fusion Failed: {e}")
+                if return_source_mask:
+                    return base_da, source_da
                 return base_da
 
+        if return_source_mask:
+            return base_da, source_da
         return base_da
