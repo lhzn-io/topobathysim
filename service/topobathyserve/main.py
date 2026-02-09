@@ -182,10 +182,6 @@ def render_png(
         # Standard lines
         cs = ax.contour(vals, levels=levels, colors="black", linewidths=0.5, alpha=0.7, origin="upper")
 
-        # Index lines (every 5th)
-        # index_levels = levels[::5]
-        # cs_index = ax.contour(vals, levels=index_levels, colors='black', linewidths=1.0, alpha=0.9, origin='upper')
-
         # Zero line (Coastline) - Thick Red/Black
         ax.contour(vals, levels=[0], colors="red", linewidths=1.5, alpha=0.8, origin="upper")
 
@@ -481,7 +477,7 @@ def get_fused_tile(
         if need_source and source_da is not None:
             # Reproject to target
             source_da = source_da.rio.reproject_match(target_grid, resampling=Resampling.nearest)
-            png_data = render_png(source_da, style="source")
+            png_data = render_png(cast(xr.DataArray, source_da), style="source")
             return Response(content=png_data, media_type="image/png")
 
         # The Manager returns a fully fused grid (Lidar + Topobathy + BlueTopo + CUDEM + GEBCO)
@@ -494,7 +490,7 @@ def get_fused_tile(
 
         # 4. Serialize
         if format == "png":
-            png_data = render_png(final_da, style=style, vmin=vmin, vmax=vmax, zoom=zoom)
+            png_data = render_png(cast(xr.DataArray, final_da), style=style, vmin=vmin, vmax=vmax, zoom=zoom)
             return Response(content=png_data, media_type="image/png")
 
         elif format == "npy":

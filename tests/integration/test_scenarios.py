@@ -1,8 +1,10 @@
 import logging
 import math
+from typing import cast
 
 import numpy as np
 import pytest
+import xarray as xr
 
 from topobathysim.manager import BathyManager
 
@@ -12,7 +14,7 @@ logger.setLevel(logging.DEBUG)
 
 
 @pytest.fixture(autouse=True, scope="module")
-def silence_chatty_libraries():
+def silence_chatty_libraries() -> None:
     """
     Configures logging to silence noisy third-party libraries while
     keeping 'topobathysim' and local tests verbose.
@@ -68,7 +70,7 @@ def xyz_to_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
         ),  # Scenario from verify_user_tile.py (matches any of these)
     ],
 )
-def test_real_world_tile_scenarios(z, x, y, expected_source_substr):
+def test_real_world_tile_scenarios(z: int, x: int, y: int, expected_source_substr: str | list[str]) -> None:
     """
     Verify specific real-world tiles known to contain specific data types.
     This replaces the ad-hoc scripts in tests/scripts/.
@@ -79,7 +81,8 @@ def test_real_world_tile_scenarios(z, x, y, expected_source_substr):
     manager = BathyManager(use_blue_topo=True, use_cudem=True, use_lidar=True)
 
     # Use a smaller shape for speed, but large enough to catch features
-    da = manager.get_grid(south, north, west, east, target_shape=(256, 256))
+    result = manager.get_grid(south, north, west, east, target_shape=(256, 256))
+    da = cast(xr.DataArray, result)
 
     assert da is not None, "Grid generation failed (returned None)"
     assert da.shape == (256, 256)

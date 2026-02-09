@@ -1,3 +1,4 @@
+import contextlib
 import fcntl
 import logging
 import zipfile
@@ -215,10 +216,8 @@ class CUDEMProvider:
                 # But some tiles might be raw lat/lon without CRS header.
                 # NAD83 is the standard for NOAA NCEI products in the US.
                 logger.warning(f"CUDEM tile {path.name} missing CRS. Assuming EPSG:4269 (NAD83).")
-                try:
+                with contextlib.suppress(Exception):
                     da.rio.write_crs("EPSG:4269", inplace=True)
-                except Exception:
-                    pass
 
             return da
 
@@ -237,7 +236,7 @@ class CUDEMProvider:
         logger.info(f"Found {len(matches)} CUDEM tiles for bbox.")
 
         das: list[xr.DataArray] = []
-        for idx, row in matches.iterrows():
+        for _, row in matches.iterrows():
             # Loading full tile
             da = self.load_tile(row, (west, south, east, north))
             if da is not None:

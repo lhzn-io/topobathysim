@@ -242,9 +242,9 @@ class BathyManager:
                 logger.debug("Reprojection complete.")
 
                 # Condition: "Upland" defined as > 1.0m (User Threshold)
-                UPLAND_THRESHOLD = 1.0
+                upland_threshold = 1.0
 
-                upland_mask = lidar_da > UPLAND_THRESHOLD
+                upland_mask = lidar_da > upland_threshold
 
                 # 1. Start with Topo (The "Base" for this tier)
                 fused = topo_aligned.copy()
@@ -254,7 +254,7 @@ class BathyManager:
 
                 # 3. Fill gaps with High Res Lidar
                 # Filter Lidar below threshold to prevent filling gaps with potential water noise.
-                clean_lidar = lidar_da.where(lidar_da > UPLAND_THRESHOLD)
+                clean_lidar = lidar_da.where(lidar_da > upland_threshold)
                 fused = fused.combine_first(clean_lidar)
 
                 valid_layers.append((1, "FusedLidarTopo", fused))

@@ -22,7 +22,7 @@ class MockTopography:
 
 sys.modules["bmi_topography"].Topography = MockTopography  # type: ignore
 
-from topobathysim.gebco_2025 import GEBCO2025Provider as GEBCO2025  # noqa: E402
+from topobathysim.gebco_2025 import GEBCO2025Provider as Gebco2025  # noqa: E402
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ def mock_gebco_dataset() -> xr.Dataset:
 
 
 def test_initialization() -> None:
-    gebco = GEBCO2025(north=10, south=-10, west=-10, east=10)
+    gebco = Gebco2025(north=10, south=-10, west=-10, east=10)
     # dem_type is set by parent to SRTMGL3 to satisfy validation, even though we are GEBCO 2025 logic.
     assert gebco.output_format == "GTiff"
 
@@ -59,7 +59,7 @@ def test_initialization() -> None:
 def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Dataset) -> None:
     mock_open_ds.return_value = mock_gebco_dataset
 
-    gebco = GEBCO2025(north=5, south=-5, west=-5, east=5)
+    gebco = Gebco2025(north=5, south=-5, west=-5, east=5)
     da = gebco.fetch()
 
     # Check Elevation logic
@@ -75,7 +75,7 @@ def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Data
     # We verify that the value is NOT what it would be without offset.
     # The exact value depends on slice logic, but we know it should have the offset component.
     # 15 arcseconds = 15/3600 degrees. Half of that is the offset.
-    offset = GEBCO2025.HALF_PIXEL_OFFSET
+    offset = Gebco2025.HALF_PIXEL_OFFSET
     # Just check that it's not an integer (mock data lies on integers/simple fractions)
     # and has the offset remainder
     val = da.lat.values[0]
@@ -94,7 +94,7 @@ def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Data
 def test_sample_elevation(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Dataset) -> None:
     mock_open_ds.return_value = mock_gebco_dataset
 
-    gebco = GEBCO2025(north=5, south=-5, west=-5, east=5)
+    gebco = Gebco2025(north=5, south=-5, west=-5, east=5)
     gebco.load()
 
     # Sample center (0,0 is in our mock data)
@@ -103,6 +103,6 @@ def test_sample_elevation(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Datase
     assert elev == 0.0
 
     # Test error before load
-    gebco_unloaded = GEBCO2025()
+    gebco_unloaded = Gebco2025()
     with pytest.raises(RuntimeError):
         gebco_unloaded.sample_elevation(0, 0)

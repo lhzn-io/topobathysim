@@ -66,10 +66,10 @@ def test_bluetopo_real_integration(tmp_path: Path) -> None:
     assert len(downloaded_files) > 0, f"No TIFF files found in cache {bluetopo_cache} after fetch."
 
     # 4. Compare with GEBCO
-    from topobathysim.gebco_2025 import GEBCO2025Provider as GEBCO2025
+    from topobathysim.gebco_2025 import GEBCO2025Provider as Gebco2025
 
     print("\n[Integration] Fetching GEBCO 2025 value for comparison...")
-    gebco = GEBCO2025()
+    gebco = Gebco2025()
     gebco.load()
     gebco_depth = gebco.sample_elevation(EXECUTION_ROCKS_LAT, EXECUTION_ROCKS_LON)
     print(f"[Integration] GEBCO Elevation: {gebco_depth} meters")

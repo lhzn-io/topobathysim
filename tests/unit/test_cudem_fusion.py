@@ -1,4 +1,5 @@
 import unittest
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -9,10 +10,15 @@ from topobathysim.manager import BathyManager
 
 
 class TestCUDEMFusion(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.manager = BathyManager(use_blue_topo=True, use_cudem=True, use_lidar=False, use_land=False)
 
-    def create_mock_da(self, val, shape=(10, 10), bounds=(-70.1, 40.0, -70.0, 40.1)):
+    def create_mock_da(
+        self,
+        val: float,
+        shape: tuple[int, int] = (10, 10),
+        bounds: tuple[float, float, float, float] = (-70.1, 40.0, -70.0, 40.1),
+    ) -> xr.DataArray:
         west, south, east, north = bounds
         height, width = shape
         lon_res = (east - west) / width
@@ -37,7 +43,7 @@ class TestCUDEMFusion(unittest.TestCase):
         return da
 
     @patch("topobathysim.manager.GEBCO2025Provider")
-    def test_bluetopo_overrides_cudem(self, MockGEBCO):
+    def test_bluetopo_overrides_cudem(self, mock_gebco: MagicMock) -> None:
         """
         Verify that Tier 2 BlueTopo overrides Tier 3 CUDEM in the fusion stack.
         """
@@ -45,7 +51,7 @@ class TestCUDEMFusion(unittest.TestCase):
         mock_gebco_da = self.create_mock_da(100.0)  # Deep background
         mock_gebco_instance = MagicMock()
         mock_gebco_instance.fetch.return_value = mock_gebco_da
-        MockGEBCO.return_value = mock_gebco_instance
+        mock_gebco.return_value = mock_gebco_instance
 
         # Mock BlueTopo (Tier 2) - Value 50
         mock_bt_da = self.create_mock_da(50.0)
@@ -73,7 +79,7 @@ class TestCUDEMFusion(unittest.TestCase):
 
         # Execute with correct coords: South, North, West, East, Shape
         # Intended bounds: S=40.0, N=40.1, W=-70.1, E=-70.0
-        result = self.manager.get_grid(40.0, 40.1, -70.1, -70.0, target_shape=(10, 10))
+        result = cast(xr.DataArray, self.manager.get_grid(40.0, 40.1, -70.1, -70.0, target_shape=(10, 10)))
 
         self.assertIsNotNone(result)
 
