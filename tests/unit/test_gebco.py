@@ -22,7 +22,7 @@ class MockTopography:
 
 sys.modules["bmi_topography"].Topography = MockTopography  # type: ignore
 
-from topobathysim.gebco import GEBCO2025  # noqa: E402
+from topobathysim.gebco_2025 import GEBCO2025Provider as GEBCO2025  # noqa: E402
 
 
 @pytest.fixture

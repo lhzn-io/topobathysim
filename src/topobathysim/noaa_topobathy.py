@@ -7,7 +7,7 @@ from typing import cast
 
 import fsspec
 import geopandas as gpd
-import requests
+import requests  # type: ignore
 import rioxarray
 import xarray as xr
 from shapely.geometry import box
@@ -23,7 +23,7 @@ def _fetch_index_cached(url: str) -> str:
     logger.info("Fetching NOAA Coastal Lidar PDS Index...")
     response = requests.get(url, timeout=10)
     response.raise_for_status()
-    return response.text
+    return str(response.text)
 
 
 class NoaaTopobathyProvider:

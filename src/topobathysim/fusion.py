@@ -1,6 +1,10 @@
+import logging
+
 import numpy as np
 import xarray as xr
 from scipy.special import expit
+
+logger = logging.getLogger(__name__)
 
 
 class FusionEngine:
@@ -115,6 +119,16 @@ class FusionEngine:
             fused_values, coords=bathy_da.coords, dims=bathy_da.dims, name="fused_elevation"
         )
 
+        # Determine CRS (Prefer Bathy -> Lidar)
+        crs = None
+        if hasattr(bathy_da, "rio") and bathy_da.rio.crs:
+            crs = bathy_da.rio.crs
+        elif hasattr(lidar_da, "rio") and lidar_da.rio.crs:
+            crs = lidar_da.rio.crs
+
+        if crs:
+            fused_da.rio.write_crs(crs, inplace=True)
+
         return fused_da
 
     def fuse_seamline(
@@ -146,6 +160,9 @@ class FusionEngine:
 
         # 0. Fast Robustness Check: If Lidar is fully empty, return Bathy
         if np.all(np.isnan(lad_vals)):
+            logger.warning(
+                "Fusion Seamline: Lidar (Priority) layer is empty (all NaNs) after alignment. Dropping layer."
+            )
             return bathy_da
 
         # 2. Masks
@@ -231,4 +248,16 @@ class FusionEngine:
         mask_t_nan_b = mask_trans & (~mask_bathy)
         fused_vals[mask_t_nan_b] = lidar_proxy[mask_t_nan_b]  # Full proxy extension
 
-        return xr.DataArray(fused_vals, coords=bathy_da.coords, dims=bathy_da.dims, name="fused_seamline")
+        fused_da = xr.DataArray(fused_vals, coords=bathy_da.coords, dims=bathy_da.dims, name="fused_seamline")
+
+        # Propagate CRS
+        crs = None
+        if hasattr(bathy_da, "rio") and bathy_da.rio.crs:
+            crs = bathy_da.rio.crs
+        elif hasattr(lidar_da, "rio") and lidar_da.rio.crs:
+            crs = lidar_da.rio.crs
+
+        if crs:
+            fused_da.rio.write_crs(crs, inplace=True)
+
+        return fused_da

@@ -11,11 +11,13 @@
 
 ## Key Features
 
-- **Multi-Source Fusion**: Automatically harmonizes data from best-available sources:
-  - **Terrestrial**: USGS Lidar (via EPT/PDAL) & 3DEP (10m).
-  - **Coastal Interface**: NOAA NGS Topobathy Lidar (Green-wavelength).
-  - **Aquatic**: NOAA BlueTopo (High-Res Bathymetry), NCEI BAG (Deep-Sea Precision) & GEBCO 2025 (Global).
-- **Intelligent Blending**: Uses logistic weight functions to seamlessly merge datasets at coastlines (seamline blending), eliminating sharp artifacts.
+- **Multi-Source Fusion (Priority Overwrite)**:
+  - **Tier 0**: NOAA BAG (Raw Survey Data, e.g., *H13385*). **Absolute Priority**.
+  - **Tier 1 (Fusion)**: Airborne Lidar (Upland > 0m) fused with Greenwave Topobathy (Intertidal/Shallow).
+  - **Tier 2**: NOAA CUDEM (Gap-Fill Coastal).
+  - **Tier 3**: NOAA BlueTopo (Regional Bathy).
+  - **Tier 4**: GEBCO 2025 (Global Fallback).
+- **Intelligent Composition**: Merges datasets based on strict sensor suitability (Airborne vs Green Lidar) and spatial availability.
 - **Offline-First Architecture**:
   - **Asset Manifests**: Records online assets for true offline playback.
   - **Smart Caching**: Local caching of COGs, LAZ files, and tile schemes.
@@ -104,11 +106,13 @@ graph TD
     subgraph "Data Sources"
         L["USGS Lidar"]
         B["NOAA BlueTopo"]
+        C["NOAA CUDEM"]
         G["GEBCO 2025"]
     end
 
     Manager -->|Fusion| Fusion["Fusion Engine"]
     L --> Fusion
+    C --> Fusion
     B --> Fusion
     G --> Fusion
 
@@ -120,7 +124,7 @@ graph TD
 
 This project uses data and methodologies from:
 
-- **Data Sources**: For a complete list of specific surveys and citatations (e.g. Long Island Sound, BlueTopo), see [DATA_SOURCES.md](DATA_SOURCES.md).
+- **Data Sources**: For a complete list of specific surveys and citatations (e.g. Long Island Sound, BlueTopo), see [the documentation](docs/source/data_sources.rst).
 
 - **Research**:
   - *Continuously Updated Digital Elevation Models (CUDEMs) to

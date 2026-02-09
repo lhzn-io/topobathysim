@@ -14,6 +14,7 @@ TopoBathySim
    :caption: Contents:
 
    methodology
+   data_sources
    api
 
 Indices and tables

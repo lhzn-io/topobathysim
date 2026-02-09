@@ -15,8 +15,8 @@ def clean_sys_modules() -> Generator[None, None, None]:
     sys.modules.update(original_modules)
 
 
-from topobathysim.bluetopo import BlueTopoProvider  # noqa: E402
 from topobathysim.manager import BathyManager  # noqa: E402
+from topobathysim.noaa_bluetopo import NoaaBlueTopoProvider  # noqa: E402
 from topobathysim.vdatum import VDatumResolver  # noqa: E402
 
 
@@ -37,7 +37,7 @@ def test_vdatum_caching() -> None:
 
 
 def test_bluetopo_coverage() -> None:
-    provider = BlueTopoProvider()
+    provider = NoaaBlueTopoProvider()
 
     with patch.object(provider, "resolve_tile_id") as mock_resolve:
         # Case: Covered
@@ -49,10 +49,10 @@ def test_bluetopo_coverage() -> None:
         assert provider.is_covered(0.0, 0.0) is False
 
 
-@patch("topobathysim.bluetopo.fsspec.filesystem")
-@patch("topobathysim.bluetopo.rioxarray.open_rasterio")
+@patch("topobathysim.noaa_bluetopo.fsspec.filesystem")
+@patch("topobathysim.noaa_bluetopo.rioxarray.open_rasterio")
 def test_bluetopo_caching_and_fetch(mock_open_rasterio: MagicMock, mock_filesystem: MagicMock) -> None:
-    provider = BlueTopoProvider()
+    provider = NoaaBlueTopoProvider()
 
     # Mock resolve_tile_id to return a valid ID
     with patch.object(provider, "resolve_tile_id", return_value="BlueTopo_Tile_Test"):
@@ -75,7 +75,7 @@ def test_bluetopo_caching_and_fetch(mock_open_rasterio: MagicMock, mock_filesyst
         # To test download, we need this to be False.
         # To test read, we need it to eventually be "openable".
 
-        with patch("pathlib.Path.exists", return_value=False):
+        with patch("pathlib.Path.exists", return_value=False), patch("pathlib.Path.rename"):
             # Mock rioxarray dataset
             mock_da = MagicMock()
             mock_da.rio.nodata = -9999
@@ -106,21 +106,19 @@ def test_bluetopo_caching_and_fetch(mock_open_rasterio: MagicMock, mock_filesyst
             assert depth == -16.0
 
 
-@patch("topobathysim.manager.GEBCO2025")
-@patch("topobathysim.bluetopo.BlueTopoProvider.fetch_elevation")
-def test_manager_smart_selection(mock_fetch_elev: MagicMock, mock_gebco_cls: MagicMock) -> None:
+@patch("topobathysim.manager.GEBCO2025Provider")
+def test_manager_smart_selection(mock_gebco_cls: MagicMock) -> None:
     # Setup GEBCO Mock
     mock_gebco_instance = MagicMock()
     mock_gebco_instance.sample_elevation.return_value = -100.0
     mock_gebco_cls.return_value = mock_gebco_instance
 
-    # Case 1: BlueTopo Available
-    mock_fetch_elev.return_value = -5.0
-
     manager = BathyManager()
-    # Mock cover check to True
+
+    # Setup BlueTopo Mock
     manager.blue_topo = MagicMock()
     manager.blue_topo.is_covered.return_value = True
+    manager.blue_topo.fetch_elevation.return_value = -5.0
 
     depth = manager.get_elevation(42.0, -70.0)
     assert depth == -5.0
@@ -134,7 +132,7 @@ def test_manager_smart_selection(mock_fetch_elev: MagicMock, mock_gebco_cls: Mag
 
 
 def test_source_info() -> None:
-    manager = BathyManager()
+    manager = BathyManager(use_cudem=False)  # Disable CUDEM to ensure BlueTopo priority in this test
     manager.blue_topo = MagicMock()
     manager.blue_topo.is_covered.return_value = True
     info = manager.get_source_info(42.0, -70.0)

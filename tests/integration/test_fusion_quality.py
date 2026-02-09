@@ -11,8 +11,8 @@ if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
     os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
 
 from topobathysim.fusion import FusionEngine  # noqa: E402
-from topobathysim.lidar import LidarProvider  # noqa: E402
 from topobathysim.manager import BathyManager  # noqa: E402
+from topobathysim.usgs_lidar import UsgsLidarProvider  # noqa: E402
 
 # Found via scan_laz.py
 LIDAR_URL = "s3://noaa-nos-coastal-lidar-pds/laz/geoid18/4938/20140403_usgs_ny_li_18TXL060240.copc.laz"
@@ -30,7 +30,7 @@ def test_fusion_quality_execution_rocks() -> None:
     2. Continuity: Check for cliffs vs smooth transition.
     """
     print(f"\n[Test] Fetching Lidar from {LIDAR_URL}...")
-    lidar_prov = LidarProvider()
+    lidar_prov = UsgsLidarProvider()
     # Fetch ~500m box around center
     lidar_da = lidar_prov.fetch_lidar_from_laz(LIDAR_URL, resolution=4.0)  # 4m grid
 

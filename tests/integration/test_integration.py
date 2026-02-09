@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from topobathysim.bluetopo import BlueTopoProvider
+from topobathysim.noaa_bluetopo import NoaaBlueTopoProvider as BlueTopoProvider
 
 # Coordinates for Execution Rocks, Long Island Sound (near Rye, NY)
 # This should fall into one of the user's identified tiles (e.g. BH4XH5FN or similar)
@@ -58,13 +58,15 @@ def test_bluetopo_real_integration(tmp_path: Path) -> None:
     assert -100.0 < depth < 100.0
 
     # 3. Verify Cache
-    # We expect a .tiff file in the cache directory
-    downloaded_files = list(cache_dir.glob("*.tiff"))
+    # We expect a .tiff file in the cache directory (specifically in the 'bluetopo' subdir)
+    bluetopo_cache = cache_dir / "bluetopo"
+    # Recursive glob in case of structure changes, or direct glob in subdir
+    downloaded_files = list(bluetopo_cache.rglob("*.tiff"))
     print(f"[Integration] Cached files: {[f.name for f in downloaded_files]}")
-    assert len(downloaded_files) > 0, "No TIFF files found in cache after fetch."
+    assert len(downloaded_files) > 0, f"No TIFF files found in cache {bluetopo_cache} after fetch."
 
     # 4. Compare with GEBCO
-    from topobathysim.gebco import GEBCO2025
+    from topobathysim.gebco_2025 import GEBCO2025Provider as GEBCO2025
 
     print("\n[Integration] Fetching GEBCO 2025 value for comparison...")
     gebco = GEBCO2025()

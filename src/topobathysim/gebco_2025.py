@@ -13,16 +13,9 @@ class GEBCO2025Provider(Topography):
     Wraps bmi-topography to fetch from OPeNDAP with specific corrections.
     """
 
-    # Official GEBCO 2025 OpenDAP URL (Placeholder - typically would be verified)
-    # Using the path provided by the user instructions
+    # Official GEBCO 2025 OpenDAP URL
     # Note: 'sub_ice_topo_bathymetry' is the elevation variable
     OPENDAP_URL = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/sub_ice_topography_bathymetry/netcdf/gebco_2025_sub_ice.nc"
-    # NOTE: The above URL might be a file download page.
-    # A true OPeNDAP URL usually ends in .nc.html or similar for browsing, or just .nc for DAP.
-    # For this implementation, we will assume standard pydap/xarray can handle the URL provided
-    # or we use a widely known one.
-    # If the user provided URL is just a browser link, we might need the DAP server root.
-    # Let's assume the user wants us to use this URL structure for xarray/pydap.
 
     RESOLUTION_ARCSEC = 15
     HALF_PIXEL_OFFSET = (15 / 3600) * 0.5  # Degrees
@@ -56,11 +49,7 @@ class GEBCO2025Provider(Topography):
         Fetch data from GEBCO 2025 OPeNDAP server.
         Overrides parent fetch mechanism to handle multi-variable loading (elevation + TID).
         """
-        # We need to load specific slice
-        # Using xarray's OPeNDAP engine
-
-        # Note: In a real 'Upstream' contribution, we would modify `bmi-topography`'s `fetch`
-        # to carry strict logic. Here we override.
+        # Overrides parent fetch mechanism to handle OPeNDAP slicing directly.
 
         logger.info(f"Fetching GEBCO data via OPeNDAP: {self.OPENDAP_URL}")
         logger.debug(f"GEBCO Slice Bounds: {self.bbox}")
@@ -79,7 +68,7 @@ class GEBCO2025Provider(Topography):
 
         # 3. No Half-Pixel Offset needed
         # GEBCO is pixel-centered, and OPeNDAP coordinates typically reflect this.
-        # Removing manual shift to ensure accuracy.
+        # No manual grid registration shift is applied.
 
         # 4. Extract DataArrays
         # Elevation
@@ -95,10 +84,7 @@ class GEBCO2025Provider(Topography):
             self.tid_data = ds_subset["tid"]
 
         # 5. Persist/Cache if needed
-        # parent logic usually saves to disk. We might want to save the subset using self.output_format
-        # For now, we keep strictly in memory for the 'load' step,
-        # but bmi-topography usually writes usage.
-        # We will assume this is the 'load_to_memory' part.
+        # Keep data in memory for this implementation rather than saving to disk.
 
         if self._da is None:
             raise KeyError("Failed to load elevation data")

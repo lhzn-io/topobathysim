@@ -602,18 +602,26 @@ class NoaaBlueTopoProvider:
 
     def _resolve_from_hsmdb_api(self, lat: float, lon: float) -> str | None:
         """Tertiary fallback: Query NCEI HSMDB API."""
-        url = (
-            "https://gis.ngdc.noaa.gov/arcgis/rest/services/web_mercator/nos_hydro_dynamic/MapServer/0/query"
-        )
-        params = {
-            "geometry": f"{lon},{lat}",
-            "geometryType": "esriGeometryPoint",
-            "spatialRel": "esriSpatialRelIntersects",
-            "outFields": "SURVEY_ID",
-            "returnGeometry": "false",
-            "f": "json",
-        }
         try:
+            from pyproj import Transformer
+
+            # Project to EPSG:3857
+            transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+            x, y = transformer.transform(lon, lat)
+
+            url = "https://gis.ngdc.noaa.gov/arcgis/rest/services/web_mercator/nos_hydro_dynamic/MapServer/0/query"
+            # Use strictly formatted JSON geometry with SR
+            geo_json = f'{{"x":{x},"y":{y},"spatialReference":{{"wkid":3857}}}}'
+
+            params = {
+                "geometry": geo_json,
+                "geometryType": "esriGeometryPoint",
+                "spatialRel": "esriSpatialRelIntersects",
+                "outFields": "SURVEY_ID",
+                "returnGeometry": "false",
+                "f": "json",
+            }
+
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 data = r.json()

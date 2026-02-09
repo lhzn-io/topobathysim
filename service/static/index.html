@@ -29,18 +29,33 @@
             top: 10px;
             right: 10px;
             background: white;
-            padding: 15px;
+            padding: 10px 15px;
             z-index: 1000;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            max-width: 300px;
+            max-width: 320px;
+            min-width: 250px;
         }
 
         h3 {
             margin-top: 0;
-            margin-bottom: 10px;
+            margin-bottom: 0;
             font-size: 16px;
+        }
+
+        button.icon-btn {
+            background: #f8f8f8;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            cursor: pointer;
+            padding: 2px 6px;
+            font-size: 14px;
+            line-height: 1;
+            color: #333;
+        }
+        button.icon-btn:hover {
+            background: #e0e0e0;
         }
 
         p {
@@ -67,11 +82,18 @@
 <body>
     <div id="map"></div>
     <div id="controls">
-        <h3>TopoBathy Viewer</h3>
-        <p>Fused Elevation (Lidar + Bathymetry)</p>
-        <p><i>Auto-Lookup active for US Coastal Lidar (STAC/3DEP)</i></p>
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 5px;">
+            <div>
+                <h3>TopoBathy Viewer</h3>
+                <div style="font-size: 11px; color: #777; margin-top: 2px;">Fused Lidar/Bathy (v0.2)</div>
+            </div>
+            <button id="toggle-controls" class="icon-btn" title="Toggle Controls">−</button>
+        </div>
 
-        <div style="margin-top: 10px; margin-bottom: 10px;">
+        <div id="controls-content">
+            <p style="font-size: 13px; margin-top: 8px;"><i>Auto-Lookup active for US Coastal Lidar (STAC/3DEP)</i></p>
+
+            <div style="margin-top: 10px; margin-bottom: 10px;">
             <label for="style-select" style="font-size: 14px; font-weight: bold;">Colormap:</label>
             <select id="style-select" style="width: 100%; padding: 5px; margin-top: 5px;">
                 <option value="default">Default (Hybrid Chart)</option>
@@ -81,6 +103,10 @@
                 <option value="hillshade">Hillshade (Grayscale)</option>
                 <option value="source">Source Map (Debug)</option>
             </select>
+        </div>
+
+        <div style="margin-top: 10px;">
+             <label><input type="checkbox" id="contour-toggle"> Show Contours (Debug)</label>
         </div>
 
         <!-- Default Legend -->
@@ -97,23 +123,24 @@
         <div id="legend-source" class="legend" style="display: none;">
             <b>Source Map Legend</b>
             <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 5px; font-size: 11px;">
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:red; margin-right:5px; border:1px solid #ccc;"></span> BAG (Tier 0)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(255,128,0); margin-right:5px; border:1px solid #ccc;"></span> Fused Lidar/Topo (Tier 1)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(0,255,0); margin-right:5px; border:1px solid #ccc;"></span> Airborne Lidar</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(128,255,0); margin-right:5px; border:1px solid #ccc;"></span> Topobathy Lidar</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:blue; margin-right:5px; border:1px solid #ccc;"></span> CUDEM (Tier 2)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:cyan; margin-right:5px; border:1px solid #ccc;"></span> BlueTopo (Tier 3)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(153,102,51); margin-right:5px; border:1px solid #ccc;"></span> Land (Tier 3)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:gray; margin-right:5px; border:1px solid #ccc;"></span> GEBCO (Tier 4)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:red; margin-right:5px; border:1px solid #ccc;"></span> <b>BAG</b> (Tier 0: Survey)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(255,128,0); margin-right:5px; border:1px solid #ccc;"></span> <b>Fused Land/Water</b> (Tier 1)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(0,255,0); margin-right:5px; border:1px solid #ccc;"></span> Airborne Lidar (USGS 3DEP)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(128,255,0); margin-right:5px; border:1px solid #ccc;"></span> Topobathy Lidar (NOAA)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:cyan; margin-right:5px; border:1px solid #ccc;"></span> <b>BlueTopo™</b> (Tier 2: Model)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:blue; margin-right:5px; border:1px solid #ccc;"></span> <b>CUDEM</b> (Tier 3: 1/9")</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(153,102,51); margin-right:5px; border:1px solid #ccc;"></span> Land DEM (USGS/NASADEM)</div>
+                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:gray; margin-right:5px; border:1px solid #ccc;"></span> <b>GEBCO 2025</b> (Tier 4: Global)</div>
                 <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:black; margin-right:5px; border:1px solid #ccc;"></span> No Data</div>
             </div>
         </div>
-        <div id="debug-info"
-            style="margin-top:10px; border-top:1px solid #ccc; padding-top:5px; font-family:monospace; font-size:11px; color:#333;">
-            <b>Debug Info:</b><br />
-            Zoom: <span id="debug-zoom">-</span><br />
-            Center: <span id="debug-center">-</span><br />
-            Bounds: <span id="debug-bounds">-</span>
+            <div id="debug-info"
+                style="margin-top:10px; border-top:1px solid #ccc; padding-top:5px; font-family:monospace; font-size:11px; color:#333;">
+                <b>Debug Info:</b><br />
+                Zoom: <span id="debug-zoom">-</span><br />
+                Center: <span id="debug-center">-</span><br />
+                Bounds: <span id="debug-bounds">-</span>
+            </div>
         </div>
     </div>
     <script>
@@ -211,6 +238,39 @@
             attribution: 'TopoBathyServe',
             style: initStyle // Leaflet util will replace {style} in url
         }).addTo(map);
+
+        // Contour Layer
+        var contourLayer = L.tileLayer('/tiles/{z}/{x}/{y}?format=png&style=contours', {
+            maxZoom: 20,
+            opacity: 1.0,
+            detectRetina: true,
+            zIndex: 10 // Ensure it sits on top
+        });
+
+        // Toggle Controls Logic
+        var toggleBtn = document.getElementById('toggle-controls');
+        var controlsContent = document.getElementById('controls-content');
+
+        toggleBtn.addEventListener('click', function() {
+            if (controlsContent.style.display === 'none') {
+                controlsContent.style.display = 'block';
+                toggleBtn.innerText = '−';
+            } else {
+                controlsContent.style.display = 'none';
+                toggleBtn.innerText = '+';
+            }
+        });
+
+        // Contours Toggle Logic
+        var contourToggle = document.getElementById('contour-toggle');
+
+        contourToggle.addEventListener('change', function() {
+            if (this.checked) {
+                contourLayer.addTo(map);
+            } else {
+                map.removeLayer(contourLayer);
+            }
+        });
 
         // Style Selector Logic
         var styleSelect = document.getElementById('style-select');

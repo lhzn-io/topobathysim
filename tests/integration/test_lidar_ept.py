@@ -1,7 +1,7 @@
 import xarray as xr
 from pyproj import Transformer
 
-from topobathysim.lidar import LidarProvider
+from topobathysim.usgs_lidar import UsgsLidarProvider as LidarProvider
 
 EPT_URL = (
     "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/USGS_LPC_NY_LongIsland_Z18_2014_LAS_2015/ept.json"

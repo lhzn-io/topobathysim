@@ -64,6 +64,9 @@ pythonpath = ["src"]
 markers = [
     "integration: mark a test as an integration test",
 ]
+filterwarnings = [
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+]
 
 [tool.ruff]
 line-length = 110

@@ -354,3 +354,16 @@ class Usgs3DepProvider:
         except Exception as e:
             logger.error(f"Error fetching {collection_id}: {e}", exc_info=True)
             return None
+
+    def get_grid(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        target_shape: tuple[int, int] | None = None,
+    ) -> xr.DataArray | None:
+        """
+        Unified access method for Manager compatibility.
+        """
+        return self.fetch_dem(bounds=(west, south, east, north))

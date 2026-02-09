@@ -8,10 +8,7 @@ import numpy as np
 import rioxarray as rxr
 import s3fs
 import xarray as xr
-
-# Removed joblib disk cache for STAC queries due to signed URL expiry issues.
-# stac_cache_dir = Path.home() / ".cache" / "topobathysim" / "stac_queries"
-# memory = Memory(stac_cache_dir, verbose=0)
+from affine import Affine
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +187,8 @@ class UsgsLidarProvider:
                 return None
 
             x_idx = ((x - min_x) / resolution).astype(int)
-            # y_idx = ((max_y - y) / resolution).astype(int) # Standard image
-            # Using Cartesian (0 is min_y) for simpler coords, then flip if needed?
-            # Let's stick to the previous logic: 0 at min_y
+            # y_idx = ((max_y - y) / resolution).astype(int)
+            # Use Cartesian coordinates (0 is min_y)
             y_idx = ((y - min_y) / resolution).astype(int)
 
             x_idx = np.clip(x_idx, 0, width - 1)
@@ -218,6 +214,11 @@ class UsgsLidarProvider:
                 dims=("y", "x"),
                 name="elevation",
             )
+
+            # Explicitly write transform (Bottom-Up Grid)
+            transform = Affine.translation(min_x, min_y) * Affine.scale(resolution, resolution)
+            da.rio.write_transform(transform, inplace=True)
+            da.rio.set_spatial_dims("x", "y", inplace=True)
 
             # Assign CRS
             if native_crs_str:
@@ -488,6 +489,28 @@ class UsgsLidarProvider:
                 minx, maxx = min(tx), max(tx)
                 miny, maxy = min(ty), max(ty)
 
+                # Check dimensions before PDAL execution to prevent OOM
+                width_est = (maxx - minx) / resolution
+                height_est = (maxy - miny) / resolution
+                logger.debug(
+                    f"STAC Native Bounds: X[{minx:.2f}, {maxx:.2f}] Y[{miny:.2f}, {maxy:.2f}] "
+                    f"Res={resolution} -> Grid: {int(width_est)}x{int(height_est)}"
+                )
+
+                if width_est > 20_000 or height_est > 20_000:
+                    logger.warning(
+                        f"Estimated Lidar Grid size too large ({int(width_est)}x{int(height_est)}). "
+                        "Aborting STAC fetch for this tile to prevent PDAL crash."
+                    )
+                    return None
+
+                if width_est <= 0 or height_est <= 0:
+                    logger.warning(
+                        f"Estimated Lidar Grid size invalid ({width_est}x{height_est}). "
+                        "Calculated bounds may be effectively zero."
+                    )
+                    return None
+
                 reader_bounds = f"([{minx}, {maxx}], [{miny}, {maxy}])"
             else:
                 # Check PROJJSON if native_epsg was missing
@@ -497,9 +520,6 @@ class UsgsLidarProvider:
                         if comp.get("type") == "ProjectedCRS" and "id" in comp:
                             native_epsg = comp["id"].get("code")
                             break
-                if native_epsg:
-                    # Same logic reuse... simplified for brevity in this edit block
-                    pass
 
             with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
                 output_filename = tmp.name
@@ -576,3 +596,21 @@ class UsgsLidarProvider:
         except Exception as e:
             logger.error(f"STAC Fetch Error: {e}", exc_info=True)
             return None
+
+    def get_grid(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        target_shape: tuple[int, int] | None = None,
+    ) -> xr.DataArray | None:
+        """
+        Unified access method for Manager compatibility.
+        Defaults to STAC access for best coverage.
+        """
+        return self.fetch_lidar_from_stac(
+            bounds=(west, south, east, north),
+            resolution=4.0,  # Default to ~4m resolution (usually appropriate for 3DEP)
+            target_crs="EPSG:4326",
+        )

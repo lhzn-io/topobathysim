@@ -1,124 +1,73 @@
 Methodology
 ===========
 
-TopoBathySim employs a multi-tiered data handling strategy to create seamless topobathymetric Digital Elevation Models (DEMs).
+TopoBathySim employs a strict, multi-tiered "Priority Overwrite" strategy to create seamless topobathymetric Digital Elevation Models (DEMs).
 
 Data Hierarchy
 --------------
 
-The system prioritizes high-resolution local data over lower-resolution global basemaps.
+The system processes data layers in specific order, where higher-tier (lower index) sources overwrite lower-tier sources.
 
-Bathymetry (Water)
-~~~~~~~~~~~~~~~~~~
+**Tier 0 (Absolute Priority): NOAA BAG (Survey Data)**
+    *   **Source**: NOAA NCEI Bathymetric Attributed Grids (BAG).
+    *   **Resolution**: Survey Native (approx. 0.5m - 4m).
+    *   **Logic**: The system performs a spatial bounding-box search for high-resolution survey files (e.g., *H13385*). If found, these are merged and burned into the grid.
+    *   **Role**: Definitive "Truth" for surveyed bathymetry.
 
-1.  **Tier 1: NOAA BlueTopo™**
-    *   **Resolution**: Variable (High), approx. 4-8m.
-    *   **Coverage**: US Coastal Waters.
-    *   **Priority**: **Highest**. If a BlueTopo tile covers the requested region, it is used exclusively for the bathymetric component.
+**Tier 1 (High-Res Coastal/Land Fusion): Lidar & Topobathy**
+    *   **Source**: USGS 3DEP (Airborne Lidar) and NOAA NGS (Topobathymetic Lidar).
+    *   **Resolution**: 1m - 3m.
+    *   **Logic**: **Conditional Upland Fusion**.
+        *   The system aligns the Topobathymetic grid to the Airborne Lidar grid.
+        *   **Upland Rule**: Where Airborne Lidar elevation > 1.0m (approx. MSL + 1m), the system prioritizes **Airborne Lidar**. This strictly masks out water noise (specular returns) from land scanners.
+        *   **Intertidal/Water Rule**: Where Airborne Lidar <= 1.0m (or missing), the system prioritizes **Topobathy Lidar**, which captures shallow water bottoms that airborne sensors miss.
+    *   **Role**: Essential for defining the precise land-water interface and shallow subtidal zones.
 
-2.  **Tier 2: GEBCO 2025**
-    *   **Resolution**: 15 arc-seconds (approx. 450m).
-    *   **Coverage**: Global.
-    *   **Priority**: **Fallback**. Used when BlueTopo is unavailable (e.g., international waters, open ocean).
+**Tier 2: NOAA BlueTopo™**
+    *   **Source**: NOAA Office of Coast Survey.
+    *   **Resolution**: ~6-8m.
+    *   **Role**: Primary high-resolution bathymetry covering US coastal waters. Prioritized over CUDEM to prevent older models from obscuring modern consolidated bathymetry.
 
-Topography (Land & Coast)
-~~~~~~~~~~~~~~~~~~~~~~~~~
+**Tier 3: NOAA CUDEM**
+    *   **Source**: NCEI Continuously Updated Digital Elevation Model (1/9 Arc-Second).
+    *   **Resolution**: ~3m.
+    *   **Role**: Secondary gap filler for coastal zones where BlueTopo coverage is incomplete or where very high-resolution gap filling is needed.
 
-1.  **Tier 1: Coastal Lidar (USGS 3DEP / NOAA)**
-    *   **Resolution**: 1-3m (Entwine Point Tiles / COPC).
-    *   **Coverage**: Narrow coastal ribbons (US).
-    *   **Priority**: **Anchor**. This is the highest fidelity dataset and serves as the reference for fusion.
-
-2.  **Tier 2: Land Topography (USGS 3DEP / NASADEM)**
-    *   **Resolution**: 10m (US), 30m (Global).
-    *   **Coverage**: Continental.
-    *   **Priority**: **Fill**. Used to extend coverage inland behind the narrow Lidar strip.
+**Tier 4: Global Context (GEBCO 2025)**
+    *   **Source**: General Bathymetric Chart of the Oceans.
+    *   **Resolution**: ~450m (Global).
+    *   **Role**: Universal fallback. Ensures that no query returns "empty" space, providing a base layer for the entire planet.
 
 Fusion Logic
 ------------
 
-The ``FusionEngine`` merges these disparate sources using two primary strategies defined by the nature of the data overlap.
+The ``FusionEngine`` (orchestrated by ``BathyManager``) follows a "Composition" strategy rather than simple blending.
 
-Logistic Overlap Fusion
-~~~~~~~~~~~~~~~~~~~~~~~
+1.  **Canvas Creation**:
+    A "Base Canvas" is initialized for the requested tile extent (bounds) and target resolution (e.g., 512x512).
 
-When datasets overlap significantly (e.g., Topobathymetric Lidar extending into the water column), we use a logistic weighting function to transition between sources based on elevation.
+2.  **Layer Accumulation**:
+    The system queries all providers (BAG, Lidar, CUDEM, BlueTopo, GEBCO) in parallel availability checks.
 
-**Formula:**
+3.  **Sequential Composition**:
+    Layers are applied to the canvas in reverse order of priority (lowest to highest), or using `combine_first` logic where higher priority layers fill gaps.
 
-.. math::
+    *   **Step 1**: The Global (GEBCO) or Regional (BlueTopo) layer establishes the baseline.
+    *   **Step 2**: The **Tier 1 Fused Lidar** layer is superimposed. This layer itself is a composite result of the "Conditional Upland Fusion" described above.
+    *   **Step 3**: Any **Tier 0 (BAG)** data is burned in on top of all other layers. This ensures that if a ship physically surveyed an area, that measurement overrides any interpolation or older model.
 
-   w = \frac{1}{1 + e^{-k(z - z_{center})}}
+4.  **CRS Unification**:
+    All layers are dynamically reprojected to EPSG:4326 (WGS84) and aligned to the pixel grid of the target canvas using Bilinear resampling.
 
-Where:
+Corner Cases
+------------
 
-*   :math:`z` is the elevation from the priority dataset (Lidar).
-*   :math:`z_{center}` is the transition midpoint (default 0.0 for NAVD88/LMSL).
-*   :math:`k` is the steepness of the transition.
+**Missing Lidar**
+    If Tier 1 data is missing, the system falls back seamlessly to Tier 2 (CUDEM) or Tier 3 (BlueTopo) for that specific pixel area.
 
-**Result:**
+**Deep Water**
+    In deep water zones where Lidar/Topobathy do not exit, the system relies on BAGs (if available) or BlueTopo/GEBCO.
 
-*   :math:`z \gg 0`: Weight approaches 1.0 (Lidar Dominant).
-*   :math:`z \ll 0`: Weight approaches 0.0 (Bathy Dominant).
-*   :math:`z \approx 0`: Smooth blend.
-
-Seamline Blending (USGS-Inspired)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-When datasets do not overlap, or have a gap ("The Void"), we use a spatial blending approach inspired by the **USGS Adaptive Topobathymetric Fusion** methodology.
-
-**Reference:**
-
-    Danielson, J.J., and Poppenga, S.K., 2023, Adaptive Topobathymetric Fusion Software: U.S. Geological Survey software release, https://doi.org/10.5066/P9POPM96.
-
-**Algorithm:**
-
-The USGS approach mitigates seamless artifacts by projecting a "Weight Surface" outwards from the priority dataset (Data A / Lidar) into the secondary dataset (Data B / Bathy).
-
-1.  **Identify Seam**: We generate a binary mask where Lidar data is valid.
-2.  **Distance Transform**: We calculate the Euclidean Distance (:math:`d`) from the nearest valid Lidar pixel into the void using ``scipy.ndimage.distance_transform_edt``.
-3.  **Proxy Generation**: We use the indices from the distance transform to identify the "Nearest Lidar Pixel" for every point in the transition zone. This creates a "Lidar Proxy" layer that extrapolates land values outwards (Nearest Neighbor).
-4.  **Weight Calculation**:
-
-    .. math::
-
-       W_{lidar} = 1.0 - \frac{d}{d_{max}}
-
-    Where :math:`d_{max}` is the designated blending distance (e.g., 20 meters). Weights are clipped to :math:`[0, 1]`.
-
-5.  **Fusion**:
-
-    .. math::
-
-       Z_{final} = (W_{lidar} \cdot Z_{proxy}) + ((1 - W_{lidar}) \cdot Z_{bathy})
-
-**Visual Result:**
-
-Instead of a vertical cliff at the exact pixel where Lidar ends, the land "fades out" linearly over 20 meters, blending smoothly into the underlying bathymetry. This eliminates step-interaction artifacts in simulation physics engines.
-
-.. note::
-   The Lidar dataset is treated as the "truth" in overlapping regions due to its superior precision.
-
-Corner Cases & Fallbacks
-------------------------
-
-Global / Missing Lidar
-~~~~~~~~~~~~~~~~~~~~~~
-In regions where Coastal Lidar is unavailable (e.g., International waters, Remote islands):
-*   **Behavior**: The system renders the Bathymetry source (GEBCO) directly.
-*   **Result**: The coastline will be defined by the resolution of the bathymetry source (450m for GEBCO). Land will be filled by NASADEM (if enabled) or remain flat/zero.
-
-Missing BlueTopo
-~~~~~~~~~~~~~~~~
-*   **Behavior**: Fallback to GEBCO 2025.
-*   **Result**: Lower resolution bathymetry seamlessly accepted by the fusion engine.
-
-Offline Mode
-~~~~~~~~~~~~
-*   **Behavior**: If ``OFFLINE_MODE=1``, the system skips all network requests.
-*   **Result**:
-    *   If a tile is **Cached**: It renders normally.
-    *   If **All Missing**: The service may return an empty/flat grid or an error depending on the extent of missing data.
 
 Data Access Technologies
 ------------------------
@@ -144,3 +93,30 @@ TopoBathySim leverages **Cloud Optimized Point Clouds (COPC)** to provide instan
         bounds=(-73.74, 40.87, -73.72, 40.89),
         force_cache=True  # Spawns background download
     )
+
+Visualization & Debugging Tools
+-----------------------------
+
+TopoBathySim includes comprehensive visualization tools to validate fusion logic and data provenance.
+
+**Source Map ("Truth" Mode)**
+    Use the `style=source` parameter or select "Source Map (Debug)" in the viewer to enable provenance visualization.
+    This mode replaces elevation colors with categorical identifiers to show exactly which dataset contributed to each pixel.
+
+    *   **Red**: Tier 0 - NOAA BAG (Bathymetric Attributed Grids, Survey Data)
+    *   **Orange**: Tier 1 - Fused High-Res Lidar (Airborne + Topobathy)
+    *   **Green**: Raw Airborne Lidar (USGS 3DEP)
+    *   **Lime**: Raw Topobathy Lidar (NOAA NGS)
+    *   **Cyan**: Tier 2 - NOAA BlueTopo™
+    *   **Blue**: Tier 3 - NOAA CUDEM
+    *   **Brown**: Land DEM (USGS/NASADEM)
+    *   **Gray**: Tier 4 - GEBCO 2025 (Global Context)
+
+**Contour Overlays**
+    Use the `style=contours` parameter or the "Show Contours" checkbox in the viewer.
+    This renders dynamically generated vector-like contour lines (2m intervals) on top of the map.
+    Useful for:
+
+    *   Verifying identifying seams/steps between datasets.
+    *   checking vertical datum alignment (NAVD88 vs MLLW).
+    *   Visualizing slope continuity across fusion boundaries.

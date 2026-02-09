@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import cast
 
-import requests
+import requests  # type: ignore
 import xarray as xr
 
 from .vdatum import VDatumResolver
@@ -23,14 +23,12 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     Reads BAG using h5py (or rasterio) and converts to xarray with NAVD88 correction.
     Cached to avoid re-opening/parsing headers for every tile.
     """
-    from .vdatum import VDatumResolver
 
     try:
         import rioxarray as rxr
 
-        # CRITICAL STABILITY FIX: Use chunks to initiate Delayed/Lazy loading via Dask.
-        # Reading entire 50cm BAGs (GBs) into memory causes OOM crashes.
-        # Open with Dask chunks for lazy loading
+        # Use chunks to initiate Delayed/Lazy loading via Dask.
+        # Prevents OOM crashes when reading large BAG files.
         with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
             da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
             da: xr.DataArray
@@ -275,6 +273,64 @@ class BAGDiscovery:
             logger.warning(f"Spatial query failed: {e}")
 
         return None
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def find_bags_by_bbox(cls, west: float, south: float, east: float, north: float) -> list[str]:
+        """
+        Queries NCEI for BAGs intersecting the bounding box.
+        Returns list of download URLs.
+        """
+        found_urls = []
+        try:
+            from pyproj import Transformer
+
+            transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+            minx, miny = transformer.transform(west, south)
+            maxx, maxy = transformer.transform(east, north)
+
+            headers = {"User-Agent": USER_AGENT}
+
+            # Envelope Query
+            geo_json = (
+                f'{{"xmin":{minx},"ymin":{miny},"xmax":{maxx},'
+                f'"ymax":{maxy},"spatialReference":{{"wkid":3857}}}}'
+            )
+
+            params = {
+                "geometry": geo_json,
+                "geometryType": "esriGeometryEnvelope",
+                "spatialRel": "esriSpatialRelIntersects",
+                "outFields": "SURVEY_ID,DOWNLOAD_URL",
+                "returnGeometry": "false",
+                "f": "json",
+            }
+
+            logger.info(f"Querying NCEI by BBox: {west},{south},{east},{north}")
+            resp = requests.get(cls.QUERY_URL, params=params, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "features" in data:
+                for feature in data["features"]:
+                    attr = feature.get("attributes", {})
+                    download_url = attr.get("DOWNLOAD_URL")
+                    if download_url:
+                        if download_url.lower().endswith(".bag"):
+                            found_urls.append(str(download_url))
+                        elif download_url.lower().endswith(".html"):
+                            scraped = cls._scrape_landing_page(download_url)
+                            if scraped:
+                                found_urls.append(scraped)
+
+            # De-duplicate
+            found_urls = list(set(found_urls))
+            logger.info(f"Found {len(found_urls)} BAGs in BBox.")
+
+        except Exception as e:
+            logger.warning(f"BBox query failed: {e}")
+
+        return found_urls
 
 
 class BAGProvider:

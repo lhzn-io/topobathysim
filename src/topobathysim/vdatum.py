@@ -114,3 +114,35 @@ class VDatumResolver:
         except Exception as e:
             logger.warning(f"Datum (Ellipsoid->NAVD88) conversion failed for ({lat}, {lon}): {e}")
             return 0.0
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def get_egm2008_to_navd88_offset(lat: float, lon: float) -> float:
+        """
+        Calculates shift from EGM2008 to NAVD88.
+        NAVD88 = EGM2008 + Offset (t_z)
+        """
+        params: dict[str, Any] = {
+            "s_x": lon,
+            "s_y": lat,
+            "s_z": 0.0,
+            "s_hframe": "WGS84_G1674",  # EGM2008 implies WGS84 usually
+            "s_vframe": "EGM2008",
+            "t_hframe": "NAD83_2011",
+            "t_vframe": "NAVD88",
+            "region": "contiguous",
+            "result_format": "json",
+        }
+
+        try:
+            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+
+            if "t_z" in data:
+                return float(data["t_z"])
+            return 0.0
+
+        except Exception as e:
+            logger.warning(f"Datum (EGM2008->NAVD88) conversion failed for ({lat}, {lon}): {e}")
+            return 0.0
