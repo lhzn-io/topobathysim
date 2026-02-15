@@ -1,5 +1,6 @@
 import logging
 import math
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -70,7 +71,9 @@ def xyz_to_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
         ),  # Scenario from verify_user_tile.py (matches any of these)
     ],
 )
-def test_real_world_tile_scenarios(z: int, x: int, y: int, expected_source_substr: str | list[str]) -> None:
+def test_real_world_tile_scenarios(
+    z: int, x: int, y: int, expected_source_substr: str | list[str], persistent_cache_dir: Path
+) -> None:
     """
     Verify specific real-world tiles known to contain specific data types.
     This replaces the ad-hoc scripts in tests/scripts/.
@@ -78,7 +81,9 @@ def test_real_world_tile_scenarios(z: int, x: int, y: int, expected_source_subst
     west, south, east, north = xyz_to_bounds(z, x, y)
     logger.info(f"Testing Tile Z={z} X={x} Y={y} -> BBox: {west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}")
 
-    manager = BathyManager(use_blue_topo=True, use_cudem=True, use_lidar=True)
+    manager = BathyManager(
+        use_blue_topo=True, use_cudem=True, use_lidar=True, cache_dir=str(persistent_cache_dir)
+    )
 
     # Use a smaller shape for speed, but large enough to catch features
     result = manager.get_grid(south, north, west, east, target_shape=(256, 256))

@@ -21,10 +21,11 @@ from topobathysim.vdatum import VDatumResolver  # noqa: E402
 
 
 def test_vdatum_caching() -> None:
-    with patch("requests.get") as mock_get:
+    with patch("requests.Session") as mock_session_cls:
+        mock_session = mock_session_cls.return_value
         mock_response = MagicMock()
         mock_response.json.return_value = {"t_z": 1.5}
-        mock_get.return_value = mock_response
+        mock_session.get.return_value = mock_response
 
         resolver = VDatumResolver()
         offset1 = resolver.get_navd88_to_lmsl_offset(42.0, -70.0)
@@ -33,7 +34,12 @@ def test_vdatum_caching() -> None:
         assert offset1 == 1.5
         assert offset2 == 1.5
         # Verify cache: request called only once
-        assert mock_get.call_count == 1
+        # Since cache is on the static method, the second call returns cached result immediately
+        # and doesn't even enter the function body to create a session?
+        # Actually lru_cache is on the method.
+        # But wait, static method with lru_cache? Yes.
+        # If it's cached, method body isn't executed.
+        assert mock_session.get.call_count == 1
 
 
 def test_bluetopo_coverage() -> None:

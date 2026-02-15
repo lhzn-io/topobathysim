@@ -60,8 +60,9 @@ class UsgsLidarProvider:
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
-        self.cache_dir = Path(cache_dir).expanduser() / "lidar"
+        self.cache_dir = Path(cache_dir).expanduser() / "usgs_lidar"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.offline_mode = offline_mode
         # S3 filesystem
         self.fs = s3fs.S3FileSystem(anon=True)
@@ -136,6 +137,10 @@ class UsgsLidarProvider:
                         Path(temp_path).rename(local_path)
 
                     logger.info("Background Download complete.")
+
+                    # Cleanup lock on success
+                    lock_path.unlink(missing_ok=True)
+
                     return local_path
 
                 finally:
@@ -157,7 +162,44 @@ class UsgsLidarProvider:
     ) -> xr.DataArray | None:
         """
         Reads a local LAZ file, filters Class 2, and rasterizes.
+        Uses Zarr caching to avoid re-rasterizing the same file.
         """
+
+        res_str = f"{resolution:.2f}".replace(".", "p")
+        zarr_dir = local_path.parent / "zarr"
+        zarr_path = zarr_dir / f"{local_path.stem}_res{res_str}.zarr"
+        # We assume the entire LAZ file is rasterized to this resolution.
+
+        # 1. Check Zarr Cache (Full File Rasterized)
+        if zarr_path.exists():
+            try:
+                ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                if "elevation" in ds:
+                    da = ds["elevation"]
+                else:
+                    # Fallback to first variable
+                    var_name = next(iter(ds.data_vars))
+                    da = ds[var_name]
+
+                # Check CRS match roughly? (If target_crs changed, we might need to re-reproject,
+                # but usually target_crs is constant 4326 for this app)
+                # If cached version is 4326 and we request 4326, good.
+
+                # Filter bounds if requested
+                if bounds:
+                    da = da.rio.clip_box(*bounds)
+
+                logger.info(f"Lidar Zarr Cache Hit: {zarr_path.name}")
+                return da
+            except Exception as e:
+                logger.warning(f"Corrupt Lidar Zarr cache {zarr_path}: {e}")
+                import shutil
+
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
+
+        logger.info(f"Lidar Zarr Cache Miss: {zarr_path.name}")
+
         try:
             with laspy.open(local_path) as fh:
                 las = fh.read()
@@ -186,9 +228,12 @@ class UsgsLidarProvider:
             if width <= 0 or height <= 0:
                 return None
 
+            # Use Cartesian coordinates for binning
+            # x_idx is column, y_idx is row (from bottom usually, or top)
+            # Standard raster is Top-Left origin.
+
+            # Here we build a Bottom-Up grid (y increases upwards) to match LAS/Cartesian
             x_idx = ((x - min_x) / resolution).astype(int)
-            # y_idx = ((max_y - y) / resolution).astype(int)
-            # Use Cartesian coordinates (0 is min_y)
             y_idx = ((y - min_y) / resolution).astype(int)
 
             x_idx = np.clip(x_idx, 0, width - 1)
@@ -196,6 +241,8 @@ class UsgsLidarProvider:
 
             grid_sum = np.zeros((height, width), dtype=np.float32)
             grid_count = np.zeros((height, width), dtype=np.int32)
+
+            # Flat index
             flat_idx = y_idx * width + x_idx
 
             np.add.at(grid_sum.ravel(), flat_idx, z)
@@ -233,6 +280,30 @@ class UsgsLidarProvider:
 
             if target_crs and da.rio.crs and da.rio.crs != target_crs:
                 da = da.rio.reproject(target_crs)
+
+            # --- Zarr Write ---
+            try:
+                # Transpose to strictly (y, x) if needed
+                if da.ndim == 2 and "y" in da.dims:
+                    da = da.transpose("y", "x")
+
+                # Chunk
+                if da.size > 0:
+                    da = da.chunk({"y": 1024, "x": 1024})
+                    logger.info(f"Caching Lidar raster to Zarr: {zarr_path.name}")
+
+                    from filelock import FileLock
+
+                    lock_path = zarr_path.with_suffix(".zarr.lock")
+                    with FileLock(lock_path):
+                        da.to_zarr(zarr_path, mode="w", consolidated=True)
+                    logger.info(f"Lidar Zarr Cache Created: {zarr_path.name}")
+            except Exception as e:
+                logger.error(f"Failed to cache Lidar Zarr: {e}")
+
+            # Return filtered
+            if bounds:
+                da = da.rio.clip_box(*bounds)
 
             return da
 

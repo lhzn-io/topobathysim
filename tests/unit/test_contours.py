@@ -15,7 +15,7 @@ except ImportError:
     from service.topobathyserve.main import render_png
 
 
-def test_contour_generation_basic():
+def test_contour_generation_basic() -> None:
     """Test standard contour generation with valid data."""
     # Create a nice gradient 0..100
     data = np.linspace(0, 100, 10000).reshape(100, 100)
@@ -29,7 +29,7 @@ def test_contour_generation_basic():
     assert png_bytes.startswith(b"\x89PNG")
 
 
-def test_contour_generation_intervals():
+def test_contour_generation_intervals() -> None:
     """Test that different zoom levels don't crash and produce output."""
     data = np.linspace(0, 100, 10000).reshape(100, 100)
     da = xr.DataArray(data, dims=("y", "x"), coords={"y": range(100), "x": range(100)})
@@ -43,7 +43,7 @@ def test_contour_generation_intervals():
     assert len(bytes_z18) > 0
 
 
-def test_contour_generation_nan_handling():
+def test_contour_generation_nan_handling() -> None:
     """Test that NaNs don't cause exceptions and produce transparent tile."""
     data = np.full((100, 100), np.nan)
     da = xr.DataArray(data, dims=("y", "x"), coords={"y": range(100), "x": range(100)})
@@ -55,7 +55,7 @@ def test_contour_generation_nan_handling():
     assert len(png_bytes) > 0
 
 
-def test_contour_coastline():
+def test_contour_coastline() -> None:
     """Test that zero-elevation (coastline) is handled without error."""
     # -10 to +10, crossing zero
     data = np.linspace(-10, 10, 10000).reshape(100, 100)

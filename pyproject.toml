@@ -40,6 +40,7 @@ dependencies = [
   "uvicorn",
   "fastapi",
   "python-dotenv",
+  "filelock",
 ]
 
 [project.urls]

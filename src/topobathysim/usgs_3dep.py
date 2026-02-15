@@ -117,7 +117,7 @@ class Usgs3DepProvider:
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
-        self.cache_dir = Path(cache_dir).expanduser() / "land"
+        self.cache_dir = Path(cache_dir).expanduser() / "usgs_3dep"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.offline_mode = offline_mode
 
@@ -180,6 +180,9 @@ class Usgs3DepProvider:
                     # Atomic move
                     temp_path.rename(local_path)
                     logger.debug("Download complete.")
+
+                    # Remove lock on success
+                    lock_path.unlink(missing_ok=True)
                     return local_path
 
                 finally:

@@ -3,6 +3,8 @@ from functools import lru_cache
 from typing import Any
 
 import requests  # type: ignore
+from requests.adapters import HTTPAdapter  # type: ignore
+from urllib3.util.retry import Retry  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,21 @@ class VDatumResolver:
     """
 
     VDATUM_API = "https://vdatum.noaa.gov/vdatumweb/api/convert"
+
+    @staticmethod
+    def _get_session() -> requests.Session:
+        """Creates a session with retries for robust API calls."""
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -36,17 +53,19 @@ class VDatumResolver:
         }
 
         try:
-            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            session = VDatumResolver._get_session()
+            response = session.get(VDatumResolver.VDATUM_API, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
             if "t_z" in data:
                 return float(data["t_z"])
-            return 0.0
+
+            raise ValueError(f"VDatum API returned no elevation data: {data}")
 
         except Exception as e:
-            logger.warning(f"Datum conversion failed for ({lat}, {lon}): {e}")
-            return 0.0
+            logger.error(f"Datum conversion failed for ({lat}, {lon}): {e}")
+            raise
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -69,18 +88,20 @@ class VDatumResolver:
         }
 
         try:
-            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            session = VDatumResolver._get_session()
+            response = session.get(VDatumResolver.VDATUM_API, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
             if "t_z" in data:
                 # If s_z=0, t_z is the height of MLLW zero in NAVD88 frame.
                 return float(data["t_z"])
-            return 0.0
+
+            raise ValueError(f"VDatum API returned no elevation data: {data}")
 
         except Exception as e:
-            logger.warning(f"Datum (MLLW->NAVD88) conversion failed for ({lat}, {lon}): {e}")
-            return 0.0
+            logger.error(f"Datum (MLLW->NAVD88) conversion failed for ({lat}, {lon}): {e}")
+            raise
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -103,17 +124,19 @@ class VDatumResolver:
         }
 
         try:
-            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            session = VDatumResolver._get_session()
+            response = session.get(VDatumResolver.VDATUM_API, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
             if "t_z" in data:
                 return float(data["t_z"])
-            return 0.0
+
+            raise ValueError(f"VDatum API returned no elevation data: {data}")
 
         except Exception as e:
-            logger.warning(f"Datum (Ellipsoid->NAVD88) conversion failed for ({lat}, {lon}): {e}")
-            return 0.0
+            logger.error(f"Datum (Ellipsoid->NAVD88) conversion failed for ({lat}, {lon}): {e}")
+            raise
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -135,14 +158,16 @@ class VDatumResolver:
         }
 
         try:
-            response = requests.get(VDatumResolver.VDATUM_API, params=params, timeout=5)
+            session = VDatumResolver._get_session()
+            response = session.get(VDatumResolver.VDATUM_API, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
             if "t_z" in data:
                 return float(data["t_z"])
-            return 0.0
+
+            raise ValueError(f"VDatum API returned no elevation data: {data}")
 
         except Exception as e:
-            logger.warning(f"Datum (EGM2008->NAVD88) conversion failed for ({lat}, {lon}): {e}")
-            return 0.0
+            logger.error(f"Datum (EGM2008->NAVD88) conversion failed for ({lat}, {lon}): {e}")
+            raise

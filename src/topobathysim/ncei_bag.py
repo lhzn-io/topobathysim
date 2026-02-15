@@ -17,67 +17,124 @@ USER_AGENT = (
 )
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     """
     Reads BAG using h5py (or rasterio) and converts to xarray with NAVD88 correction.
     Cached to avoid re-opening/parsing headers for every tile.
     """
+    # Define a pathway for the cached Zarr version (directory)
+    # Zarr is more parallel-friendly and I/O efficient than monolithic HDF5/NetCDF
+    # Store Zarr in "zarr" subdirectory
+    zarr_dir = local_path.parent / "zarr"
+    zarr_path = zarr_dir / local_path.name.replace(".bag", "_navd88.zarr")
 
-    try:
-        import rioxarray as rxr
-
-        # Use chunks to initiate Delayed/Lazy loading via Dask.
-        # Prevents OOM crashes when reading large BAG files.
-        with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
-            da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
-            da: xr.DataArray
-            if isinstance(da_raw, list):
-                da = cast(xr.DataArray, da_raw[0])
-            elif isinstance(da_raw, xr.Dataset):
-                da = da_raw.to_array().isel(variable=0)
-            else:
-                da = cast(xr.DataArray, da_raw)
-
-        # BAGs usually have 'elevation' and 'uncertainty'.
-        # Rasterio usually reads band 1 as elevation.
-        elev = da.isel(band=0).drop_vars("band")
-
-        # Check for Ellipsoid vs MLLW
-        filename = local_path.name
-        is_ellipsoid = "_Ellipsoid_" in filename or "Ellipsoid" in filename
-
-        # Vertical Datum Correction (to NAVD88)
-        crs = elev.rio.crs
-        bounds = elev.rio.bounds()  # (minx, miny, maxx, maxy)
-        center_x = (bounds[0] + bounds[2]) / 2
-        center_y = (bounds[1] + bounds[3]) / 2
-
-        offset = 0.0
+    # If we have a pre-computed NAVD88 Zarr store, load strictly that.
+    if zarr_path.exists():
         try:
-            from pyproj import Transformer
-
-            if crs:
-                transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-                lon, lat = transformer.transform(center_x, center_y)
-
-                if is_ellipsoid:
-                    # Ellipsoid -> NAVD88
-                    offset = VDatumResolver.get_ellipsoid_to_navd88_offset(lat, lon)  # type: ignore
-                    logger.info(f"Applying Ellipsoid->NAVD88 offset of {offset:.3f}m for {filename}")
-                else:
-                    # MLLW -> NAVD88
-                    offset = VDatumResolver.get_mllw_to_navd88_offset(lat, lon)  # type: ignore
-                    logger.info(f"Applying MLLW->NAVD88 offset of {offset:.3f}m for {filename}")
-
-                # Applying offset to Dask array adds a task to the graph (Lazy).
-                elev = elev + offset
-
+            # chunks="auto" enables Dask lazy loading efficiently
+            # consolidated=False is safer for local directory stores unless explicitly consolidated
+            da_cached = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+            logger.info(f"BAG Zarr Cache Hit: {zarr_path.name}")
+            return da_cached
         except Exception as e:
-            logger.warning(f"Failed to apply VDatum correction: {e}")
+            logger.warning(f"Failed to load cached Zarr {zarr_path}, falling back to raw BAG: {e}")
+            # If load fails, delete and regenerate
+            try:
+                import shutil
 
-        elev.attrs["survey_source"] = filename
-        return cast(xr.DataArray, elev)
+                if zarr_path.is_dir():
+                    shutil.rmtree(zarr_path)
+            except Exception:
+                pass
+
+    # Cache Miss - Acquire Lock
+    from filelock import FileLock
+
+    lock_path = zarr_path.with_suffix(".zarr.lock")
+    try:
+        with FileLock(lock_path):
+            # Double check
+            if zarr_path.exists():
+                logger.info(f"BAG Zarr Cache Hit (after lock): {zarr_path.name}")
+                return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+
+            logger.info(f"BAG Zarr Cache Miss: {zarr_path.name}")
+
+            import rioxarray as rxr
+
+            # Use chunks to initiate Delayed/Lazy loading via Dask.
+            # Prevents OOM crashes when reading large BAG files.
+            with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
+                da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+                da: xr.DataArray
+                if isinstance(da_raw, list):
+                    da = cast(xr.DataArray, da_raw[0])
+                elif isinstance(da_raw, xr.Dataset):
+                    da = da_raw.to_array().isel(variable=0)
+                else:
+                    da = cast(xr.DataArray, da_raw)
+
+            # BAGs usually have 'elevation' and 'uncertainty'.
+            # Rasterio usually reads band 1 as elevation.
+            elev = da.isel(band=0).drop_vars("band")
+
+            # Check for Ellipsoid vs MLLW
+            filename = local_path.name
+            is_ellipsoid = "_Ellipsoid_" in filename or "Ellipsoid" in filename
+
+            # Vertical Datum Correction (to NAVD88)
+            crs = elev.rio.crs
+            bounds = elev.rio.bounds()  # (minx, miny, maxx, maxy)
+            center_x = (bounds[0] + bounds[2]) / 2
+            center_y = (bounds[1] + bounds[3]) / 2
+
+            offset = 0.0
+            try:
+                from pyproj import Transformer
+
+                if crs:
+                    transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                    lon, lat = transformer.transform(center_x, center_y)
+
+                    if is_ellipsoid:
+                        # Ellipsoid -> NAVD88
+                        offset = VDatumResolver.get_ellipsoid_to_navd88_offset(lat, lon)  # type: ignore
+                        logger.info(f"Applying Ellipsoid->NAVD88 offset of {offset:.3f}m for {filename}")
+                    else:
+                        # MLLW -> NAVD88
+                        offset = VDatumResolver.get_mllw_to_navd88_offset(lat, lon)  # type: ignore
+                        logger.info(f"Applying MLLW->NAVD88 offset of {offset:.3f}m for {filename}")
+
+                    # Applying offset to Dask array adds a task to the graph (Lazy).
+                    elev = elev + offset
+
+                # --- OPTIMIZATION: Persist the adjusted data to Zarr ---
+                # Zarr allows chunked parallel writes and reads, ideal for this use case.
+                try:
+                    logger.info(f"Caching NAVD88 adjusted BAG to {zarr_path}...")
+
+                    # Ensure we have good chunks for Zarr (e.g. 1024x1024)
+                    # This balances number of files vs I/O size
+                    if "x" in elev.dims and "y" in elev.dims:
+                        elev = elev.chunk({"y": 1024, "x": 1024})
+
+                    # compute() happens during the write.
+                    # mode='w' overwrites if exists (safe here as we checked existence above)
+                    elev.to_zarr(zarr_path, mode="w", consolidated=True)
+                    logger.info(f"BAG Zarr Cache Created: {zarr_path.name}")
+
+                    # Re-open from the fresh Zarr to return a consistent Dask-backed object
+                    elev = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                except Exception as e:
+                    logger.error(f"Failed to write cached Zarr: {e}")
+                # ---------------------------------------------------------
+
+            except Exception as e:
+                logger.warning(f"Failed to apply VDatum correction: {e}")
+
+            elev.attrs["survey_source"] = filename
+            return cast(xr.DataArray, elev)
 
     except Exception as e:
         logger.error(f"Error reading BAG {local_path}: {e}")
@@ -339,8 +396,9 @@ class BAGProvider:
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
-        self.cache_dir = Path(cache_dir).expanduser() / "bag"
+        self.cache_dir = Path(cache_dir).expanduser() / "ncei_bag"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.vdatum = VDatumResolver()
 
     def fetch_bag(self, survey_id: str, download_url: str | None = None) -> xr.DataArray | None:
@@ -376,15 +434,29 @@ class BAGProvider:
                         # Since BAGs are large, streaming via requests is better
                         with requests.get(download_url, stream=True) as r:
                             r.raise_for_status()
+                            total_size = int(r.headers.get("content-length", 0))
                             with open(temp_path, "wb") as f:
                                 for chunk in r.iter_content(chunk_size=32768):
                                     f.write(chunk)
 
+                            # Verify size if content-length was provided
+                            if total_size > 0 and temp_path.stat().st_size != total_size:
+                                raise OSError(
+                                    f"Incomplete download: {temp_path.stat().st_size}/{total_size} bytes"
+                                )
+
                         Path(temp_path).rename(local_path)
+
+                    # Cleanup Lock if successful
+                    lock_path.unlink(missing_ok=True)
             except Exception as e:
                 logger.error(f"Failed to download BAG {survey_id}: {e}")
                 if Path(temp_path).exists():
                     Path(temp_path).unlink()
+                # Leave lock file or remove?
+                # If we remove it, another process might try immediately.
+                # Better to leave for manual intervention or timeout logic,
+                # but for now we follow request to remove on success.
                 return None
 
         # 2. Read BAG

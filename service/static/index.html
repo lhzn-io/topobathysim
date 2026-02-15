@@ -146,8 +146,8 @@
     <script>
         // Parse URL Params
         const params = new URLSearchParams(window.location.search);
-        var startLat = 40.88;
-        var startLon = -73.73;
+        var startLat = 40.880001;
+        var startLon = -73.730003;
         var startZoom = 13;
         var initBounds = null;
         var initStyle = "default";
@@ -243,7 +243,7 @@
         var contourLayer = L.tileLayer('/tiles/{z}/{x}/{y}?format=png&style=contours', {
             maxZoom: 20,
             opacity: 1.0,
-            detectRetina: true,
+
             zIndex: 10 // Ensure it sits on top
         });
 

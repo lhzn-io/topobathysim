@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import fsspec
 import geopandas as gpd
@@ -35,8 +35,9 @@ class NoaaBlueTopoProvider:
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
         self.vdatum = VDatumResolver()
         base_cache = Path(cache_dir).expanduser()
-        self.cache_dir = base_cache / "bluetopo"
+        self.cache_dir = base_cache / "noaa_bluetopo"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         # Tile Scheme stays in root or moves? Let's move to bluetopo dir too to be clean.
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
@@ -229,6 +230,10 @@ class NoaaBlueTopoProvider:
 
                     # Atomic Rename
                     Path(temp_path).rename(local_path)
+
+                    # Clean up lock on success
+                    lock_path.unlink(missing_ok=True)
+
                     return local_path
 
                 finally:
@@ -299,15 +304,50 @@ class NoaaBlueTopoProvider:
         """
         Loads the cached tile and clips to bbox (west, south, east, north).
         Downloads if missing.
+        Applies caching to Zarr format for faster subsequent reads.
         """
-        try:
-            path = self._ensure_tile_cached(tile_id)
-            if not path:
-                return None
+        path = self._ensure_tile_cached(tile_id)
+        if not path:
+            return None
 
-            # Load Lazy for memory efficiency
+        zarr_dir = path.parent / "zarr"
+        zarr_path = zarr_dir / path.with_suffix(".zarr").name
+
+        # 1. Zarr Cache Hit
+        if zarr_path.exists():
+            try:
+                ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                logger.info(f"BlueTopo Zarr Cache Hit: {zarr_path.name}")
+                if "elevation" in ds:
+                    return ds["elevation"]
+                # Fallback
+                var_name = next(iter(ds.data_vars))
+                return ds[var_name]
+            except Exception as e:
+                logger.warning(f"Corrupt BlueTopo Zarr cache {zarr_path}: {e}")
+                import shutil
+
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
+
+        # 2. Cache Miss - Acquire Lock
+        from filelock import FileLock
+
+        lock_path = zarr_path.with_suffix(".zarr.lock")
+        with FileLock(lock_path):
+            # Double check if another process created it while we waited
+            if zarr_path.exists():
+                logger.info(f"BlueTopo Zarr Cache Hit (after lock): {zarr_path.name}")
+                ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                return ds["elevation"] if "elevation" in ds else ds[next(iter(ds.data_vars))]
+
+            logger.info(f"BlueTopo Zarr Cache Miss: {zarr_path.name}")
+
+            # 3. Load Raw
             da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
             da: xr.DataArray
+            from typing import cast
+
             if isinstance(da_raw, list):
                 da = cast(xr.DataArray, da_raw[0])
             elif isinstance(da_raw, xr.Dataset):
@@ -318,15 +358,29 @@ class NoaaBlueTopoProvider:
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")
 
-            # Clip
-            # WARNING: Clipping here can cause edge artifacts (transparency triangles)
-            # if the reprojection of the bbox doesn't fully cover the rotated raster corner.
-            # We return the full tile and let main.py's reproject_match handle the cropping.
-            return da
+            # 4. Cache to Zarr (Optimized Format)
+            try:
+                # Ensure name
+                da.name = "elevation"
 
-        except Exception as e:
-            logger.error(f"Load Tile Error: {e}")
-            return None
+                # Check bounds validity
+                if da.size > 0:
+                    # 1024 chunks
+                    if "y" in da.dims and "x" in da.dims:
+                        da = da.chunk({"y": 1024, "x": 1024})
+
+                    logger.info(f"Caching BlueTopo tile to Zarr: {zarr_path.name}")
+                    da.to_zarr(zarr_path, mode="w", consolidated=True)
+                    logger.info(f"BlueTopo Zarr Cache Created: {zarr_path.name}")
+
+                    # Re-open
+                    return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+
+            except Exception as e:
+                logger.error(f"Failed to write BlueTopo Zarr: {e}")
+
+            # Clip - handled by consumer, but returned DA is full tile
+            return da
 
     def get_tile_id(self, lat: float, lon: float) -> str | None:
         """
@@ -349,14 +403,8 @@ class NoaaBlueTopoProvider:
         return str(row.get("tile_id", row.get("tile")))
 
     def get_source_survey_id(self, lat: float, lon: float) -> str | None:
-        """
-        Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
-
-        Strategy Cascade:
-        1. **Embedded RAT**: Inspects Band 3 of the local GeoTIFF.
-        2. **Sidecar RAT**: Downloads the linked .vat.dbf from the Tile Scheme.
-        3. **HSMDB API**: Queries the NOAA NCEI spatial API directly.
-        """
+        # Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
+        # Strategy Cascade: Embedded RAT -> Sidecar RAT -> HSMDB API.
 
         # 1. Tile Resolution
         tile_id = self.get_tile_id(lat, lon)
@@ -435,7 +483,7 @@ class NoaaBlueTopoProvider:
         return self._resolve_from_hsmdb_api(lat, lon)
 
     def _geo_to_pixel(self, ds: Any, lat: float, lon: float) -> tuple[int | None, int | None]:
-        """Helper to transform lat/lon to pixel coordinates."""
+        # Helper to transform lat/lon to pixel coordinates.
         try:
             from osgeo import gdal, osr
 
@@ -471,7 +519,7 @@ class NoaaBlueTopoProvider:
         return None, None
 
     def _lookup_rat(self, rat: Any, pixel_val: int) -> str | None:
-        """Helper to query a GDAL RAT."""
+        # Helper to query a GDAL RAT.
         for i in range(rat.GetColumnCount()):
             col_name = rat.GetNameOfCol(i)
             if (
@@ -485,7 +533,7 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_sidecar_rat(self, tile_id: str, pixel_val: int) -> str | None:
-        """Downloads and parses the sidecar RAT linked in the GPKG."""
+        # Downloads and parses the sidecar RAT linked in the GPKG.
         self._ensure_scheme_loaded()
         if self._gdf is None:
             return None
@@ -540,7 +588,7 @@ class NoaaBlueTopoProvider:
             logger.warning(f"Sidecar parsing failed: {e}")
 
     def _parse_aux_xml_rat(self, xml_path: Path, pixel_val: int) -> str | None:
-        """Parses GDAL PAM XML to find Survey ID."""
+        # Parses GDAL PAM XML to find Survey ID.
         import xml.etree.ElementTree as Et
 
         try:
@@ -601,7 +649,7 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_hsmdb_api(self, lat: float, lon: float) -> str | None:
-        """Tertiary fallback: Query NCEI HSMDB API."""
+        # Tertiary fallback: Query NCEI HSMDB API.
         try:
             from pyproj import Transformer
 

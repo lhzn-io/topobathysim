@@ -28,6 +28,7 @@ dependencies:
   - uvicorn
   - fastapi
   - python-dotenv
+  - filelock
   # Dev dependencies
   - pytest
   - pre-commit

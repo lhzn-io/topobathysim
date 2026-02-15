@@ -1,4 +1,3 @@
-import contextlib
 import fcntl
 import logging
 import zipfile
@@ -30,8 +29,9 @@ class CUDEMProvider:
     TILE_INDEX_ZIP = "tileindex_NCEI_ninth_Topobathy_2014.zip"
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
-        self.cache_dir = Path(cache_dir).expanduser() / "cudem"
+        self.cache_dir = Path(cache_dir).expanduser() / "ncei_cudem"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
 
         self.index_path = self.cache_dir / self.TILE_INDEX_ZIP
         self.index_shp_dir = self.cache_dir / "index_shp"
@@ -148,6 +148,14 @@ class CUDEMProvider:
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=16384):
                         f.write(chunk)
+
+                # Cleanup Lock on success
+                # Ensure file handle is closed locally if needed, but 'with' context handles it?
+                lock_file.close()
+                # Actually 'with open' context handles the file object closing,
+                # but os level locks are advisory. Use unlink after success.
+                Path(lock_path).unlink(missing_ok=True)
+
                 return local_path
             except Exception as e:
                 logger.error(f"Failed to download CUDEM tile {url}: {e}")
@@ -155,7 +163,10 @@ class CUDEMProvider:
                     local_path.unlink()
                 return None
             finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                if not lock_file.closed:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                # We unlinked lock_path above on success.
+                # If failure, we keep it? User asked to remove on success.
 
     def load_tile(self, row: Any, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
         """Load single tile and harmonize datum."""
@@ -163,16 +174,38 @@ class CUDEMProvider:
         if not url:
             return None
 
+        # Ensure raw file is present
         path = self._ensure_tile_cached(url)
         if not path:
             return None
 
+        # --- Zarr Cache Layer ---
+        # If we have already converted this tile to Zarr (optimized & VDatum adjusted), use it.
+        zarr_dir = path.parent / "zarr"
+        zarr_path = zarr_dir / path.with_suffix(".zarr").name  # e.g. tile.tif -> tile.zarr
+
+        if zarr_path.exists():
+            try:
+                # Use chunks="auto" for Dask lazy loading
+                da_cached = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                logger.info(f"CUDEM Zarr Cache Hit: {zarr_path.name}")
+                return da_cached
+            except Exception as e:
+                logger.warning(f"Corrupt CUDEM Zarr cache {zarr_path}: {e}")
+                import shutil
+
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
+
+        logger.info(f"CUDEM Zarr Cache Miss: {zarr_path.name}")
+
         try:
-            # Load
+            # Load Raw
             # cast result to DataArray (open_rasterio can be ambiguous)
             from typing import cast
 
-            da_raw = rioxarray.open_rasterio(path)
+            # Use chunking on read to allow large tiles to be processed in chunks
+            da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
             da: xr.DataArray
 
             if isinstance(da_raw, list):
@@ -192,34 +225,58 @@ class CUDEMProvider:
 
             # --- Datum Check ---
             # CUDEM is usually NAVD88.
-            # Check 'vert_datum' or similar
             v_datum = "NAVD88"  # Assumption
             for col in ["vert_datum", "v_datum", "vertical_datum"]:
                 if row.get(col):
                     v_datum = str(row[col]).upper()
                     break
 
-            # If not NAVD88, we might need correction.
-            # But the simulation standard IS usually NAVD88 (or we assume base is NAVD88).
-            # Wait, default `manager.py` doesn't explicitly force NAVD88 vs MSL except in VDatum calls.
-            # Usually Topo/Bathy sim targets NAVD88 for "Land" and defaults.
             # If CUDEM is EGM2008 (Ellipsoidal?), we need correction.
-            # If CUDEM is MHW, we need correction.
-
-            # NOTE: For MVP, we pass it through but log warning if it looks exotic.
             if "EGM" in v_datum:
                 logger.warning(f"CUDEM Tile {path.name} is {v_datum}. Vertical transformation recommended.")
+                # TODO: Implement VDatum shift here if strictly required
+
+            # -- Ensure variable is imported from contextlib for safety inside the tool
+            import contextlib
 
             # Robustness: Ensure CRS is written if missing
             if da.rio.crs is None:
-                # CUDEM is typically NAD83 (EPSG:4269) or WGS84 (EPSG:4326)
-                # But some tiles might be raw lat/lon without CRS header.
-                # NAD83 is the standard for NOAA NCEI products in the US.
                 logger.warning(f"CUDEM tile {path.name} missing CRS. Assuming EPSG:4269 (NAD83).")
                 with contextlib.suppress(Exception):
                     da.rio.write_crs("EPSG:4269", inplace=True)
 
-            return da
+            # --- CACHE WRITE ---
+            # We persist the Zarr version to speed up future access and parallelism
+            try:
+                # Transpose to canonical (y, x) if needed
+                if da.dims != ("y", "x") and "y" in da.dims and "x" in da.dims:
+                    da = da.transpose("y", "x")
+
+                # Ensure we have a Name for the DataArray
+                da.name = "elevation"
+
+                # Check bounds validity before writing (sometimes nodata logic strips everything)
+                if da.size > 0:
+                    # Setup robust chunking
+                    da = da.chunk({"y": 1024, "x": 1024})
+
+                    from filelock import FileLock
+
+                    lock_path = zarr_path.with_suffix(".zarr.lock")
+                    with FileLock(lock_path):
+                        logger.info(f"Caching CUDEM tile to Zarr: {zarr_path.name}")
+                        da.to_zarr(zarr_path, mode="w", consolidated=True)
+                    logger.info(f"CUDEM Zarr Cache Created: {zarr_path.name}")
+
+                    # Re-open from Zarr
+                    return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+
+            except Exception as e:
+                logger.error(f"Failed to cache CUDEM to Zarr: {e}")
+                # Fallback to returning the raw dask array if write failed
+                return da
+
+            return da  # Fallback if write skipped logic
 
         except Exception as e:
             logger.error(f"Error reading CUDEM tile {path}: {e}")

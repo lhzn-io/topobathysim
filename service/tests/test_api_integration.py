@@ -17,7 +17,7 @@ from topobathyserve.main import app
 def mock_managers() -> Generator[tuple[MagicMock, MagicMock, MagicMock], None, None]:
     with (
         patch("topobathyserve.main.BathyManager") as mock_bm,
-        patch("topobathysim.lidar.LidarProvider") as mock_lp,
+        patch("topobathysim.usgs_lidar.UsgsLidarProvider") as mock_lp,
         patch("topobathysim.fusion.FusionEngine") as mock_fe,
     ):
         # Setup BathyManager instance
@@ -51,28 +51,29 @@ def test_source_info_endpoint(mock_managers: tuple[MagicMock, MagicMock, MagicMo
         assert response.json()["source"] == "BlueTopo"
 
 
-def test_fused_tile_ept(mock_managers: tuple[MagicMock, MagicMock, MagicMock]) -> None:
-    bm, lp, _ = mock_managers
+@patch("pathlib.Path.exists", return_value=False)
+def test_xyz_tile_endpoint(
+    mock_exists: MagicMock, mock_managers: tuple[MagicMock, MagicMock, MagicMock]
+) -> None:
+    bm, _, _ = mock_managers
 
     # Mock return DAs
-    # Create simple DataArrays
-    da_bathy = xr.DataArray(np.zeros((10, 10)) - 10, coords={"y": range(10), "x": range(10)})
+    # Create simple DataArrays roughly around New York (40N, 74W)
+    xs = np.linspace(-74.5, -73.5, 10)
+    ys = np.linspace(40.5, 41.5, 10)
+
+    da_bathy = xr.DataArray(np.zeros((10, 10)) - 10, coords={"y": ys, "x": xs})
     da_bathy.rio.write_crs("EPSG:4326", inplace=True)
 
-    da_lidar = xr.DataArray(np.ones((10, 10)) * 5, coords={"y": range(10), "x": range(10)})
-    da_lidar.rio.write_crs("EPSG:4326", inplace=True)
-
     bm.get_grid.return_value = da_bathy
-    lp.fetch_lidar_from_ept.return_value = da_lidar
 
-    url = "/fused_tile?north=41&south=40&west=-74&east=-73&ept_url=http://mock/ept.json"
+    # Request a valid tile (Tile 10/301/388 covers part of this area)
+    url = "/tiles/10/301/388.tif"
 
     with TestClient(app) as client:
         response = client.get(url)
         assert response.status_code == 200
-        # Check that fetch_lidar_from_ept was called with ept_url
-        lp.fetch_lidar_from_ept.assert_called_once()
-        args, kwargs = lp.fetch_lidar_from_ept.call_args
-        assert args[0] == "http://mock/ept.json"
-        assert kwargs["target_crs"] == "EPSG:4326"
         assert response.headers["content-type"] == "image/tiff"
+
+        # Verify manager called
+        bm.get_grid.assert_called_once()

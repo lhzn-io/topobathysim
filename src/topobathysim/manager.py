@@ -158,7 +158,7 @@ class BathyManager:
         logger.info(f"Requesting Grid: S={south}, N={north}, W={west}, E={east}, Shape={target_shape}")
 
         # 1. Collect all potential layers
-        valid_layers = []  # Tuple(Tier, Name, DataArray)
+        valid_layers: list[tuple[float, str, xr.DataArray]] = []
 
         # Tier 0: BAG (Absolute Priority)
         if self.bag:
@@ -306,7 +306,10 @@ class BathyManager:
             try:
                 da = self.land.get_grid(west, south, east, north)
                 if da is not None:
-                    valid_layers.append((1, "Land", da))
+                    # Using priority 3.5 to ensure it fills gaps but respects Bathy sources (BlueTopo/CUDEM)
+                    # unless it's Lidar (which is Tier 1, handled above).
+                    # 'Land' here typically refers to lower-res DEMs if Lidar failed.
+                    valid_layers.append((3.5, "Land", da))
             except Exception as e:
                 logger.warning(f"Land error: {e}")
 
@@ -375,8 +378,8 @@ class BathyManager:
                 res_x = res_y = 0.00005
 
             # Calc shape
-            width = int((east - west) / res_x)
-            height = int((north - south) / res_y)
+            width = max(1, int((east - west) / res_x))
+            height = max(1, int((north - south) / res_y))
 
             # Clamp potential OOM
             if width * height > 100_000_000:
@@ -409,7 +412,7 @@ class BathyManager:
             return d
 
         # Source ID Lookup
-        def get_sid(tier: int, name: str) -> int:
+        def get_sid(tier: float, name: str) -> int:
             if name == "BAG":
                 return SOURCE_ID_BAG
             if name == "Lidar":

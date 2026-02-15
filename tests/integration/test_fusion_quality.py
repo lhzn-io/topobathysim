@@ -1,7 +1,10 @@
 import os
+from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
+import xarray as xr
 from dotenv import load_dotenv
 
 # Load env vars
@@ -22,7 +25,7 @@ CENTER_LON = -73.7279
 
 
 @pytest.mark.integration
-def test_fusion_quality_execution_rocks() -> None:
+def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     """
     Verifies the fusion of Lidar and BlueTopo near Execution Rocks using a real Lidar tile.
     Metrics:
@@ -30,12 +33,13 @@ def test_fusion_quality_execution_rocks() -> None:
     2. Continuity: Check for cliffs vs smooth transition.
     """
     print(f"\n[Test] Fetching Lidar from {LIDAR_URL}...")
-    lidar_prov = UsgsLidarProvider()
+    lidar_prov = UsgsLidarProvider(cache_dir=str(persistent_cache_dir))
     # Fetch ~500m box around center
     lidar_da = lidar_prov.fetch_lidar_from_laz(LIDAR_URL, resolution=4.0)  # 4m grid
 
     assert lidar_da is not None, "Failed to fetch Lidar data."
-    print(f"[Test] Lidar Stats: Min {lidar_da.min().item():.2f}, Max {lidar_da.max().item():.2f}")
+    lidar_da.load()  # Force load into memory
+    print(f"[Test] Lidar Stats: Min {float(lidar_da.min()):.2f}, Max {float(lidar_da.max()):.2f}")
 
     # Define bounds for BlueTopo based on Lidar extent
     west, south, east, north = (
@@ -47,10 +51,15 @@ def test_fusion_quality_execution_rocks() -> None:
 
     # Expand slightly to ensure overlap? Or just use same bounds.
     print(f"[Test] Fetching Bathymetry for bounds: {west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}...")
-    manager = BathyManager()
-    bathy_da = manager.get_grid(south, north, west, east)
+    manager = BathyManager(cache_dir=str(persistent_cache_dir))
+    # Explicitly cast to DataArray as we are not requesting source mask
+    bathy_da_maybe = manager.get_grid(south, north, west, east, target_shape=(128, 128))
 
-    assert bathy_da is not None, "Failed to fetch Bathymetry."
+    assert bathy_da_maybe is not None, "Failed to fetch Bathymetry."
+    assert isinstance(bathy_da_maybe, xr.DataArray), "Expected DataArray not tuple."
+
+    bathy_da = cast(xr.DataArray, bathy_da_maybe)
+
     # Filter nodata
     bathy_valid = bathy_da.where(bathy_da != -9999.0)  # Assuming nodata handling
     print(f"[Test] Bathy Stats: Min {bathy_valid.min().item():.2f}, Max {bathy_valid.max().item():.2f}")
