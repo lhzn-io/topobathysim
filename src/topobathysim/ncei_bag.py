@@ -1,3 +1,4 @@
+import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -7,6 +8,7 @@ from typing import cast
 
 import requests  # type: ignore
 import xarray as xr
+from filelock import FileLock
 
 from .vdatum import VDatumResolver
 
@@ -172,9 +174,75 @@ class BAGDiscovery:
         "https://gis.ngdc.noaa.gov/arcgis/rest/services/web_mercator/nos_hydro_dynamic/MapServer/0/query"
     )
 
+    # Persistent Cache for Redirects (HTML Landing Page -> .bag URL)
+    # Stored in ~/.cache/topobathysim/metadata/ncei_bag_redirects.json
+    REDIRECT_CACHE_PATH = Path("~/.cache/topobathysim/metadata/ncei_bag_redirects.json").expanduser()
+
     @classmethod
-    def _scrape_landing_page(cls, download_url: str) -> str | None:
-        """Helper to scrape .bag URL from HTML landing page."""
+    def _read_bag_cached(cls, local_path: Path) -> xr.DataArray | None:
+        """
+        Reads BAG using h5py (or rasterio) and converts to xarray with NAVD88 correction.
+        Cached to avoid re-opening/parsing headers for every tile.
+        """
+        return _read_bag_cached(local_path)
+
+    @classmethod
+    def _get_redirect_from_cache(cls, download_url: str) -> list[str] | None:
+        """Read from the JSON cache if available."""
+        if not cls.REDIRECT_CACHE_PATH.exists():
+            return None
+
+        try:
+            # Simple read without locking (locking on write is critical)
+            with open(cls.REDIRECT_CACHE_PATH) as f:
+                data = json.load(f)
+                result = data.get(download_url)
+                if isinstance(result, str):
+                    return [result]
+                return cast(list[str] | None, result)
+        except Exception:
+            return None
+
+    @classmethod
+    def _update_redirect_cache(cls, download_url: str, bag_urls: list[str]) -> None:
+        """Update the JSON cache with a new mapping."""
+        try:
+            cls.REDIRECT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Use lock file alongside the json
+            lock_path = cls.REDIRECT_CACHE_PATH.parent / (cls.REDIRECT_CACHE_PATH.name + ".lock")
+
+            with FileLock(lock_path):
+                data = {}
+                if cls.REDIRECT_CACHE_PATH.exists():
+                    try:
+                        with open(cls.REDIRECT_CACHE_PATH) as f:
+                            data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = {}
+
+                # Check if already added
+                if download_url in data and data[download_url] == bag_urls:
+                    return
+
+                data[download_url] = bag_urls
+
+                # Write back sorted
+                with open(cls.REDIRECT_CACHE_PATH, "w") as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                    f.write("\n")  # EOF newline
+
+        except Exception as e:
+            logger.warning(f"Failed to update redirect cache: {e}")
+
+    @classmethod
+    def _scrape_landing_page(cls, download_url: str) -> list[str]:
+        """Helper to scrape .bag URL zfrom HTML landing page."""
+        # 1. Check Cache
+        cached_urls = cls._get_redirect_from_cache(download_url)
+        if cached_urls:
+            logger.debug(f"Redirect Cache Hit: {download_url} -> {cached_urls}")
+            return cached_urls
+
         try:
             logger.debug(f"Scraping landing page: {download_url}")
             headers = {"User-Agent": USER_AGENT}
@@ -199,36 +267,39 @@ class BAGDiscovery:
                     link = urljoin(download_url, link)
                 bag_links.append(link)
 
+            final_urls: list[str] = []
+
             # Prioritize MLLW (Tidal Datum usually matches user expectation)
             # Deprioritize Ellipsoid because we lack robust Geoid separation grids.
             mllw_links = [L for L in bag_links if "_MLLW_" in L or "MLLW" in L]
             ellip_links = [L for L in bag_links if "_Ellipsoid_" in L or "Ellipsoid" in L]
 
             if mllw_links:
-                logger.info(f"Preferred MLLW BAG found: {mllw_links[0]}")
-                return mllw_links[0]
-
-            if ellip_links:
+                logger.info(f"Preferred MLLW BAGs found: {len(mllw_links)} files")
+                final_urls = sorted(list(set(mllw_links)))
+            elif ellip_links:
                 logger.info(
-                    f"Selecting Ellipsoid BAG (Fallback, may require large Geoid offset): {ellip_links[0]}"
+                    "Selecting Ellipsoid BAGs (Fallback, may require large Geoid offset): "
+                    f"{len(ellip_links)} files"
                 )
-                return ellip_links[0]
+                final_urls = sorted(list(set(ellip_links)))
+            elif bag_links:
+                final_urls = sorted(list(set(bag_links)))
 
-            if mllw_links:
-                logger.info(f"Selecting MLLW BAG: {mllw_links[0]}")
-                return mllw_links[0]
+            if final_urls:
+                # 2. Update Cache
+                cls._update_redirect_cache(download_url, final_urls)
+                return final_urls
 
-            if bag_links:
-                return bag_links[0]
         except Exception as e:
             logger.warning(f"Scraping failed for {download_url}: {e}")
-        return None
+        return []
 
     @classmethod
     @lru_cache(maxsize=128)
-    def find_bag_by_survey_id(cls, survey_id: str) -> str | None:
+    def find_bag_by_survey_id(cls, survey_id: str) -> list[str]:
         """
-        Query NCEI API for a specific Survey ID (e.g., 'H13385') to get the BAG download URL.
+        Query NCEI API for a specific Survey ID (e.g., 'H13385') to get the BAG download URL(s).
         """
         headers = {"User-Agent": USER_AGENT}
         # Try to clean Survey ID (e.g. H13385_MB_... -> H13385)
@@ -261,26 +332,26 @@ class BAGDiscovery:
                 download_url = attr.get("DOWNLOAD_URL")
 
                 if download_url and download_url.lower().endswith(".bag"):
-                    return str(download_url)
+                    return [str(download_url)]
 
                 if download_url and download_url.lower().endswith(".html"):
                     return cls._scrape_landing_page(download_url)
 
                 # Default return
-                return str(download_url) if download_url else None
+                return [str(download_url)] if download_url else []
             else:
                 logger.warning(f"No features in response: {data}")
 
             logger.warning(f"No NCEI record found for Survey ID: {survey_id}")
-            return None
+            return []
 
         except Exception as e:
             logger.error(f"BAG Discovery Field: {e}")
-            return None
+            return []
 
     @classmethod
     @lru_cache(maxsize=128)
-    def find_bag_by_location(cls, lat: float, lon: float) -> str | None:
+    def find_bag_by_location(cls, lat: float, lon: float) -> list[str]:
         """
         Query NCEI API by location (spatial intersection).
         Useful when Survey ID resolving fails or matches a dataset not in the NCEI ID index.
@@ -321,7 +392,7 @@ class BAGDiscovery:
 
                 if download_url:
                     if download_url.lower().endswith(".bag"):
-                        return str(download_url)
+                        return [str(download_url)]
                     if download_url.lower().endswith(".html"):
                         return cls._scrape_landing_page(download_url)
             else:
@@ -329,7 +400,7 @@ class BAGDiscovery:
         except Exception as e:
             logger.warning(f"Spatial query failed: {e}")
 
-        return None
+        return []
 
     @classmethod
     @lru_cache(maxsize=128)
@@ -338,7 +409,7 @@ class BAGDiscovery:
         Queries NCEI for BAGs intersecting the bounding box.
         Returns list of download URLs.
         """
-        found_urls = []
+        found_urls: list[str] = []
         try:
             from pyproj import Transformer
 
@@ -358,7 +429,7 @@ class BAGDiscovery:
                 "geometry": geo_json,
                 "geometryType": "esriGeometryEnvelope",
                 "spatialRel": "esriSpatialRelIntersects",
-                "outFields": "SURVEY_ID,DOWNLOAD_URL",
+                "outFields": "SURVEY_ID,DOWNLOAD_URL,SURVEY_YEAR,DATE_SURVEY_END",
                 "returnGeometry": "false",
                 "f": "json",
             }
@@ -369,20 +440,56 @@ class BAGDiscovery:
             data = resp.json()
 
             if "features" in data:
+                # Collect valid BAGs with their sort key (Year/Date)
+                found_bags: list[tuple[str, int]] = []  # (URL, SortVal)
+
                 for feature in data["features"]:
                     attr = feature.get("attributes", {})
                     download_url = attr.get("DOWNLOAD_URL")
+                    # Prefer precise end date (timestamp), fallback to year (int), fallback to 0
+                    d_end = attr.get("DATE_SURVEY_END")
+                    d_year = attr.get("SURVEY_YEAR")
+                    sort_val = 0
+
+                    try:
+                        # If we have a timestamp (milliseconds), use it.
+                        # If we ONLY have a year, estimate a timestamp so they are comparable.
+                        # Timestamps ~ 1.6e12 (2020s). Years ~ 2020.
+                        if d_end is not None:
+                            sort_val = int(d_end)
+                        elif d_year is not None:
+                            # Convert Year to rough milliseconds timestamp (Year-01-01)
+                            # 1970 = 0. 2023 = (2023-1970)*31536000000
+                            sort_val = (int(d_year) - 1970) * 31536000000
+                    except Exception:
+                        pass
+
+                    # Tuple: (URL, SortVal)
                     if download_url:
+                        final_urls = []
                         if download_url.lower().endswith(".bag"):
-                            found_urls.append(str(download_url))
+                            final_urls = [str(download_url)]
                         elif download_url.lower().endswith(".html"):
                             scraped = cls._scrape_landing_page(download_url)
                             if scraped:
-                                found_urls.append(scraped)
+                                final_urls = scraped
 
-            # De-duplicate
-            found_urls = list(set(found_urls))
-            logger.info(f"Found {len(found_urls)} BAGs in BBox.")
+                        for url in final_urls:
+                            found_bags.append((url, sort_val))
+
+                # Sort by Date (Ascending: Old -> New)
+                found_bags.sort(key=lambda x: x[1])
+
+                # Extract just the URLs for compatibility
+                # Deduplicate while preserving order
+                seen = set()
+                found_urls = []
+                for url, _ in found_bags:
+                    if url not in seen:
+                        found_urls.append(url)
+                        seen.add(url)
+
+            logger.info(f"Found {len(found_urls)} BAGs in BBox (Sorted by Date).")
 
         except Exception as e:
             logger.warning(f"BBox query failed: {e}")
@@ -401,10 +508,10 @@ class BAGProvider:
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.vdatum = VDatumResolver()
 
-    def fetch_bag(self, survey_id: str, download_url: str | None = None) -> xr.DataArray | None:
+    def fetch_bag(self, survey_id: str, download_url: str | list[str] | None = None) -> xr.DataArray | None:
         """
         Fetches and reads a BAG file for a given Survey ID.
-        Auto-discovers URL if not provided.
+        Auto-discovers URL if not provided. Supports multiple BAG files for a single survey.
         """
         if not download_url:
             download_url = BAGDiscovery.find_bag_by_survey_id(survey_id)
@@ -412,8 +519,46 @@ class BAGProvider:
         if not download_url:
             return None
 
-        # Determine filename from URL
-        filename = download_url.split("/")[-1]
+        # Normalize to list
+        urls = [download_url] if isinstance(download_url, str) else download_url
+
+        loaded_arrays = []
+
+        for url in urls:
+            local_path = self._ensure_downloaded(url)
+            if local_path:
+                da = self._read_bag(local_path)
+                if da is not None:
+                    loaded_arrays.append(da)
+
+        if not loaded_arrays:
+            return None
+
+        if len(loaded_arrays) == 1:
+            return loaded_arrays[0]
+
+        # Merge if multiple
+        try:
+            from rioxarray.merge import merge_arrays
+
+            # Sort by resolution (finest first) to preserve detail
+            # abs(res[0]) is pixel width. Smallest pixel width = highest resolution.
+            loaded_arrays.sort(key=lambda da: abs(da.rio.resolution()[0]))
+
+            logger.info(f"Merging {len(loaded_arrays)} BAG segments for {survey_id}")
+            # merge_arrays returns a DataArray by default if inputs are DataArrays
+            merged = merge_arrays(loaded_arrays)
+            merged.attrs["survey_source"] = f"{survey_id} (Merged {len(loaded_arrays)})"
+            return cast(xr.DataArray, merged)
+        except Exception as e:
+            logger.error(f"Failed to merge BAGs for {survey_id}: {e}")
+            # Fallback: return the largest one? or just the first?
+            # Let's return the first one as best effort
+            return loaded_arrays[0]
+
+    def _ensure_downloaded(self, url: str) -> Path | None:
+        """Helper to download a single BAG file if missing."""
+        filename = url.split("/")[-1]
         local_path = self.cache_dir / filename
 
         # 1. Download if missing
@@ -429,10 +574,10 @@ class BAGProvider:
                     if local_path.exists():
                         pass  # Double check inside lock
                     else:
-                        logger.info(f"Downloading BAG: {download_url}")
+                        logger.info(f"Downloading BAG: {url}")
                         # Use requests for progress? Or urllib/shutil for simplicity
                         # Since BAGs are large, streaming via requests is better
-                        with requests.get(download_url, stream=True) as r:
+                        with requests.get(url, stream=True) as r:
                             r.raise_for_status()
                             total_size = int(r.headers.get("content-length", 0))
                             with open(temp_path, "wb") as f:
@@ -450,17 +595,12 @@ class BAGProvider:
                     # Cleanup Lock if successful
                     lock_path.unlink(missing_ok=True)
             except Exception as e:
-                logger.error(f"Failed to download BAG {survey_id}: {e}")
+                logger.error(f"Failed to download BAG {url}: {e}")
                 if Path(temp_path).exists():
                     Path(temp_path).unlink()
-                # Leave lock file or remove?
-                # If we remove it, another process might try immediately.
-                # Better to leave for manual intervention or timeout logic,
-                # but for now we follow request to remove on success.
                 return None
 
-        # 2. Read BAG
-        return self._read_bag(local_path)
+        return local_path
 
     def _read_bag(self, local_path: Path) -> xr.DataArray | None:
         """wrapper to call standalone cached function."""

@@ -12,8 +12,8 @@ class OfflineManifest:
     Maps spatial bounds/collections to Asset URLs, enabling offline lookup.
     """
 
-    def __init__(self, cache_dir: Path) -> None:
-        self.manifest_path = cache_dir / "manifest.json"
+    def __init__(self, cache_dir: Path, filename: str = "stac_manifest.json") -> None:
+        self.manifest_path = cache_dir / filename
         self._ensure_manifest()
 
     def _ensure_manifest(self) -> None:

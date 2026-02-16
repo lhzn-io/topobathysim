@@ -16,6 +16,7 @@ TopoBathySim
    methodology
    data_sources
    api
+   cli_tools
 
 Indices and tables
 ==================

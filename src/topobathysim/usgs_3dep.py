@@ -117,14 +117,20 @@ class Usgs3DepProvider:
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
-        self.cache_dir = Path(cache_dir).expanduser() / "usgs_3dep"
+        base_cache = Path(cache_dir).expanduser()
+        self.cache_dir = base_cache / "usgs_3dep"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Metadata Cache Directory
+        self.metadata_dir = base_cache / "metadata"
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+
         self.offline_mode = offline_mode
 
         # Manifest for Offline Lookup
         from .manifest import OfflineManifest
 
-        self.manifest = OfflineManifest(self.cache_dir)
+        self.manifest = OfflineManifest(self.metadata_dir, filename="stac_manifest.json")
 
     def _query_land_collection(
         self,

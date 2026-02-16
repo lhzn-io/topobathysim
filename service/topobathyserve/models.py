@@ -27,3 +27,14 @@ class ElevationResponse(BaseModel):
 class TIDReportResponse(BaseModel):
     report: dict[str, float]
     description: str = "Percentage of data sources by quality tier."
+
+
+class TileMetadataResponse(BaseModel):
+    z: int
+    x: int
+    y: int
+    bounds: dict[str, float]
+    created_at: str | None = None
+    fusion_sources: str | None = None
+    cache_status: str
+    request_params: str | None = None

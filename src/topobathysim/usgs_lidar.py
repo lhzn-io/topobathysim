@@ -24,9 +24,16 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
 
     try:
         logger.debug(f"Querying STAC: {stac_url} with bbox {bbox}")
+        # Search without 'limit' (which forces tiny pages)
+        # Use iterator to break early
         catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-        search = catalog.search(collections=["3dep-lidar-copc"], bbox=bbox, limit=1)
-        items = list(search.items())
+        search = catalog.search(collections=["3dep-lidar-copc"], bbox=bbox)
+
+        # Taking just the first item without exhausting all pages
+        items = []
+        for item in search.items():
+            items.append(item)
+            break
 
         if not items:
             return None

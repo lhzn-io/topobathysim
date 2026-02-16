@@ -39,47 +39,253 @@ class NoaaTopobathyProvider:
     BUCKET_BASE = "noaa-nos-coastal-lidar-pds"
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
-        self.cache_dir = Path(cache_dir).expanduser() / "noaa_topobathy"
+        self.base_cache_dir = Path(cache_dir).expanduser()
+        self.cache_dir = self.base_cache_dir / "noaa_topobathy"
+        self.metadata_dir = self.base_cache_dir / "metadata"
+        self.inport_cache_dir = self.metadata_dir / "inport"
+
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "zarr").mkdir(parents=True, exist_ok=True)
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.inport_cache_dir.mkdir(parents=True, exist_ok=True)
+
         self.vdatum = VDatumResolver()
 
         # Internal state
+        # storage: {pid: {"name": folder_name, "info": info_url, ...}}
+        # But legacy `_projects` is just {pid: folder_name}.
+        # We will keep `_projects` simple for backward compat
+        # and add `_metadatas` or just fetch on demand.
         self._projects: dict[str, str] = {}  # ID -> FolderName
+        self._projects_metadata_urls: dict[str, str] = {}  # ID -> InPort/Info URL
+
         self._active_project_id: str | None = None
         self._tile_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
 
     def _fetch_index(self) -> str:
-        """Cached fetch of the index page."""
+        """
+        Fetches the HTML index page from NOAA.
+        Only called if the JSON metadata cache is missing or stale.
+        """
+        logger.info("Fetching NOAA Coastal Lidar PDS Index (HTML)...")
+        # Reuse existing logic for fetching HTML
         return _fetch_index_cached(self.INDEX_URL)
 
     def _ensure_project_list(self) -> None:
         """
-        Parses the main index to map ID -> Project Folder Name.
+        Parses the map of ID -> Project Folder Name.
+        1. Checks local JSON cache (~/.cache/topobathysim/metadata/noaa_coastal_lidar.json)
+        2. If stale/missing, fetches HTML index, parses, and saves JSON.
         """
         if self._projects:
             return
 
+        json_path = self.metadata_dir / "noaa_coastal_lidar.json"
+        import json
+        import time
+
+        # 1. Try Loading JSON
+        if json_path.exists():
+            age = time.time() - json_path.stat().st_mtime
+            # 7 days expiration for project list (it changes rarely)
+            if age < 604800:
+                try:
+                    with open(json_path) as f:
+                        data = json.load(f)
+                        # Handle legacy format where data was just {ID: Name}
+                        # New format is {ID: {name: Name, info: URL}} or mixed?
+                        # Let's standardize on internal storage being split for now.
+                        # actually, let's keep it simple: keys are IDs. Values are Name or Dict.
+
+                        for k, v in data.items():
+                            if isinstance(v, dict):
+                                self._projects[k] = v.get("name", "")
+                                if "info" in v:
+                                    self._projects_metadata_urls[k] = v["info"]
+                            else:
+                                self._projects[k] = str(v)
+
+                        logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
+                        return
+                except Exception as e:
+                    logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
+
+        # 2. Fetch and Parse HTML
         try:
             text = self._fetch_index()
+            new_projects = {}
+            new_metadata_urls = {}
 
-            # Simple regex parser for Bulk Download links
-            # Link: [Bulk Download](https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NY_LakeOntario_DEM_2023_10402/index.html)
-            # Regex: dem/([^/]+)/index\.html
-            pattern = r"dem/([^/]+)/index\.html"
-            for match in re.finditer(pattern, text):
-                folder_name_match = match.group(1)
-                # Extract ID from end of folder name
-                # e.g. NY_LakeOntario_DEM_2023_10402 -> 10402
-                parts = folder_name_match.split("_")
-                if parts and parts[-1].isdigit():
-                    pid = parts[-1]
-                    self._projects[pid] = folder_name_match
+            # Strategy: Parse the HTML index to extract Project IDs from bulk download links
+            # (e.g. .../dem/Name_ID/index.html) and attempt to pair them with nearby
+            # InPort metadata links if present in the same table row.
 
-            logger.info(f"Discovered {len(self._projects)} Coastal Lidar Projects.")
+            # Better approach: parse lines.
+            lines = text.split("\n")
+            current_folder = None
+
+            for line in lines:
+                # 1. Find Folder / Bulk Link
+                folder_match = re.search(r'href=".*dem/([^/]+)/index\.html"', line)
+                if folder_match:
+                    folder_name = folder_match.group(1)
+                    parts = folder_name.split("_")
+                    if parts and parts[-1].isdigit():
+                        pid = parts[-1]
+                        current_folder = (pid, folder_name)
+                        new_projects[pid] = folder_name
+
+                # 2. Find InPort Link
+                # href="https://www.fisheries.noaa.gov/inport/item/74870"
+                if current_folder:
+                    pid = current_folder[0]
+                    # Check for metadata link in the SAME line
+                    pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
+                    inport_match = re.search(pattern, line)
+                    if inport_match:
+                        new_metadata_urls[pid] = inport_match.group(1)
+
+            self._projects = new_projects
+            self._projects_metadata_urls = new_metadata_urls
+
+            p_count = len(self._projects)
+            m_count = len(self._projects_metadata_urls)
+            logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
+
+            # 3. Save to JSON (Enhanced Format)
+            # Save as {ID: {name: "...", info: "..."}}
+            save_data = {}
+            for pid, folder in self._projects.items():
+                entry = {"name": folder}
+                if pid in self._projects_metadata_urls:
+                    entry["info"] = self._projects_metadata_urls[pid]
+                save_data[pid] = entry
+
+            try:
+                with open(json_path, "w") as f:
+                    json.dump(save_data, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to write metadata JSON: {e}")
 
         except Exception as e:
             logger.error(f"Failed to load project index: {e}")
+            # Identify if we have a stale JSON fallback
+            if json_path.exists():
+                logger.warning("Using stale metadata JSON as fallback.")
+                with open(json_path) as f:
+                    # Fallback specific for mixed format
+                    data = json.load(f)
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            self._projects[k] = v.get("name", "")
+                            if "info" in v:
+                                self._projects_metadata_urls[k] = v["info"]
+                        else:
+                            self._projects[k] = str(v)
+
+    def fetch_inport_metadata(self, project_id: str) -> dict | None:
+        """
+        Fetches and parses the InPort XML metadata for a project.
+        Returns a dict with key attributes (datum, date_range, sensor).
+        """
+        self._ensure_project_list()
+
+        info_url = self._projects_metadata_urls.get(project_id)
+        if not info_url:
+            logger.debug(f"No InPort URL known for Project {project_id}")
+            return None
+
+        # Ensure it's the XML endpoint
+        # URL: .../inport/item/74870 -> .../inport/item/74870/xml
+        if not info_url.endswith("/xml"):
+            # Strip trailing slash if present?
+            info_url = info_url.rstrip("/")
+            if not info_url.endswith("/xml"):
+                info_url = f"{info_url}/xml"
+
+        # Extract InPort ID for cache filename
+        # .../item/74870/xml -> 74870
+        try:
+            # split by / -> ['...', 'item', '74870', 'xml']
+            parts = info_url.split("/")
+            inport_id = parts[parts.index("xml") - 1] if "xml" in parts else parts[-1]
+        except Exception:
+            inport_id = f"pid_{project_id}"  # Fallback
+
+        xml_path = self.inport_cache_dir / f"{inport_id}.xml"
+
+        # 1. Fetch
+        if not xml_path.exists():
+            try:
+                logger.info(f"Fetching InPort Metadata: {info_url}")
+                headers = {"User-Agent": "Mozilla/5.0 TopoBathySim/1.0"}
+                r = requests.get(info_url, headers=headers, timeout=10)
+                # 200 OK even if empty sometimes?
+                if r.status_code == 200 and len(r.content) > 100:
+                    with open(xml_path, "wb") as f:
+                        f.write(r.content)
+                else:
+                    logger.warning(f"InPort fetch failed {r.status_code} for {project_id}")
+                    return None
+            except Exception as e:
+                logger.warning(f"InPort fetch error: {e}")
+                return None
+
+        # 2. Parse
+        return self._parse_inport_xml(xml_path)
+
+    def _parse_inport_xml(self, xml_path: Path) -> dict:
+        """
+        Parses FGDC/InPort XML to extract Vertical Datum and Temporal range.
+        """
+        try:
+            import xml.etree.ElementTree
+
+            tree = xml.etree.ElementTree.parse(xml_path)
+            root = tree.getroot()
+
+            meta = {"vertical_datum": "Unknown", "start_date": None, "end_date": None, "sensor_name": None}
+
+            # Helper to search text content recursively or by specific FGDC paths
+            # Note: NOAA InPort XMLs can be verbose.
+            # Look for <vertdef> (Vertical Definition) -> <altsys> (Altitude System) -> <altdatum>
+
+            # Namespace handling can be annoying in ET.
+            # We'll use simple recursive search or iter.
+
+            # 1. Vertical Datum
+            # Common tags: "altdatum", "vdatum"
+            for elem in root.iter():
+                if ("altdatum" in elem.tag or "vdatum" in elem.tag) and elem.text:
+                    txt = elem.text.lower()
+                    if "navd88" in txt or "88" in txt:
+                        meta["vertical_datum"] = "NAVD88"
+                    elif "geoid18" in txt:
+                        meta["vertical_datum"] = "NAVD88 (Geoid18)"  # Geoid18 is a realization of NAVD88
+                    elif "ellipsoid" in txt:
+                        meta["vertical_datum"] = "Ellipsoid"
+
+            # 2. Time Period
+            # <timeinfo> -> <rngdates> -> <begdate> / <enddate>
+            beg_dates = []
+            end_dates = []
+            for elem in root.iter():
+                if "begdate" in elem.tag and elem.text:
+                    beg_dates.append(elem.text)
+                if "enddate" in elem.tag and elem.text:
+                    end_dates.append(elem.text)
+
+            if beg_dates:
+                meta["start_date"] = sorted(beg_dates)[0]
+            if end_dates:
+                meta["end_date"] = sorted(end_dates)[-1]
+
+            return meta
+
+        except Exception as e:
+            logger.warning(f"Error parsing XML {xml_path}: {e}")
+            return {}
 
     def find_project_by_box(self, west: float, south: float, east: float, north: float) -> str | None:
         """
@@ -143,7 +349,13 @@ class NoaaTopobathyProvider:
                 continue
 
         if not index_file_key:
-            logger.warning(f"No tile index found for Project {project_id}.")
+            # Fallback strategy for known problematic datasets (e.g. 10274 LIS 2023)
+            # Sometimes the tile index is not in the laz/ prefix but in the dem/ prefix or named differently.
+            # 10274 often has 'tileindex.gpkg' inside the root of its DEM folder or adjacent.
+            pass
+
+        if not index_file_key:
+            logger.warning(f"No tile index found for Project {project_id} in standard locations.")
             return
 
         # Download Index
@@ -198,24 +410,161 @@ class NoaaTopobathyProvider:
 
     def fetch_tile(self, tile_filename: str) -> xr.DataArray | None:
         """
-        Fetches the specific COG from the project DEM folder.
+        Fetches the specific COG, applies VDatum corrections, and caches as Zarr.
         """
         if not self._active_project_id:
             return None
 
+        # Resolve Project Folder Name
+        if self._active_project_id not in self._projects:
+            self._ensure_project_list()
+
+        if self._active_project_id not in self._projects:
+            logger.error(f"Cannot resolve folder for Project ID {self._active_project_id}")
+            return None
+
         folder_name = self._projects[self._active_project_id]
 
-        # Using /vsicurl/ directly
-        http_url = f"https://s3.amazonaws.com/{self.BUCKET_BASE}/dem/{folder_name}/{tile_filename}"
-        vsi_path = f"/vsicurl/{http_url}"
+        # Construct Remote and Local paths
+        http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{folder_name}/{tile_filename}"
+        local_filename = f"{self._active_project_id}_{tile_filename}"
+        local_cog_path = self.cache_dir / local_filename
+
+        # Zarr Cache Setup
+        zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + "_navd88.zarr"
+        zarr_path = self.cache_dir / "zarr" / zarr_name
+
+        # 1. Zarr Cache Hit (Fast Path)
+        if zarr_path.exists():
+            try:
+                da = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                logger.debug(f"Topobathy Zarr Cache Hit: {zarr_name}")
+                return da
+            except Exception as e:
+                logger.warning(f"Corrupt Zarr {zarr_path}: {e}")
+                import shutil
+
+                shutil.rmtree(zarr_path, ignore_errors=True)
+
+        # 2. Cache Miss - Acquire Lock
+        import fcntl
+
+        lock_path = self.cache_dir / "zarr" / (zarr_name + ".lock")
 
         try:
-            # Lazy loading to prevent OOM
-            da = rioxarray.open_rasterio(vsi_path, chunks={"x": 2048, "y": 2048})
-            return cast(xr.DataArray, da)
+            with open(lock_path, "w") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+                # Double Check inside lock
+                if zarr_path.exists():
+                    try:
+                        da = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                        logger.info(f"Topobathy Zarr Cache Hit (Post-Lock): {zarr_name}")
+                        return da
+                    except Exception:
+                        pass
+
+                logger.info(f"Topobathy Zarr Cache Miss: Creating {zarr_name}")
+
+                # 3. Ensure Raw COG is Downloaded
+                if not local_cog_path.exists():
+                    cog_lock = self.cache_dir / f"{local_filename}.lock"
+                    temp_cog = self.cache_dir / f".tmp_{local_filename}"
+                    try:
+                        with open(cog_lock, "w") as cl:
+                            fcntl.flock(cl, fcntl.LOCK_EX)
+                            if not local_cog_path.exists():
+                                logger.info(f"Downloading COG: {http_url}")
+                                with requests.get(http_url, stream=True, timeout=30) as r:
+                                    r.raise_for_status()
+                                    with open(temp_cog, "wb") as f:
+                                        for chunk in r.iter_content(chunk_size=32768):
+                                            f.write(chunk)
+                                Path(temp_cog).rename(local_cog_path)
+                    except Exception as e:
+                        logger.error(f"Failed to download COG {http_url}: {e}")
+                        if Path(temp_cog).exists():
+                            Path(temp_cog).unlink()
+                        return None
+
+                # 4. Open COG and Apply Adjustments
+                try:
+                    # Load lazily
+                    da_raw = cast(
+                        xr.DataArray,
+                        rioxarray.open_rasterio(local_cog_path, chunks={"x": 2048, "y": 2048}, masked=True),
+                    )
+
+                    # Metadata & VDatum Logic
+                    meta = self.fetch_inport_metadata(self._active_project_id) or {}
+
+                    # --- PROVENANCE METADATA ---
+                    import datetime
+
+                    # Core identity
+                    da_raw.attrs["survey_source"] = self._active_project_id
+                    da_raw.attrs["source_url"] = http_url
+
+                    # Time
+                    da_raw.attrs["date_created"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    da_raw.attrs["start_date"] = meta.get("start_date", "Unknown")
+                    da_raw.attrs["end_date"] = meta.get("end_date", "Unknown")
+
+                    # Vertical Reference
+                    vdatum = meta.get("vertical_datum", "Unknown").lower()
+                    da_raw.attrs["vertical_datum_original"] = vdatum
+                    da_raw.attrs["vertical_datum"] = vdatum  # Current state
+
+                    # Links
+                    info_url = self._projects_metadata_urls.get(self._active_project_id)
+                    if info_url:
+                        da_raw.attrs["metadata_url"] = info_url
+
+                    # Apply Correction if Ellipsoid
+                    if "ellipsoid" in vdatum:
+                        try:
+                            from pyproj import Transformer
+
+                            bounds = da_raw.rio.bounds()
+                            cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
+
+                            crs = da_raw.rio.crs
+                            if crs:
+                                t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                                lon, lat = t.transform(cx, cy)
+
+                                offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
+                                logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
+                                da_raw = da_raw + offset
+
+                                # Update Attributes post-correction
+                                da_raw.attrs["vertical_datum"] = "NAVD88"
+                                da_raw.attrs["correction_method"] = "VDatum Geoid18"
+                                da_raw.attrs["vdatum_offset"] = offset
+                        except Exception as e:
+                            logger.warning(f"VDatum correction failed: {e}")
+
+                    # 5. Write to Zarr
+                    # Ensure good chunks for writing
+                    if "x" in da_raw.dims and "y" in da_raw.dims:
+                        da_raw = da_raw.chunk({"y": 1024, "x": 1024})
+
+                    da_raw.to_zarr(zarr_path, mode="w", consolidated=True)
+                    logger.info(f"Created Zarr Cache: {zarr_path.name}")
+
+                    # Return re-opened Zarr
+                    return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+
+                except Exception as e:
+                    logger.error(f"Failed to process/write Zarr for {local_filename}: {e}")
+                    return None
+
         except Exception as e:
-            logger.warning(f"Failed to stream tile {vsi_path}: {e}")
+            logger.error(f"Zarr lock/process failed: {e}")
             return None
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
 
     def get_grid(
         self, west: float, south: float, east: float, north: float, project_id: str | None = None
@@ -251,6 +600,12 @@ class NoaaTopobathyProvider:
             return das[0]
 
         from rioxarray.merge import merge_arrays
+
+        # Regarding Fusion order:
+        # For NOAA DEMs within a single project, tiles are typically spatially disjoint (mosaic).
+        # Overlap is minimal. If overlap exists, we trust rioxarray default (last layer wins).
+        # We assume the order returned by `resolve_tiles_in_bbox` (from GeoDataFrame) is arbitrary.
+        # If we had multiple temporal surveys, we would need to sort `das` by 'end_date' here.
 
         try:
             merged = merge_arrays(das)

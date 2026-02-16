@@ -339,8 +339,9 @@
             // Construct URLs
             var tileUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=npy&style=${currentStyle}`;
             var viewUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=png&style=${currentStyle}`;
+            var metaUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}/metadata`;
 
-            var content = `
+            var popupContent = `
                 <div style="font-family: monospace; font-size: 13px;">
                     <b>Location Info</b><br/>
                     <div style="margin-top:5px">
@@ -350,6 +351,9 @@
                     <div style="margin-top:5px">
                         Tile Z/X/Y: <b>${tile.z}/${tile.x}/${tile.y}</b>
                     </div>
+                    <div id="tile-meta-${tile.z}-${tile.x}-${tile.y}" style="margin-top:5px; padding:4px; background:#f0f0f0; border-radius:4px; font-size:11px;">
+                        <i>Loading metadata...</i>
+                    </div>
                     <div style="margin-top:5px; display:flex; gap:5px;">
                         <a href="${tileUrl}" target="_blank">Download .npy</a> |
                         <a href="${viewUrl}" target="_blank">View Tile</a>
@@ -357,10 +361,38 @@
                 </div>
             `;
 
-            L.popup()
+            var popup = L.popup()
                 .setLatLng(e.latlng)
-                .setContent(content)
+                .setContent(popupContent)
                 .openOn(map);
+
+            // Fetch Metadata
+            fetch(metaUrl)
+                .then(response => response.json())
+                .then(data => {
+                    var el = document.getElementById(`tile-meta-${tile.z}-${tile.x}-${tile.y}`);
+                    if (!el) return;
+
+                    if (data.cache_status === 'miss') {
+                        el.innerHTML = '<span style="color:orange">Not cached yet</span>';
+                    } else if (data.cache_status === 'corrupt') {
+                        el.innerHTML = '<span style="color:red">Cache corrupt</span>';
+                    } else {
+                        var dateStr = data.created_at ? new Date(data.created_at).toLocaleString() : 'Unknown';
+                        var sources = data.fusion_sources || 'Unknown';
+                        // Truncate sources if too long
+                        if (sources.length > 50) sources = sources.substring(0, 47) + '...';
+
+                        el.innerHTML = `
+                            <b>Created:</b> ${dateStr}<br/>
+                            <b>Sources:</b> ${sources}
+                        `;
+                    }
+                })
+                .catch(err => {
+                    var el = document.getElementById(`tile-meta-${tile.z}-${tile.x}-${tile.y}`);
+                    if(el) el.innerHTML = '<span style="color:red">Meta Error</span>';
+                });
         });
     </script>
 </body>

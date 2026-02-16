@@ -27,21 +27,71 @@ from rasterio.enums import Resampling
 from topobathysim.manager import BathyManager
 from topobathysim.quality import source_report
 
-from .models import ElevationResponse, TIDReportResponse
+from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
 
 # Configure Logging
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(log_dir / "service.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
+# Parse Debug Level from Env (set by run_server.py or environment)
+debug_mode = int(os.environ.get("TOPOBATHYSIM_DEBUG", "0"))
+log_level = logging.DEBUG if debug_mode >= 1 else logging.INFO
+
+# We need to aggressively configure logging because Uvicorn may have already set up handlers
+# and basicConfig does nothing if handlers exist.
+root_logger = logging.getLogger()
+root_logger.setLevel(log_level)
+
+# Formatter
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
+
+# File Handler (Always add)
+file_handler = logging.FileHandler(log_dir / "service.log")
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+
+# Stream Handler (Add if not present, to avoid duplicates from Uvicorn)
+# Uvicorn adds a stream handler to the root logger or 'uvicorn'.
+# If we are running under uvicorn, the root logger might already have a handler.
+# BUT we want to ensure our format is used and it goes to stdout.
+# So we aggressively add it if we don't see one that looks like ours.
+has_console = False
+for h in root_logger.handlers:
+    if isinstance(h, logging.StreamHandler) and h.stream == sys.stdout:
+        h.setFormatter(formatter)  # Force our formatter
+        h.setLevel(log_level)
+        has_console = True
+        break
+
+if not has_console:
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(log_level)
+    root_logger.addHandler(stream_handler)
+
+
+# --- Silence External Libraries even in Debug Mode ---
+# We generally want to inspect our own logic, but not the internals of rasterio/matplotlib/etc for every tile.
+for noisy_logger in [
+    "rasterio",
+    "fiona",
+    "shapely",
+    "matplotlib",
+    "PIL",
+    "botocore",
+    "urllib3",
+    "asyncio",
+    "multipart",
+    "uvicorn.access",  # Uvicorn access logs are redundant if we have middleware
+]:
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+# Explicitly set level for our app loggers
+logging.getLogger("topobathyserve").setLevel(log_level)
+logging.getLogger("topobathysim").setLevel(log_level)
+
 logger = logging.getLogger("topobathyserve")
 bathy_manager: BathyManager | None = None
 
@@ -417,6 +467,77 @@ def get_tile_coverage(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+@app.get("/tiles/{z}/{x}/{y}/metadata", response_model=TileMetadataResponse)
+def get_tile_metadata(
+    z: int,
+    x: int,
+    y: int,
+    lidar_url: str | None = None,
+    ept_url: str | None = None,
+    use_seam_blending: bool = True,
+) -> TileMetadataResponse:
+    """
+    Returns metadata for a specific fused tile (XYZ), including cache status,
+    creation time, and contributing sources.
+    Does NOT generate the tile if missing (returns cache_status='miss').
+    """
+    n = 2.0**z
+    west = x / n * 360.0 - 180.0
+    east = (x + 1) / n * 360.0 - 180.0
+    lat_rad_north = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+    north = math.degrees(lat_rad_north)
+    lat_rad_south = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
+    south = math.degrees(lat_rad_south)
+
+    import hashlib
+
+    # Use same signature logic as get_fused_tile
+    data_sig_str = (
+        f"n={north:.6f}_s={south:.6f}_w={west:.6f}_e={east:.6f}_z={z}_"
+        f"l={lidar_url}_e={ept_url}_sb={use_seam_blending}"
+    )
+    data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
+
+    data_cache_dir = Path.home() / ".cache" / "topobathysim" / "fused_zarr"
+    data_cache_path = data_cache_dir / f"{data_hash}.zarr"
+
+    bounds = {"north": north, "south": south, "west": west, "east": east}
+
+    if not data_cache_path.exists():
+        return TileMetadataResponse(z=z, x=x, y=y, bounds=bounds, cache_status="miss", fusion_sources=None)
+
+    try:
+        # Load Metadata ONLY (Fast)
+        ds = xr.open_dataset(data_cache_path, engine="zarr", chunks=None)
+
+        # We need to access the 'elevation' variable attributes or dataset attributes
+        # Our previous code writes attributes to the 'elevation' Array or the Dataset?
+        # Let's check both.
+
+        attrs = {}
+        if "created_at" in ds.attrs:
+            attrs = ds.attrs
+        elif "elevation" in ds and "created_at" in ds["elevation"].attrs:
+            attrs = ds["elevation"].attrs
+
+        return TileMetadataResponse(
+            z=z,
+            x=x,
+            y=y,
+            bounds=bounds,
+            cache_status="hit",
+            created_at=str(attrs.get("created_at")),
+            fusion_sources=str(attrs.get("fusion_sources", "Unknown")),
+            request_params=str(attrs.get("request_params")),
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to read metadata for {data_hash}: {e}")
+        return TileMetadataResponse(
+            z=z, x=x, y=y, bounds=bounds, cache_status="corrupt", fusion_sources=str(e)
+        )
+
+
 @app.get("/tiles/{z}/{x}/{y}")
 @app.get("/tiles/{z}/{x}/{y}.tif")
 @app.get("/tiles/{z}/{x}/{y}.png")
@@ -633,23 +754,47 @@ def get_fused_tile(
     final_da = None
 
     # 1.5 Try Data Cache (Zarr)
-    # We skip this for 'style=source' as that requires a different data product (source mask)
+    # We now cache both elevation and source data in the same Zarr group if available
     data_cache_path = data_cache_dir / f"{data_hash}.zarr"
+    source_da = None
 
-    if style != "source" and data_cache_path.exists():
+    if data_cache_path.exists():
         try:
             # Check for valid Zarr
             # Use chunks=None to eagerly load since these are small tiles (512x512)
             # This avoids Dask overhead for tiny arrays and ensures immediate validation
-            final_da = xr.open_dataarray(data_cache_path, engine="zarr", chunks=None, decode_coords="all")
-            # Force valid load
-            final_da.load()
 
-            logger.info(f"Fused Zarr Cache Hit: {data_hash} | Style: {style}")
+            # Try loading as Dataset first (supports multiple variables)
+            ds_cached = xr.open_dataset(data_cache_path, engine="zarr", chunks=None, decode_coords="all")
+            ds_cached.load()
+
+            if "elevation" in ds_cached:
+                final_da = ds_cached["elevation"]
+                logger.info(f"Fused Zarr Cache Hit (Elevation): {data_hash}")
+
+            if "source" in ds_cached:
+                source_da = ds_cached["source"]
+                logger.info(f"Fused Zarr Cache Hit (Source): {data_hash}")
+
+            # Fallback for old caches that were DataArrays
+            if final_da is None:
+                # Try opening as DataArray
+                final_da = xr.open_dataarray(data_cache_path, engine="zarr", chunks=None, decode_coords="all")
+                final_da.load()
+                logger.info(f"Fused Zarr Cache Hit (Legacy DataArray): {data_hash}")
+
         except Exception as e:
             logger.warning(f"Corrupt Fused Zarr {data_cache_path}: {e}")
             shutil.rmtree(data_cache_path, ignore_errors=True)
             final_da = None
+            source_da = None
+
+    # If we requested style=source but cache didn't have source_da, we must regenerate?
+    # Yes, unless we want to fail. But generally checking final_da is None triggers regeneration.
+    # If final_da exists but source_da is missing and style=source, we force regen.
+    if style == "source" and source_da is None:
+        logger.info("Cache hit for elevation but missing source mask for style='source'. Regenerating.")
+        final_da = None
 
     if final_da is None:
         try:
@@ -674,7 +819,8 @@ def get_fused_tile(
             logger.info(f"Requests Manager Grid with Shape: {b_height}x{b_width}")
 
             # Determine if we need source mask
-            need_source = style == "source"
+            # We ALWAYS ask for source mask now to populate the cache fully
+            need_source = True
 
             result = manager.get_grid(
                 south=b_south,
@@ -685,10 +831,10 @@ def get_fused_tile(
                 return_source_mask=need_source,
             )
 
-            source_da = None
+            source_da_raw = None
             if need_source:
                 if isinstance(result, tuple):
-                    bathy_da, source_da = result
+                    bathy_da, source_da_raw = result
                 else:
                     bathy_da = cast(xr.DataArray, result)
             else:
@@ -704,24 +850,30 @@ def get_fused_tile(
             target_grid = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
             target_grid.rio.write_crs("EPSG:4326", inplace=True)
 
-            # If style=source, we SHORT CIRCUIT logic to return just the source map from manager
-            if need_source and source_da is not None:
-                # Reproject to target
-                source_da = source_da.rio.reproject_match(target_grid, resampling=Resampling.nearest)
-                png_data = render_png(cast(xr.DataArray, source_da), style="source")
-                return Response(content=png_data, media_type="image/png")
+            # Reproject Source Mask if available
+            if source_da_raw is not None:
+                source_da = source_da_raw.rio.reproject_match(target_grid, resampling=Resampling.nearest)
+                if isinstance(source_da, xr.DataArray):
+                    source_da.name = "source"
+
+            # If style=source, we verify we have it
+            if style == "source" and source_da is not None:
+                # We still proceed to cache below, then return response
+                pass
 
             # The Manager returns a fully fused grid (Lidar + Topobathy + BlueTopo + CUDEM + GEBCO)
             if bathy_da is not None:
                 final_da = bathy_da
                 # Reproject to target grid
                 final_da = final_da.rio.reproject_match(target_grid, resampling=Resampling.bilinear)
+                final_da.name = "elevation"
             else:
                 raise HTTPException(status_code=404, detail="No data available")
 
             # Write Data Cache (Zarr)
             # We cache the REPROJECTED grid (the 'final_da') so it's ready for any visualization
-            if style != "source":
+            # We now write BOTH elevation and source to a Dataset
+            try:
                 from filelock import FileLock
 
                 lock_path = data_cache_path.with_suffix(".lock")
@@ -731,22 +883,46 @@ def get_fused_tile(
                     else:
                         try:
                             tmp_zarr = data_cache_dir / f".tmp_{data_hash}_{os.getpid()}_{time.time_ns()}"
-                            # Use compute=True implicit in to_zarr unless calculate=False
-                            # We ensure we have a valid array
-                            final_da.name = "elevation"
-                            final_da.to_zarr(tmp_zarr, mode="w", consolidated=True)
+
+                            # Add Metadata to elevation array (primary)
+                            from datetime import datetime
+
+                            existing_source_attr = final_da.attrs.get("source", "Unknown")
+                            final_da.attrs.update(
+                                {
+                                    "created_at": datetime.utcnow().isoformat(),
+                                    "zoom_level": zoom,
+                                    "bounds": {"north": north, "south": south, "west": west, "east": east},
+                                    "fusion_sources": existing_source_attr,
+                                    "request_params": data_sig_str,
+                                }
+                            )
+
+                            # Create Dataset
+                            ds_to_save = xr.Dataset({"elevation": final_da})
+                            if source_da is not None:
+                                ds_to_save["source"] = source_da
+
+                            # Save
+                            ds_to_save.to_zarr(tmp_zarr, mode="w", consolidated=True)
 
                             # Atomic Move
-                            # Clean up target if exists (though we checked exists() above,
-                            # race condition guard)
                             if data_cache_path.exists():
                                 shutil.rmtree(data_cache_path)
                             tmp_zarr.rename(data_cache_path)
 
-                            logger.info(f"Fused Zarr Cache Created: {data_hash}")
+                            logger.info(f"Fused Zarr Cache Created (Dataset): {data_hash}")
                         except Exception as e:
                             logger.warning(f"Failed to write Fused Zarr: {e}")
-                            # Continue without caching
+                            if "tmp_zarr" in locals() and tmp_zarr.exists():
+                                shutil.rmtree(tmp_zarr)
+            except Exception as e:
+                logger.error(f"Zarr Cache Lock Error: {e}")
+
+            # If explicit source style requested, render it here after generation/caching
+            if style == "source" and source_da is not None:
+                png_data = render_png(cast(xr.DataArray, source_da), style="source")
+                return Response(content=png_data, media_type="image/png")
 
         except Exception as e:
             logger.error(f"Error in get_fused_tile generation: {e}", exc_info=True)

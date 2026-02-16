@@ -179,18 +179,56 @@ class BathyManager:
                 bag_urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
 
                 if bag_urls:
-                    bbox_das = []
-                    for url in bag_urls:
-                        d = self.bag.fetch_bag("unknown", download_url=url)
-                        if d is not None:
-                            bbox_das.append(d)
+                    logger.info(f"Processing {len(bag_urls)} BAG surveys for BBox (Parallel)...")
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    results: list[tuple[int, xr.DataArray]] = []
+
+                    def process_bag(idx: int, url: str) -> tuple[int, xr.DataArray] | None:
+                        try:
+                            # Must verify provider is available
+                            if self.bag is None:
+                                return None
+
+                            d = self.bag.fetch_bag("unknown", download_url=url)
+                            if d is not None:
+                                try:
+                                    # Slice to request bbox immediately
+                                    d_sliced = d.rio.clip_box(
+                                        minx=west,
+                                        miny=south,
+                                        maxx=east,
+                                        maxy=north,
+                                        crs="EPSG:4326",
+                                        auto_expand=True,
+                                    )
+                                    if d_sliced.size > 0:
+                                        return (idx, d_sliced)
+                                except Exception:
+                                    # Only debug log clip errors, common for non-overlapping parts
+                                    pass
+                        except Exception as e_fetch:
+                            logger.error(f"Error processing BAG {url}: {e_fetch}")
+                        return None
+
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = [executor.submit(process_bag, i, u) for i, u in enumerate(bag_urls)]
+                        for f in as_completed(futures):
+                            res = f.result()
+                            if res:
+                                results.append(res)
+
+                    # Sort results Newest -> Oldest (Index Descending)
+                    # Because merge_arrays uses "First Wins" logic
+                    results.sort(key=lambda x: x[0], reverse=True)
+                    bbox_das = [r[1] for r in results]
 
                     if bbox_das:
                         try:
                             # Use rioxarray to merge multiple BAGs if found
-                            logger.debug("Merging multiple BAG arrays...")
+                            logger.info(f"Merging {len(bbox_das)} valid BAG array slices...")
                             merged_bag = merge_arrays(bbox_das)
-                            logger.debug("Merged BAG arrays successfully.")
+                            logger.info("Merged BAG arrays successfully.")
 
                             # Filter out existing BAG entry if any (prioritize merged)
                             valid_layers = [v for v in valid_layers if v[1] != "BAG"]
@@ -204,11 +242,14 @@ class BathyManager:
                 # Legacy Fallback
                 if not any(v[1] == "BAG" for v in valid_layers):
                     # We need a URL here, assume None is handled
-                    bag_url: str | None = BAGDiscovery.find_bag_by_location(center_lat, center_lon)
-                    if bag_url:
-                        da = self.bag.fetch_bag("unknown", download_url=bag_url)
-                        if da is not None:
-                            valid_layers.append((0, "BAG", da))
+                    bag_urls_loc = BAGDiscovery.find_bag_by_location(center_lat, center_lon)
+                    if bag_urls_loc:
+                        # Use the first one or logic
+                        bag_url: str = bag_urls_loc[0]
+                        if self.bag:
+                            da = self.bag.fetch_bag("unknown", download_url=bag_url)
+                            if da is not None:
+                                valid_layers.append((0, "BAG", da))
             except Exception as e:
                 logger.warning(f"BAG error: {e}")
 

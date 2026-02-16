@@ -66,7 +66,17 @@ docker run -p 9595:8000 topobathyserve
 
 *Access the viewer at `http://localhost:9595/viewer`*
 
-### 2. Python API Usage
+### 2. Cache Maintenance
+
+Since TopoBathySim caches large datasets, use the built-in integrity tool to audit and repair storage health.
+See [CLI Tools Documentation](docs/source/cli_tools.rst) for full usage details.
+
+```bash
+# Quick Audit
+micromamba run -n topobathysim python src/topobathysim/scripts/verify_cache_integrity.py --check
+```
+
+### 3. Python API Usage
 
 Use the library directly for custom analysis or data extraction.
 

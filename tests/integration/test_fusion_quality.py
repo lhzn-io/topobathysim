@@ -109,4 +109,4 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
 
 if __name__ == "__main__":
     # Allow manual run
-    test_fusion_quality_execution_rocks()
+    test_fusion_quality_execution_rocks(Path(".cache"))
