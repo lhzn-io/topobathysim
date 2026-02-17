@@ -707,7 +707,7 @@ def get_fused_tile(
 
     # 1b. Output Signature (Format + Style + Contrast)
     # This determines the FILE returned to the client
-    sig_str = f"{data_hash}_" f"fmt={format}_st={style}_" f"vm={vmin}_vx={vmax}"
+    sig_str = f"{data_hash}_fmt={format}_st={style}_vm={vmin}_vx={vmax}"
     sig_hash = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
 
     # Structured Cache Directory for Fused Outputs

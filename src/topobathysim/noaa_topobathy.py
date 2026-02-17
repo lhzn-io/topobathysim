@@ -500,12 +500,19 @@ class NoaaTopobathyProvider:
         results = []
         for _, row in matches.iterrows():
             fname = None
-            for col in ["Name", "name", "URL", "url", "id", "TileName"]:
+            # Extended column search order
+            for col in ["location", "Location", "Name", "name", "URL", "url", "id", "TileName"]:
                 if col in row:
-                    fname = str(row[col])
-                    break
+                    val = str(row[col])
+                    if val and val.lower() != "nan":
+                        fname = val
+                        break
 
             if fname:
+                # If we picked up a full URL, strip it to just the filename
+                if fname.startswith("http"):
+                    fname = Path(fname).name
+
                 if not fname.endswith(".tif"):
                     fname += ".tif"  # Append extension if missing
                 results.append(fname)

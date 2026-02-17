@@ -156,7 +156,7 @@ def scan_provider(provider_name: str, clean: bool = False, lock_timeout: int = 3
                     logger.info(f"Removing stale lock: {t.name}")
                     t.unlink()
                 else:
-                    logger.warning(f"Found stale lock: {t.name} ({age/60:.1f} min old)")
+                    logger.warning(f"Found stale lock: {t.name} ({age / 60:.1f} min old)")
         else:
             # Tmp files always suspect if older than timeout
             age = time.time() - t.stat().st_mtime

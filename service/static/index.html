@@ -348,6 +348,9 @@
                         Lat: <input type="text" value="${lat.toFixed(6)}" style="width: 100px;" onclick="this.select()"><br/>
                         Lon: <input type="text" value="${lng.toFixed(6)}" style="width: 100px;" onclick="this.select()">
                     </div>
+                    <div id="click-elevation-${tile.x}-${tile.y}" style="margin-top:5px; font-weight:bold; color:#0066cc;">
+                        <i>Loading Elevation...</i>
+                    </div>
                     <div style="margin-top:5px">
                         Tile Z/X/Y: <b>${tile.z}/${tile.x}/${tile.y}</b>
                     </div>
@@ -365,6 +368,26 @@
                 .setLatLng(e.latlng)
                 .setContent(popupContent)
                 .openOn(map);
+
+            // Fetch Elevation
+            fetch(`/elevation?lat=${lat}&lon=${lng}`)
+                .then(response => {
+                    if (!response.ok) throw new Error("No Data");
+                    return response.json();
+                })
+                .then(data => {
+                    var el = document.getElementById(`click-elevation-${tile.x}-${tile.y}`);
+                    if (!el) return;
+
+                    var m = data.elevation;
+                    var ft = m * 3.28084;
+
+                    el.innerHTML = `Depth: ${m.toFixed(2)} m (${ft.toFixed(1)} ft)`;
+                })
+                .catch(err => {
+                    var el = document.getElementById(`click-elevation-${tile.x}-${tile.y}`);
+                    if (el) el.innerHTML = '<span style="color:#999">No Elevation Data</span>';
+                });
 
             // Fetch Metadata
             fetch(metaUrl)

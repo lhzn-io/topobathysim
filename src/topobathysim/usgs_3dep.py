@@ -292,7 +292,7 @@ class Usgs3DepProvider:
                     except requests.HTTPError as e:
                         if e.response is not None and e.response.status_code == 403:
                             logger.warning(
-                                f"403 Forbidden for {href}. Clearing STAC cache and " "local manifest..."
+                                f"403 Forbidden for {href}. Clearing STAC cache and local manifest..."
                             )
                             # 1. Clear In-Memory Cache (lru_cache)
                             _query_stac_cached.cache_clear()
