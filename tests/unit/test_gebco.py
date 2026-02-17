@@ -37,29 +37,29 @@ mock_bmi.Topography = MockTopography
 sys.modules["bmi_topography"] = mock_bmi
 
 # Reload to force using the mock
-if "topobathysim.gebco_2025" in sys.modules:
-    import topobathysim.gebco_2025
+if "topobathysim.providers.gebco_2025" in sys.modules:
+    import topobathysim.providers.gebco_2025
 
-    importlib.reload(topobathysim.gebco_2025)
+    importlib.reload(topobathysim.providers.gebco_2025)
 
-from topobathysim.gebco_2025 import GEBCO2025Provider as Gebco2025  # noqa: E402
+from topobathysim.providers.gebco_2025 import GEBCO2025Provider as Gebco2025  # noqa: E402
 
 
 @pytest.fixture
 def mock_gebco_dataset() -> xr.Dataset:
     """Create a mock Xarray Dataset mimicking GEBCO 2025 structure."""
-    lat = np.linspace(-10, 10, 20)
-    lon = np.linspace(-10, 10, 20)
+    lat = np.linspace(-10, 10, 100)
+    lon = np.linspace(-10, 10, 100)
 
     da_elev = xr.DataArray(
-        np.zeros((20, 20)),
+        np.zeros((100, 100)),
         coords={"lat": lat, "lon": lon},
         dims=("lat", "lon"),
         name="sub_ice_topo_bathymetry",
     )
 
     da_tid = xr.DataArray(
-        np.ones((20, 20), dtype=int) * 11,  # Direct TID
+        np.ones((100, 100), dtype=int) * 11,  # Direct TID
         coords={"lat": lat, "lon": lon},
         dims=("lat", "lon"),
         name="tid",

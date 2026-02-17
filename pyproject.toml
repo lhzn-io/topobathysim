@@ -24,6 +24,7 @@ dependencies = [
   "bmi-topography==0.9.0",
   "xarray",
   "rioxarray",
+  "zarr",
   "numpy",
   "pydap",
   "fsspec",
@@ -54,6 +55,7 @@ Source = "https://github.com/lhzn-io/biologger-sim/tree/main/bathysim"
 dependencies = [
   "coverage[toml]>=6.5",
   "pytest",
+  "geopandas",
 ]
 
 [tool.hatch.envs.default.scripts]

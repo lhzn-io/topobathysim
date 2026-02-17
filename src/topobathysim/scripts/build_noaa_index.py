@@ -7,7 +7,7 @@ import fsspec
 import geopandas as gpd
 from shapely.geometry import box
 
-from topobathysim.noaa_topobathy import NoaaTopobathyProvider
+from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")

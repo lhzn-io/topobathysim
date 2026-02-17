@@ -9,8 +9,10 @@ dependencies:
   - python-pdal
   - gdal
   - rasterio
+  - geopandas
   - xarray
   - rioxarray
+  - zarr
   - numpy
   - scipy
   - laspy

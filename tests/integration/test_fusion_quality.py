@@ -15,7 +15,7 @@ if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
 
 from topobathysim.fusion import FusionEngine  # noqa: E402
 from topobathysim.manager import BathyManager  # noqa: E402
-from topobathysim.usgs_lidar import UsgsLidarProvider  # noqa: E402
+from topobathysim.providers.usgs_lidar import UsgsLidarProvider  # noqa: E402
 
 # Found via scan_laz.py
 LIDAR_URL = "s3://noaa-nos-coastal-lidar-pds/laz/geoid18/4938/20140403_usgs_ny_li_18TXL060240.copc.laz"

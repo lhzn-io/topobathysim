@@ -5,7 +5,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import box
 
-from topobathysim.noaa_topobathy import NoaaTopobathyProvider
+from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
 
 
 @pytest.fixture

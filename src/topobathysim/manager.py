@@ -393,7 +393,7 @@ class BathyManager:
             xs = np.linspace(west + lon_res / 2, east - lon_res / 2, num=width)
             ys = np.linspace(north - lat_res / 2, south + lat_res / 2, num=height)
 
-            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
+            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"), name="elevation")
             base_da.rio.set_spatial_dims("x", "y", inplace=True)
             base_da.rio.write_crs("EPSG:4326", inplace=True)
             transform = Affine.translation(west, north) * Affine.scale(lon_res, -lat_res)
@@ -435,7 +435,7 @@ class BathyManager:
             xs = np.linspace(west + lon_res / 2, east - lon_res / 2, num=width)
             ys = np.linspace(north - lat_res / 2, south + lat_res / 2, num=height)
 
-            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
+            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"), name="elevation")
             base_da.rio.set_spatial_dims("x", "y", inplace=True)
             base_da.rio.write_crs("EPSG:4326", inplace=True)
             transform = Affine.translation(west, north) * Affine.scale(lon_res, -lat_res)
