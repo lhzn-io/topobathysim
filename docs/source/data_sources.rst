@@ -66,6 +66,18 @@ NOAA National Geodetic Survey (NGS)
     *   **Example (Long Island Sound)**: `Methodology Report (PDF) <https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/laz/geoid18/10273/supplemental/NOAA_NY_Long_Island_Topobathymetric_Lidar_Imagery_Report_Final.pdf>`_
     *   **Access**: `NOAA Digital Coast <https://coast.noaa.gov/digitalcoast/>`_
 
+    **Coverage Maximization & Survey Selection Strategy**
+
+    To manage the hundreds of overlapping proprietary surveys available via NOAA's Digital Coast, TopoBathySim employs a dynamic **Spatial Index** to select the optimal data source for any given area of interest.
+
+    When a simulation region intersects multiple available surveys, the system prioritizes them using the following **Fusion Hierarchy**:
+
+    1.  **Vertical Datum Quality**: Surveys referenced to **NAVD88 (Geoid18)** are strictly preferred over legacy NAVD88 or Ellipsoidal references, ensuring consistent vertical integration with water levels.
+    2.  **Recency**: Among surveys with equal datum quality, the most recently completed survey (based on ``end_date``) is selected.
+    3.  **Spatial Overlap**: The system identifies all surveys intersecting the requested bounding box. Currently, the single "best" survey is selected to provide a self-consistent foundation, rather than blending multiple surveys which may have slight vertical offsets or temporal discrepancies.
+
+    Within a selected survey, individual data tiles are fused using a **Mosaic** operation, where valid data overwrites NoData/Void areas.
+
 Survey "Truth" Data (Tier 0)
 ----------------------------
 

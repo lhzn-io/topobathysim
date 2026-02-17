@@ -61,6 +61,7 @@ class NoaaTopobathyProvider:
 
         self._active_project_id: str | None = None
         self._tile_index: gpd.GeoDataFrame | None = None
+        self._spatial_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
 
     def _fetch_index(self) -> str:
@@ -287,29 +288,118 @@ class NoaaTopobathyProvider:
             logger.warning(f"Error parsing XML {xml_path}: {e}")
             return {}
 
+    def _ensure_spatial_index(self) -> None:
+        """
+        Loads the spatial index of project extents (GeoJSON).
+        If missing, attempts to build it (this may take time).
+        """
+        if self._spatial_index is not None:
+            return
+
+        index_path = self.metadata_dir / "noaa_project_extents.geojson"
+
+        if not index_path.exists():
+            logger.warning(
+                "Spatial index missing. Building NOAA Project Index (this may take several minutes)..."
+            )
+            try:
+                # Run the builder script logic
+                # To avoid circular imports, we import the function here
+                # Note: `scripts` must be a package for this to work relative within `topobathysim` context
+                from .scripts.build_noaa_index import main as build_index
+
+                # If running purely as script, build_index execution context might differ,
+                # but since we are in `topobathysim` package, it should work.
+                build_index()
+            except ImportError:
+                # Fallback if scripts isn't importable as package
+                logger.error(
+                    "Could not import build_noaa_index script. Please run "
+                    "'python -m topobathysim.scripts.build_noaa_index' manually."
+                )
+                return
+            except Exception as e:
+                logger.error(f"Failed to build spatial index: {e}")
+                return
+
+        if index_path.exists():
+            try:
+                self._spatial_index = gpd.read_file(index_path)
+                # Parse dates for sorting
+                import pandas as pd
+
+                if "end_date" in self._spatial_index.columns:
+                    self._spatial_index["end_date"] = pd.to_datetime(
+                        self._spatial_index["end_date"], errors="coerce"
+                    )
+
+                logger.info(f"Loaded NOAA Spatial Index with {len(self._spatial_index)} projects.")
+            except Exception as e:
+                logger.error(f"Failed to load spatial index {index_path}: {e}")
+                self._spatial_index = None
+
     def find_project_by_box(self, west: float, south: float, east: float, north: float) -> str | None:
         """
-        Identifies the best project ID for the bounding box.
-        Currently relies on keyword heuristics or manual ID injection
-        since we lack a global spatial index.
+        Identifies the best project ID for the bounding box using the spatial index.
+        Prioritizes:
+        1. Spatial Overlap (intersects)
+        2. Recency (end_date)
+        3. Vertical Datum Quality (NAVD88/Geoid18 > Ellipsoid > Unknown)
         """
         self._ensure_project_list()
 
-        # Heuristic: Check for known project IDs first (e.g. LIS 2023 = 10274)
-        # In a real impl, we might check 'roi.geojson' if we had it.
-        # For Phase 8 prompt, we specifically look for LIS (10274).
+        # Try loading spatial index
+        self._ensure_spatial_index()
 
-        # Validating hardcoded knowledge as fallback
-        # LIS 2023 -> 10274
-        if "10274" in self._projects:
-            # Check if bbox is roughly in LIS?
-            # LIS approx: -74 to -71, 40 to 42.
-            lis_box = box(-74.5, 40.5, -71.5, 41.5)
+        if self._spatial_index is not None and not self._spatial_index.empty:
             query_box = box(west, south, east, north)
-            if lis_box.intersects(query_box):
-                return "10274"
 
-        # TODO: Implement full spatial search via checking metadata of all projects
+            # CRS check
+            search_geom = query_box
+            if self._spatial_index.crs and self._spatial_index.crs.to_string() != "EPSG:4326":
+                # Index should be 4326 per build script, but verify
+                pass
+
+            # Filter by intersection
+            # Use spatial index if available, or brute force intersection
+            candidates = self._spatial_index[self._spatial_index.intersects(search_geom)].copy()
+
+            if not candidates.empty:
+                # Conflict Resolution
+
+                # 1. Datum Priority Score
+                def datum_score(d: object) -> int:
+                    d_str = str(d).lower()
+                    if "geoid18" in d_str:
+                        return 3
+                    if "navd88" in d_str:
+                        return 2
+                    if "ellipsoid" in d_str:
+                        return 1
+                    return 0
+
+                candidates["datum_score"] = candidates["vertical_datum"].apply(datum_score)
+
+                # 2. Date Priority
+                # already converted to datetime in _ensure_spatial_index
+
+                # Sort: Datum Score (Desc), End Date (Desc)
+                candidates = candidates.sort_values(by=["datum_score", "end_date"], ascending=[False, False])
+
+                best_match = candidates.iloc[0]
+                logger.info(
+                    f"Auto-selected Project {best_match['project_id']} "
+                    f"({best_match['project_name']}) for bbox."
+                )
+                return str(best_match["project_id"])
+
+        # If spatial index is missing or empty, we fail loudly as requested
+        if self._spatial_index is None or self._spatial_index.empty:
+            raise RuntimeError(
+                "NOAA Spatial Index is unavailable. "
+                "Please run 'python -m topobathysim.scripts.build_noaa_index' to generate it."
+            )
+
         return None
 
     def set_active_project(self, project_id: str) -> None:
@@ -326,18 +416,32 @@ class NoaaTopobathyProvider:
 
         self._active_project_id = project_id
 
-        # Find tile index in laz/geoid18/{ID} or laz/geoid12b/{ID}
-        # We try geoid18 first as per prompt requirement
+        # Find tile index in laz/geoid18/{ID}, laz/geoid12b/{ID}, or dem/{FOLDER}/
+        # We try geoid18 first, then geoid12b, then fallback to dem/ folder
         candidates = [f"laz/geoid18/{project_id}/", f"laz/geoid12b/{project_id}/"]
+
+        folder_name = self._projects.get(project_id)
+        if folder_name:
+            candidates.append(f"dem/{folder_name}/")
 
         index_file_key = None
 
         for prefix in candidates:
             try:
-                files = self.fs.ls(f"{self.BUCKET_BASE}/{prefix}")
+                # s3fs ls returns full paths
+                # e.g. ["bucket/key", ...]
+                path_to_list = f"{self.BUCKET_BASE}/{prefix}"
+                try:
+                    files = self.fs.ls(path_to_list)
+                except FileNotFoundError:
+                    continue
+
+                if not files:
+                    continue
+
                 for f in files:
                     # f is full path e.g. noaa-nos.../laz/...
-                    name = Path(f).name
+                    name = Path(f).name.lower()  # ensure case-insensitive check
                     if "tileindex" in name and (
                         name.endswith(".gpkg") or name.endswith(".zip") or name.endswith(".shp")
                     ):
