@@ -894,7 +894,12 @@ def get_fused_tile(
                                 {
                                     "created_at": datetime.utcnow().isoformat(),
                                     "zoom_level": zoom,
-                                    "bounds": {"north": north, "south": south, "west": west, "east": east},
+                                    "tile_bounds": {
+                                        "north": north,
+                                        "south": south,
+                                        "west": west,
+                                        "east": east,
+                                    },
                                     "fusion_sources": existing_source_attr,
                                     "request_params": data_sig_str,
                                 }
@@ -918,6 +923,14 @@ def get_fused_tile(
                             logger.warning(f"Failed to write Fused Zarr: {e}")
                             if "tmp_zarr" in locals() and tmp_zarr.exists():
                                 shutil.rmtree(tmp_zarr)
+
+                # Attempt to clean up lock file if cache was successfully created
+                try:
+                    if data_cache_path.exists() and lock_path.exists():
+                        lock_path.unlink()
+                except Exception:
+                    pass
+
             except Exception as e:
                 logger.error(f"Zarr Cache Lock Error: {e}")
 

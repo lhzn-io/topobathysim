@@ -175,6 +175,13 @@ class GEBCO2025Provider(Topography):
                                 logger.error(f"Failed to fetch GEBCO tile {tile_key}: {tile_err}")
                                 continue
 
+                    # Attempt to clean up lock file if cache was successfully created
+                    try:
+                        if cache_path.exists() and lock_path.exists():
+                            lock_path.unlink()
+                    except Exception:
+                        pass
+
                 if da_tile is not None:
                     das_to_merge.append(da_tile)
 

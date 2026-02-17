@@ -94,6 +94,36 @@ TopoBathySim leverages **Cloud Optimized Point Clouds (COPC)** to provide instan
         force_cache=True  # Spawns background download
     )
 
+Caching Architecture
+--------------------
+
+To balance the high cost of data fusion (fetching, unzipping, resampling) with the need for high-performance tile serving, TopoBathySim implements a strict **3-Layer Caching Strategy**.
+
+**Layer 1: Data Cache (Fused Zarr)**
+    *   **Location**: ``~/.cache/topobathysim/fused_zarr/``
+    *   **Format**: **Zarr** (Python native, chunked, compressed arrays).
+    *   **Content**: The raw, fused mathematical data (Elevation values + Source IDs). This is the "Truth" state of the fused grid.
+    *   **Keying**: Content-Addressable. The cache key is an MD5 hash of the **Data Request Parameters** (Bounds + Data Source URLs + Fusion Logic).
+    *   **Role**: **Expensive Operation Cache**. It saves the cost of downloading gigabytes of Lidar/GEBCO data and fusing them. It is reused for *all* visualization styles (hillshade, raw data, contours).
+
+**Layer 2: Render Cache (Output Cache)**
+    *   **Location**: ``~/.cache/topobathysim/fused/``
+    *   **Format**: **Format-Specific** (PNG, GeoTIFF, NumPy).
+    *   **Content**: The final serialized bytes returned to the client.
+    *   **Keying**: Content-Addressable. The cache key is an MD5 hash of the **Output Parameters** (Data Hash + Format + Visual Style + Min/Max Elevation).
+    *   **Role**: **CPU/IO Cache**. It saves the cost of opening the Zarr file, running Matplotlib (for PNGs), or serializing arrays.
+    *   **Structure**:
+        *   ``visual/``: Rendered images (e.g., ``visual/default/fused_...png``).
+        *   ``data/``: Raw serialized buffers (e.g., ``data/fused_...npy``).
+        *   ``raw/``: GIS formats (GeoTIFF).
+
+**Layer 3: Tile Cache (Slippy Map)**
+    *   **Location**: ``~/.cache/topobathysim/tiles/``
+    *   **Format**: XYZ Tiled Images/Data.
+    *   **Content**: A semantic copy of Layer 2, organized by Zoom/X/Y.
+    *   **Keying**: Semantic (``/{z}/{x}/{y}.png``).
+    *   **Role**: **Service Delivery**. Allows standard web maps (Leaflet, Mapbox) to request tiles by coordinate without knowing the underlying hash keys. This directory can simply be served as a static file server.
+
 Visualization & Debugging Tools
 -----------------------------
 
