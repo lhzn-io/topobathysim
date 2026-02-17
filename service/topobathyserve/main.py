@@ -950,8 +950,18 @@ def get_fused_tile(
 
     try:
         if format == "png":
+            # If style is source, we MUST render the source_da, not elevation
+            da_to_render = final_da
+            if style == "source":
+                if source_da is not None:
+                    da_to_render = source_da
+                else:
+                    logger.warning(
+                        "Requested style='source' but source_da is None. Rendering elevation instead."
+                    )
+
             resp_content = render_png(
-                cast(xr.DataArray, final_da),
+                cast(xr.DataArray, da_to_render),
                 style=style,
                 vmin=vmin,
                 vmax=vmax,
