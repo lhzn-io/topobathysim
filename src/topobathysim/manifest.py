@@ -95,3 +95,28 @@ class OfflineManifest:
         except Exception as e:
             logger.error(f"Failed to read manifest: {e}")
             return []
+
+    def remove_item_by_href(self, href: str) -> None:
+        """
+        Removes an item from the manifest by matching the base URL (ignoring tokens).
+        """
+        try:
+            target_base = href.split("?")[0]
+
+            with open(self.manifest_path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                data = json.load(f)
+
+                original_len = len(data.get("items", []))
+                # Filter out matching items
+                data["items"] = [x for x in data.get("items", []) if x["href"].split("?")[0] != target_base]
+
+                if len(data["items"]) < original_len:
+                    logger.debug(f"Removed {original_len - len(data['items'])} stale items from manifest.")
+                    f.seek(0)
+                    json.dump(data, f, indent=2)
+                    f.truncate()
+
+                fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            logger.error(f"Failed to remove item from manifest: {e}")

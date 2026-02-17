@@ -291,18 +291,22 @@ class Usgs3DepProvider:
                         local_path = self._download_and_cache(href)
                     except requests.HTTPError as e:
                         if e.response is not None and e.response.status_code == 403:
-                            logger.warning(f"403 Forbidden for {href}. Clearing STAC cache and retrying...")
+                            logger.warning(
+                                f"403 Forbidden for {href}. Clearing STAC cache and " "local manifest..."
+                            )
+                            # 1. Clear In-Memory Cache (lru_cache)
                             _query_stac_cached.cache_clear()
-                            # Retry THIS item? We need to re-query everything actually.
-                            # But we are inside a loop over OLD items.
-                            # We should probably break out and restart the entire _fetch_collection logic?
-                            # Or just re-query this specific call?
-                            # If we clear cache, the next call to _query_land_collection will get new tokens.
-                            # So we should recursively call _fetch_collection once?
+
+                            # 2. Remove Stale Item from Persistent Manifest
+                            self.manifest.remove_item_by_href(href)
+
+                            # 3. Recursive Retry (Will re-query API for fresh token)
+                            # Note: use self.fetch_dem logic again implicitly via
+                            # recursive call or just re-call this private method?
+                            # Using private method is safer to avoid changing
+                            # collection priority logic.
                             return self._fetch_collection(bounds, collection_id)
-                        raise e  # Re-raise other errors to be handled below?
-                        # Actually previous logic swallowed errors in _download_and_cache.
-                        # We need _download_and_cache to RAISE 403, but maybe return None for others?
+                        raise e
 
                     if not local_path:
                         break  # Download failed (non-403)
