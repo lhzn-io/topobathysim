@@ -41,7 +41,7 @@ logger = logging.getLogger("cache_verify")
 
 CACHE_ROOT = Path("~/.cache/topobathysim").expanduser()
 
-PROVIDERS = ["ncei_bag", "usgs_lidar", "noaa_bluetopo", "noaa_topobathy", "ncei_cudem"]
+PROVIDERS = ["ncei_bag", "usgs_lidar", "noaa_bluetopo", "noaa_topobathy", "ncei_cudem", "usgs_3dep"]
 
 
 @contextmanager
@@ -77,14 +77,21 @@ def suppress_fd_stderr() -> Iterator[None]:
 def verify_raster_integrity(file_path: Path) -> bool:
     """
     Checks if a raster file (BAG, TIFF) is valid using rasterio.
+    Reads a small chunk of data to ensure the file isn't just a valid header with missing body.
     """
     try:
         # Using FD redirection to silence stubborn GDAL C-level warnings
         with suppress_fd_stderr(), rasterio.Env(CPL_LOG_ERRORS=False), rasterio.open(file_path) as src:
-            # Basic header check
-            _ = src.width
-            _ = src.height
+            # Basic header check - fast failure
+            width = src.width
+            height = src.height
             _ = src.count
+
+            # Read the last pixel/block to verify file is not truncated
+            # (Reading the whole file is too slow for 100s of files)
+            # Window(col_off, row_off, width, height)
+            if width > 0 and height > 0:
+                _ = src.read(1, window=rasterio.windows.Window(width - 1, height - 1, 1, 1))
         return True
     except (RasterioIOError, Exception):
         return False
@@ -170,6 +177,7 @@ def scan_provider(provider_name: str, clean: bool = False, lock_timeout: int = 3
         "usgs_lidar": ["*.laz"],
         "ncei_cudem": ["*.tif"],
         "noaa_topobathy": ["*.tif", "*.tiff"],
+        "usgs_3dep": ["*.tif", "*.tiff"],
     }
 
     patterns = source_patterns.get(provider_name, [])

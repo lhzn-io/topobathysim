@@ -472,6 +472,7 @@ def get_tile_metadata(
     z: int,
     x: int,
     y: int,
+    manager: Annotated[BathyManager, Depends(get_manager)],
     lidar_url: str | None = None,
     ept_url: str | None = None,
     use_seam_blending: bool = True,
@@ -498,7 +499,7 @@ def get_tile_metadata(
     )
     data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
 
-    data_cache_dir = Path.home() / ".cache" / "topobathysim" / "fused_zarr"
+    data_cache_dir = manager.cache_dir / "fused_zarr"
     data_cache_path = data_cache_dir / f"{data_hash}.zarr"
 
     bounds = {"north": north, "south": south, "west": west, "east": east}
@@ -585,7 +586,8 @@ def get_xyz_tile(
         f"Bounds: N={north:.5f} S={south:.5f} W={west:.5f} E={east:.5f}"
     )
 
-    base_cache_dir = Path.home() / ".cache" / "topobathysim" / "tiles"
+    # Use manager's cache root so tests can override it
+    base_cache_dir = manager.cache_dir / "tiles"
     # Separate cache by format
     if format in ["png"]:
         # Organize visual tiles by style
@@ -709,7 +711,7 @@ def get_fused_tile(
     sig_hash = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
 
     # Structured Cache Directory for Fused Outputs
-    base_fused_dir = Path.home() / ".cache" / "topobathysim" / "fused"
+    base_fused_dir = manager.cache_dir / "fused"
 
     if format == "png":
         # Organize visual outputs by style
@@ -723,7 +725,7 @@ def get_fused_tile(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Data Cache Directory (Fused Zarr L1 Cache)
-    data_cache_dir = Path.home() / ".cache" / "topobathysim" / "fused_zarr"
+    data_cache_dir = manager.cache_dir / "fused_zarr"
     data_cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Extension mapping
@@ -993,10 +995,12 @@ def get_fused_tile(
 
 
 @app.post("/cache/clear")
-async def clear_cache(type: str = "output") -> dict[str, object]:
+async def clear_cache(
+    manager: Annotated[BathyManager, Depends(get_manager)], type: str = "output"
+) -> dict[str, object]:
     import shutil
 
-    cache_root = Path("~/.cache/topobathysim").expanduser()
+    cache_root = manager.cache_dir
     deleted = []
     try:
         if type in ["output", "all"]:
