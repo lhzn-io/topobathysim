@@ -474,6 +474,10 @@ class BathyManager:
 
         for tier, name, src_da in valid_layers:
             try:
+                # Ensure 2D (remove band dimension if present)
+                if "band" in src_da.dims:
+                    src_da = src_da.squeeze("band", drop=True)
+
                 src_da = _ensure_crs(src_da)
 
                 # Align Source to Canvas
