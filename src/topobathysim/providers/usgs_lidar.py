@@ -1,7 +1,15 @@
+"""
+USGS Lidar Provider module.
+
+This module implements the provider for USGS 3DEP Lidar data (Point Clouds).
+It queries the Microsoft Planetary Computer STAC API for '3dep-lidar-copc' and
+rasterizes the point clouds to a target resolution/CRS.
+"""
+
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import laspy
 import numpy as np
@@ -9,6 +17,10 @@ import rioxarray as rxr
 import s3fs
 import xarray as xr
 from affine import Affine
+
+from ..manifest import OfflineManifest
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +72,20 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
         return None
 
 
-class UsgsLidarProvider:
+class UsgsLidarProvider(Provider):
     """
-    Fetches and processes Lidar data from NOAA LAZ files.
+    Fetches and processes Lidar data from NOAA LAZ files or 3DEP COPC via STAC.
     Filters for 'Bare Earth' (Class 2) and rasterizes to GeoTIFF.
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
+        """
+        Initialize the Lidar provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+            offline_mode: If True, only use locally cached data/manifests.
+        """
         self.cache_dir = Path(cache_dir).expanduser() / "usgs_lidar"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
@@ -75,9 +94,46 @@ class UsgsLidarProvider:
         self.fs = s3fs.S3FileSystem(anon=True)
 
         # Manifest for Offline Lookup
-        from .manifest import OfflineManifest
-
         self.manifest = OfflineManifest(self.cache_dir)
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Fetch USGS Lidar data for the given bounding box.
+        """
+        # Default resolution for Lidar is higher than 3DEP raster
+        # ~4m is safe default if not specified
+        res = resolution if resolution is not None else 4.0
+
+        da = self.fetch_lidar_from_stac(
+            bounds=bbox,
+            resolution=res,
+            target_crs=crs,
+            force_cache=True,
+        )
+
+        if da is None:
+            raise KeyError(f"No USGS Lidar found for bbox {bbox}")
+
+        return da
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the Lidar provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "USGS 3DEP LiDAR",
+            "citation": "U.S. Geological Survey.",
+            "resolution": "Variable (Point Cloud derived)",
+            "url": "https://www.usgs.gov/core-science-systems/ngp/3dep/lidar",
+        }
 
     def _get_cache_path(self, url: str) -> Path:
         """
@@ -188,10 +244,6 @@ class UsgsLidarProvider:
                     var_name = next(iter(ds.data_vars))
                     da = ds[var_name]
 
-                # Check CRS match roughly? (If target_crs changed, we might need to re-reproject,
-                # but usually target_crs is constant 4326 for this app)
-                # If cached version is 4326 and we request 4326, good.
-
                 # Filter bounds if requested
                 if bounds:
                     da = da.rio.clip_box(*bounds)
@@ -236,10 +288,6 @@ class UsgsLidarProvider:
                 return None
 
             # Use Cartesian coordinates for binning
-            # x_idx is column, y_idx is row (from bottom usually, or top)
-            # Standard raster is Top-Left origin.
-
-            # Here we build a Bottom-Up grid (y increases upwards) to match LAS/Cartesian
             x_idx = ((x - min_x) / resolution).astype(int)
             y_idx = ((y - min_y) / resolution).astype(int)
 
@@ -316,152 +364,6 @@ class UsgsLidarProvider:
 
         except Exception as e:
             logger.error(f"Lidar Read Error: {e}", exc_info=True)
-            return None
-
-    def fetch_lidar_from_laz(
-        self,
-        s3_url: str,
-        resolution: float = 4.0,  # Meters (approx, if projected)
-        target_crs: str = "EPSG:4326",
-    ) -> xr.DataArray | None:
-        """
-        Fetches a specific LAZ file, filters Class 2, and rasterizes.
-
-        Args:
-            s3_url: S3 path (e.g. noaa-nos-coastal-lidar-pds/laz/geoid18/4938/...)
-            resolution: Grid resolution (degrees if 4326, meters otherwise)
-            target_crs: Desired output CRS.
-
-        Returns:
-            xr.DataArray: Rasterized elevation.
-        """
-        try:
-            filename = Path(s3_url).name
-            local_path = self.cache_dir / filename
-
-            # 1. Download (if not cached)
-            if not local_path.exists():
-                if self.offline_mode:
-                    logger.warning(f"Offline Mode: Missing Lidar file {filename}")
-                    return None
-
-                logger.info(f"Downloading {s3_url} to {local_path}...")
-                self.fs.get(s3_url, str(local_path))
-
-            # 2. Read
-            return self._read_laz_file(local_path, resolution=resolution, target_crs=target_crs)
-
-        except Exception as e:
-            logger.error(f"Lidar Fetch Error: {e}", exc_info=True)
-            return None
-
-    def fetch_lidar_from_ept(
-        self,
-        ept_url: str,
-        bounds: tuple[float, float, float, float],
-        resolution: float = 4.0,
-        target_crs: str = "EPSG:4326",
-    ) -> xr.DataArray | None:
-        """
-        Fetches Lidar data from an Entwine Point Tile (EPT) source using PDAL.
-
-        Args:
-            ept_url: URL to ept.json (e.g., https://.../ept.json)
-            bounds: Tuple (minx, min_y, max_x, max_y) in the EPT's native CRS (usually).
-                    Wait, EPT readers typically want bounds in native CRS.
-                    For NOAA/USGS, this is crucial.
-            resolution: Grid resolution in native units.
-            target_crs: Desired output CRS.
-
-        Returns:
-            xr.DataArray: Rasterized elevation.
-        """
-        import json
-        import tempfile
-
-        import pdal
-
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-                output_filename = tmp.name
-
-            # Construct PDAL Pipeline
-            # bounds format for EPT reader: "([xmin, xmax], [ymin, ymax])"
-            minx, miny, maxx, maxy = bounds
-            pdal_bounds = f"([{minx}, {maxx}], [{miny}, {maxy}])"
-
-            pipeline_config = {
-                "pipeline": [
-                    {
-                        "type": "readers.ept",
-                        "filename": ept_url,
-                        "bounds": pdal_bounds,
-                        "tag": "reader",
-                    },
-                    {
-                        "type": "filters.range",
-                        "limits": "Classification[2:2]",  # Bare Earth only
-                        "tag": "filter",
-                    },
-                    {
-                        "type": "writers.gdal",
-                        "filename": output_filename,
-                        "bounds": pdal_bounds,
-                        "resolution": resolution,
-                        "output_type": "mean",  # Grid method
-                        "data_type": "float32",
-                        "nodata": -9999.0,
-                    },
-                ]
-            }
-
-            # Execute PDAL
-            logger.info(f"Executing PDAL Pipeline for {ept_url}...")
-            # print(json.dumps(pipeline_config, indent=2))
-            pipeline = pdal.Pipeline(json.dumps(pipeline_config))
-            count = pipeline.execute()
-
-            logger.info(f"PDAL executed. Points processed: {count}")
-
-            # Load Result
-            if Path(output_filename).exists():
-                da_raw = rxr.open_rasterio(output_filename, masked=True)
-                da: xr.DataArray
-                if isinstance(da_raw, list):
-                    da = cast(xr.DataArray, da_raw[0])
-                elif isinstance(da_raw, xr.Dataset):
-                    da = da_raw.to_array().isel(variable=0)
-                else:
-                    da = cast(xr.DataArray, da_raw)
-
-                da = da.rename({"band": "variable"}).squeeze("variable")
-                da.name = "elevation"
-                da.attrs.pop("long_name", None)
-
-                # EPT is almost always 3857 (Web Mercator).
-                # If CRS is missing from the GDAL output, assume 3857.
-                if da.rio.crs is None:
-                    da.rio.write_crs("EPSG:3857", inplace=True)
-
-                # Reproject if needed
-                if target_crs and da.rio.crs != target_crs:
-                    # e.g., if EPT is Web Mercator (3857) but we want 4326
-                    da = da.rio.reproject(target_crs)
-
-                # Cleanup
-                Path(output_filename).unlink()
-                return da
-            else:
-                logger.error("PDAL failed to produce output file.")
-                return None
-
-        except ImportError:
-            logger.error("pda/python-pdal not installed. Please install via conda/micromamba.")
-            return None
-        except Exception as e:
-            logger.error(f"EPT Fetch Error: {e}", exc_info=True)
-            if "output_filename" in locals() and Path(output_filename).exists():
-                Path(output_filename).unlink()
             return None
 
     def fetch_lidar_from_stac(
@@ -675,20 +577,6 @@ class UsgsLidarProvider:
             logger.error(f"STAC Fetch Error: {e}", exc_info=True)
             return None
 
-    def get_grid(
-        self,
-        west: float,
-        south: float,
-        east: float,
-        north: float,
-        target_shape: tuple[int, int] | None = None,
-    ) -> xr.DataArray | None:
-        """
-        Unified access method for Manager compatibility.
-        Defaults to STAC access for best coverage.
-        """
-        return self.fetch_lidar_from_stac(
-            bounds=(west, south, east, north),
-            resolution=4.0,  # Default to ~4m resolution (usually appropriate for 3DEP)
-            target_crs="EPSG:4326",
-        )
+
+# Register
+registry.register("lidar", UsgsLidarProvider)

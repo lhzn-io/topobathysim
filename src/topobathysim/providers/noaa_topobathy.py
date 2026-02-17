@@ -3,16 +3,19 @@ import logging
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import fsspec
 import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
+from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
-from .vdatum import VDatumResolver
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +29,7 @@ def _fetch_index_cached(url: str) -> str:
     return str(response.text)
 
 
-class NoaaTopobathyProvider:
+class NoaaTopobathyProvider(Provider):
     """
     Provider for NOAA Topobathymetric LiDAR DEMs (Tier 0).
     Distinguished from Terrestrial Lidar (USGS 3DEP) by its use of green-wavelength
@@ -52,10 +55,6 @@ class NoaaTopobathyProvider:
         self.vdatum = VDatumResolver()
 
         # Internal state
-        # storage: {pid: {"name": folder_name, "info": info_url, ...}}
-        # But legacy `_projects` is just {pid: folder_name}.
-        # We will keep `_projects` simple for backward compat
-        # and add `_metadatas` or just fetch on demand.
         self._projects: dict[str, str] = {}  # ID -> FolderName
         self._projects_metadata_urls: dict[str, str] = {}  # ID -> InPort/Info URL
 
@@ -64,20 +63,104 @@ class NoaaTopobathyProvider:
         self._spatial_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
 
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Fetch NOAA Topobathy data for the given bounding box.
+        Auto-selects the best project based on overlap and recency.
+        """
+        west, south, east, north = bbox
+
+        # 1. Identify Project
+        pid = self.find_project_by_box(west, south, east, north)
+        if not pid:
+            raise KeyError(f"No NOAA Topobathy project found for bbox {bbox}")
+
+        self.set_active_project(pid)
+        if not self._active_project_id:
+            raise KeyError(f"Failed to activate project {pid}")
+
+        # 2. Identify Tiles
+        tiles = self.resolve_tiles_in_bbox(west, south, east, north)
+        if not tiles:
+            raise KeyError(f"No tiles found in project {pid} for bbox {bbox}")
+
+        logger.info(f"Topobathy fetch: Found {len(tiles)} tiles in project {pid}")
+
+        # 3. Fetch/Load Tiles
+        das = []
+        for t in tiles:
+            da = self.fetch_tile(t)
+            if da is not None:
+                # Pre-clip to save memory?
+                try:
+                    clipped = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=da.rio.crs)
+                    if clipped.size > 0:
+                        das.append(clipped)
+                except Exception:
+                    pass
+
+        if not das:
+            raise KeyError(f"Failed to load valid Topobathy data for bbox {bbox}")
+
+        # 4. Merge
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                merged = merge_arrays(das)
+                raise KeyError("Failed to load or merge NOAA Topobathy data")
+            except Exception as e:
+                logger.error(f"Merge error: {e}")
+                merged = das[0]
+
+        # 5. Reproject/Clip
+        if crs and merged.rio.crs and merged.rio.crs != crs:
+            try:
+                logger.info(f"Reprojecting Topobathy from {merged.rio.crs} to {crs}")
+                merged = merged.rio.reproject(crs)
+            except Exception as e:
+                logger.warning(f"Reprojection failed: {e}")
+
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
+        except Exception as e:
+            logger.warning(f"Final clip failed: {e}")
+
+        merged.name = "elevation"
+        merged.attrs["source_provider"] = "noaa_topobathy"
+        merged.attrs["project_id"] = pid
+        return cast(xr.DataArray, merged)
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the NOAA Topobathy provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA Coastal Topobathy LiDAR",
+            "citation": "NOAA National Geodetic Survey (NGS) / OCM.",
+            "resolution": "High (Variable, typically 1m - 3m)",
+            "url": "https://coast.noaa.gov/digitalcoast/data/coastallidar.html",
+        }
+
     def _fetch_index(self) -> str:
         """
         Fetches the HTML index page from NOAA.
-        Only called if the JSON metadata cache is missing or stale.
         """
         logger.info("Fetching NOAA Coastal Lidar PDS Index (HTML)...")
-        # Reuse existing logic for fetching HTML
         return _fetch_index_cached(self.INDEX_URL)
 
     def _ensure_project_list(self) -> None:
         """
         Parses the map of ID -> Project Folder Name.
-        1. Checks local JSON cache (~/.cache/topobathysim/metadata/noaa_coastal_lidar.json)
-        2. If stale/missing, fetches HTML index, parses, and saves JSON.
+        Checks local JSON or fetches remote HTML index.
         """
         if self._projects:
             return
@@ -89,16 +172,11 @@ class NoaaTopobathyProvider:
         # 1. Try Loading JSON
         if json_path.exists():
             age = time.time() - json_path.stat().st_mtime
-            # 7 days expiration for project list (it changes rarely)
+            # 7 days expiration
             if age < 604800:
                 try:
                     with open(json_path) as f:
                         data = json.load(f)
-                        # Handle legacy format where data was just {ID: Name}
-                        # New format is {ID: {name: Name, info: URL}} or mixed?
-                        # Let's standardize on internal storage being split for now.
-                        # actually, let's keep it simple: keys are IDs. Values are Name or Dict.
-
                         for k, v in data.items():
                             if isinstance(v, dict):
                                 self._projects[k] = v.get("name", "")
@@ -118,11 +196,6 @@ class NoaaTopobathyProvider:
             new_projects = {}
             new_metadata_urls = {}
 
-            # Strategy: Parse the HTML index to extract Project IDs from bulk download links
-            # (e.g. .../dem/Name_ID/index.html) and attempt to pair them with nearby
-            # InPort metadata links if present in the same table row.
-
-            # Better approach: parse lines.
             lines = text.split("\n")
             current_folder = None
 
@@ -138,7 +211,6 @@ class NoaaTopobathyProvider:
                         new_projects[pid] = folder_name
 
                 # 2. Find InPort Link
-                # href="https://www.fisheries.noaa.gov/inport/item/74870"
                 if current_folder:
                     pid = current_folder[0]
                     # Check for metadata link in the SAME line
@@ -154,8 +226,7 @@ class NoaaTopobathyProvider:
             m_count = len(self._projects_metadata_urls)
             logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
 
-            # 3. Save to JSON (Enhanced Format)
-            # Save as {ID: {name: "...", info: "..."}}
+            # 3. Save to JSON
             save_data = {}
             for pid, folder in self._projects.items():
                 entry = {"name": folder}
@@ -171,11 +242,9 @@ class NoaaTopobathyProvider:
 
         except Exception as e:
             logger.error(f"Failed to load project index: {e}")
-            # Identify if we have a stale JSON fallback
             if json_path.exists():
                 logger.warning("Using stale metadata JSON as fallback.")
                 with open(json_path) as f:
-                    # Fallback specific for mixed format
                     data = json.load(f)
                     for k, v in data.items():
                         if isinstance(v, dict):
@@ -188,7 +257,6 @@ class NoaaTopobathyProvider:
     def fetch_inport_metadata(self, project_id: str) -> dict | None:
         """
         Fetches and parses the InPort XML metadata for a project.
-        Returns a dict with key attributes (datum, date_range, sensor).
         """
         self._ensure_project_list()
 
@@ -198,21 +266,17 @@ class NoaaTopobathyProvider:
             return None
 
         # Ensure it's the XML endpoint
-        # URL: .../inport/item/74870 -> .../inport/item/74870/xml
         if not info_url.endswith("/xml"):
-            # Strip trailing slash if present?
             info_url = info_url.rstrip("/")
             if not info_url.endswith("/xml"):
                 info_url = f"{info_url}/xml"
 
         # Extract InPort ID for cache filename
-        # .../item/74870/xml -> 74870
         try:
-            # split by / -> ['...', 'item', '74870', 'xml']
             parts = info_url.split("/")
             inport_id = parts[parts.index("xml") - 1] if "xml" in parts else parts[-1]
         except Exception:
-            inport_id = f"pid_{project_id}"  # Fallback
+            inport_id = f"pid_{project_id}"
 
         xml_path = self.inport_cache_dir / f"{inport_id}.xml"
 
@@ -222,7 +286,6 @@ class NoaaTopobathyProvider:
                 logger.info(f"Fetching InPort Metadata: {info_url}")
                 headers = {"User-Agent": "Mozilla/5.0 TopoBathySim/1.0"}
                 r = requests.get(info_url, headers=headers, timeout=10)
-                # 200 OK even if empty sometimes?
                 if r.status_code == 200 and len(r.content) > 100:
                     with open(xml_path, "wb") as f:
                         f.write(r.content)
@@ -248,22 +311,14 @@ class NoaaTopobathyProvider:
 
             meta = {"vertical_datum": "Unknown", "start_date": None, "end_date": None, "sensor_name": None}
 
-            # Helper to search text content recursively or by specific FGDC paths
-            # Note: NOAA InPort XMLs can be verbose.
-            # Look for <vertdef> (Vertical Definition) -> <altsys> (Altitude System) -> <altdatum>
-
-            # Namespace handling can be annoying in ET.
-            # We'll use simple recursive search or iter.
-
             # 1. Vertical Datum
-            # Common tags: "altdatum", "vdatum"
             for elem in root.iter():
                 if ("altdatum" in elem.tag or "vdatum" in elem.tag) and elem.text:
                     txt = elem.text.lower()
                     if "navd88" in txt or "88" in txt:
                         meta["vertical_datum"] = "NAVD88"
                     elif "geoid18" in txt:
-                        meta["vertical_datum"] = "NAVD88 (Geoid18)"  # Geoid18 is a realization of NAVD88
+                        meta["vertical_datum"] = "NAVD88 (Geoid18)"
                     elif "ellipsoid" in txt:
                         meta["vertical_datum"] = "Ellipsoid"
 
@@ -306,7 +361,7 @@ class NoaaTopobathyProvider:
                 # Run the builder script logic
                 # To avoid circular imports, we import the function here
                 # Note: `scripts` must be a package for this to work relative within `topobathysim` context
-                from .scripts.build_noaa_index import main as build_index
+                from ..scripts.build_noaa_index import main as build_index
 
                 # If running purely as script, build_index execution context might differ,
                 # but since we are in `topobathysim` package, it should work.
@@ -366,8 +421,7 @@ class NoaaTopobathyProvider:
 
             if not candidates.empty:
                 # Conflict Resolution
-
-                # 1. Datum Priority Score
+                # 1. Datum Priority (Geoid18 > NAVD88 > Ellipsoid)
                 def datum_score(d: object) -> int:
                     d_str = str(d).lower()
                     if "geoid18" in d_str:
@@ -380,10 +434,7 @@ class NoaaTopobathyProvider:
 
                 candidates["datum_score"] = candidates["vertical_datum"].apply(datum_score)
 
-                # 2. Date Priority
-                # already converted to datetime in _ensure_spatial_index
-
-                # Sort: Datum Score (Desc), End Date (Desc)
+                # 2. Sort by Datum Score (Desc), then End Date (Desc)
                 candidates = candidates.sort_values(by=["datum_score", "end_date"], ascending=[False, False])
 
                 best_match = candidates.iloc[0]
@@ -453,9 +504,7 @@ class NoaaTopobathyProvider:
                 continue
 
         if not index_file_key:
-            # Fallback strategy for known problematic datasets (e.g. 10274 LIS 2023)
-            # Sometimes the tile index is not in the laz/ prefix but in the dem/ prefix or named differently.
-            # 10274 often has 'tileindex.gpkg' inside the root of its DEM folder or adjacent.
+            # Fallback for datasets with non-standard tile index locations
             pass
 
         if not index_file_key:
@@ -670,50 +719,6 @@ class NoaaTopobathyProvider:
             if lock_path.exists():
                 lock_path.unlink()
 
-    def get_grid(
-        self, west: float, south: float, east: float, north: float, project_id: str | None = None
-    ) -> xr.DataArray | None:
-        """
-        High level interface to get merged grid.
-        """
-        if project_id:
-            self.set_active_project(project_id)
-        elif self._active_project_id is None:
-            # Try to auto-detect
-            pid = self.find_project_by_box(west, south, east, north)
-            if pid:
-                self.set_active_project(pid)
 
-        if not self._active_project_id:
-            return None
-
-        tiles = self.resolve_tiles_in_bbox(west, south, east, north)
-        if not tiles:
-            return None
-
-        das = []
-        for t in tiles:
-            da = self.fetch_tile(t)
-            if da is not None:
-                das.append(da)
-
-        if not das:
-            return None
-
-        if len(das) == 1:
-            return das[0]
-
-        from rioxarray.merge import merge_arrays
-
-        # Regarding Fusion order:
-        # For NOAA DEMs within a single project, tiles are typically spatially disjoint (mosaic).
-        # Overlap is minimal. If overlap exists, we trust rioxarray default (last layer wins).
-        # We assume the order returned by `resolve_tiles_in_bbox` (from GeoDataFrame) is arbitrary.
-        # If we had multiple temporal surveys, we would need to sort `das` by 'end_date' here.
-
-        try:
-            merged = merge_arrays(das)
-            return merged
-        except Exception as e:
-            logger.error(f"Merge error: {e}")
-            return None
+# Register
+registry.register("topobathy", NoaaTopobathyProvider)

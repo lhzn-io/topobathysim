@@ -1,16 +1,27 @@
+"""
+NOAA NCEI BAG Provider module.
+
+This module implements the provider for accessing Bathymetric Attributed Grid (BAG) files
+from NOAA's National Centers for Environmental Information (NCEI). It handles discovery,
+downloading, caching, and reading of BAG files.
+"""
+
 import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import requests  # type: ignore
 import xarray as xr
 from filelock import FileLock
+from rioxarray.merge import merge_arrays
 
-from .vdatum import VDatumResolver
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -497,16 +508,98 @@ class BAGDiscovery:
         return found_urls
 
 
-class BAGProvider:
+class BAGProvider(Provider):
     """
     Manages downloading, caching, and reading of NOAA BAG files.
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+        """
+        Initialize the BAG provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+        """
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_bag"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.vdatum = VDatumResolver()
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Fetches and merges BAG files intersecting the bounding box.
+        """
+        west, south, east, north = bbox
+
+        # 1. Discover BAGs
+        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
+        if not urls:
+            raise KeyError(f"No BAG files found for bbox {bbox}")
+
+        logger.info(f"BAG fetch: Found {len(urls)} files to process.")
+
+        # 2. Fetch/Load Each
+        das = []
+        for url in urls:
+            # We treat the URL as the ID for caching purposes basically
+            # fetch_bag will handle downloading
+            try:
+                da = self.fetch_bag(survey_id="unknown_bbox_fetch", download_url=url)
+                if da is not None:
+                    das.append(da)
+            except Exception as e:
+                logger.warning(f"Failed to fetch BAG {url}: {e}")
+
+        if not das:
+            raise KeyError(f"Failed to load any BAG data for bbox {bbox}")
+
+        # 3. Merge
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                # Sort by resolution (finest first) if possible
+                # merge_arrays
+                merged = merge_arrays(das)
+            except Exception as e:
+                logger.error(f"Failed to merge BAGs: {e}")
+                merged = das[0]
+
+        # 4. Reproject/Clip
+        if crs and merged.rio.crs and merged.rio.crs != crs:
+            try:
+                logger.info(f"Reprojecting BAG merged from {merged.rio.crs} to {crs}")
+                merged = merged.rio.reproject(crs)
+            except Exception as e:
+                logger.warning(f"Reprojection failed: {e}")
+
+        # Clip
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
+        except Exception as e:
+            logger.warning(f"Clip failed: {e}")
+
+        merged.name = "elevation"
+        return merged
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the BAG provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA NCEI BAG (Bathymetric Attributed Grid)",
+            "citation": "NOAA National Centers for Environmental Information.",
+            "resolution": "High (Variable, typically 0.5m - 4m)",
+            "url": "https://www.ncei.noaa.gov/products/bathymetry",
+        }
 
     def fetch_bag(self, survey_id: str, download_url: str | list[str] | None = None) -> xr.DataArray | None:
         """
@@ -607,3 +700,7 @@ class BAGProvider:
         # Note: B019 warns about lru_cache on method.
         # We rely on the standalone function's cache.
         return _read_bag_cached(local_path)
+
+
+# Register the provider
+registry.register("bag", BAGProvider)

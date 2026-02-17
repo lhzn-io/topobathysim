@@ -17,10 +17,8 @@ if env_path.exists():
 if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
     os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
 
-from .gebco_2025 import GEBCO2025Provider  # noqa: E402
 from .manager import BathyManager  # noqa: E402
-from .ncei_cudem import CUDEMProvider  # noqa: E402
-from .noaa_bluetopo import NoaaBlueTopoProvider  # noqa: E402
+from .providers.registry import registry  # noqa: E402
 from .quality import TIDClassifier, source_report  # noqa: E402
 
 # Set up NullHandler to prevent "No handler found" warnings
@@ -28,9 +26,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
     "BathyManager",
-    "CUDEMProvider",
-    "GEBCO2025Provider",
-    "NoaaBlueTopoProvider",
+    "registry",
     "TIDClassifier",
     "source_report",
 ]

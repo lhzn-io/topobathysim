@@ -1,16 +1,29 @@
+"""
+USGS 3DEP Provider module.
+
+This module implements the provider for USGS 3D Elevation Program (3DEP) data.
+It queries the Microsoft Planetary Computer STAC API for '3dep-seamless', 'cop-dem-glo-30',
+and 'nasadem' collections.
+"""
+
 import fcntl
 import logging
 
 # Caching setup
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import planetary_computer
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
 from pystac_client import Client
+from rioxarray.merge import merge_arrays
+
+from ..manifest import OfflineManifest
+from .base import Provider
+from .registry import registry
 
 # Share cache directory with Lidar for STAC queries (Not used for query caching anymore)
 # stac_cache_dir = Path.home() / ".cache" / "topobathysim" / "stac_queries"
@@ -109,7 +122,7 @@ def _query_stac_cached(
     return None
 
 
-class Usgs3DepProvider:
+class Usgs3DepProvider(Provider):
     """
     Provider for Mid-Resolution Land Topography.
     Tier 2: USGS 3DEP (10m)
@@ -117,6 +130,13 @@ class Usgs3DepProvider:
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
+        """
+        Initialize the 3DEP provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+            offline_mode: If True, only use locally cached data/manifests.
+        """
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "usgs_3dep"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -128,9 +148,55 @@ class Usgs3DepProvider:
         self.offline_mode = offline_mode
 
         # Manifest for Offline Lookup
-        from .manifest import OfflineManifest
-
         self.manifest = OfflineManifest(self.metadata_dir, filename="stac_manifest.json")
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Fetch USGS 3DEP (or fallback) data for the given bounding box.
+        """
+        bounds = bbox
+
+        # 1. 3DEP Seamless (10m) - Best for US
+        da = self._fetch_collection(bounds, "3dep-seamless")
+        if da is not None:
+            logger.debug("Found USGS 3DEP Coverage")
+            da.name = "elevation"
+            return da
+
+        # 2. Try Copernicus DEM (GLO-30)
+        da = self._fetch_collection(bounds, "cop-dem-glo-30")
+        if da is not None:
+            logger.debug("Found Copernicus DEM Coverage")
+            da.name = "elevation"
+            return da
+
+        # 3. Try NASADEM
+        da = self._fetch_collection(bounds, "nasadem")
+        if da is not None:
+            logger.debug("Found NASADEM Coverage")
+            da.name = "elevation"
+            return da
+
+        raise KeyError(f"No USGS 3DEP/Land coverage found for bbox {bbox}")
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the 3DEP provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "USGS 3DEP (Seamless)",
+            "citation": "U.S. Geological Survey.",
+            "resolution": "10m (1/3 arc-second)",
+            "url": "https://www.usgs.gov/core-science-systems/ngp/3dep",
+        }
 
     def _query_land_collection(
         self,
@@ -138,9 +204,15 @@ class Usgs3DepProvider:
         collection_id: str,
         datetime_range: str | None = None,
     ) -> list[dict] | None:
+        """
+        Query STAC for land collection items.
+        """
         return _query_stac_cached(bbox, collection_id, str(self.cache_dir))
 
     def _download_and_cache(self, url: str) -> Path | None:
+        """
+        Download a file from a URL to the cache.
+        """
         import hashlib
 
         import requests
@@ -165,7 +237,6 @@ class Usgs3DepProvider:
             return local_path
 
         # 2. Acquire Lock
-        # Using a separate lock file avoids opening the target file in write mode before we are ready
         try:
             with open(lock_path, "w") as lock_file:
                 # Exclusive lock (blocking)
@@ -204,46 +275,13 @@ class Usgs3DepProvider:
                 temp_path.unlink()
             return None
         finally:
-            # Clean up lock file?
-            # Deleting lock file allows race condition if another process is waiting on it.
-            # Safe to leave lock files or delete only if we held it exclusively?
-            # Standard practice: usually leave lock files or use /tmp.
-            # We'll leave it to be safe and simple.
             pass
-
-    def fetch_dem(self, bounds: tuple[float, float, float, float]) -> xr.DataArray | None:
-        logger.debug(f"fetch_dem called with bounds={bounds}")
-        """
-        Fetches best available land DEM for the bbox.
-        Search priority: 3DEP (US), then Copernicus (Global), then NASADEM (Global)
-        """
-        # 1. 3DEP Seamless (10m) - Best for US
-        da = self._fetch_collection(bounds, "3dep-seamless")
-        if da is not None:
-            logger.debug("Found USGS 3DEP Coverage")
-            return da
-
-        # 2. Try Copernicus DEM (GLO-30)
-        da = self._fetch_collection(bounds, "cop-dem-glo-30")
-        if da is not None:
-            logger.debug("Found Copernicus DEM Coverage")
-            return da
-
-        # 3. Try NASADEM
-        da = self._fetch_collection(bounds, "nasadem")
-        if da is not None:
-            logger.debug("Found NASADEM Coverage")
-            return da
-
-        return None
 
     def _fetch_collection(self, bounds: tuple, collection_id: str) -> xr.DataArray | None:
         try:
             items = None
 
             # 1. Always Check Manifest First (Local STAC Cache)
-            # This allows us to skip throttled API calls if we already know the assets for this bbox.
-            # We trust our local cache of "resolution" (mapping from bbox -> assets)
             logger.debug(f"Checking Local Manifest for {collection_id} in {bounds}")
             manifest_items = self.manifest.find_items(collection_id, bounds)
 
@@ -292,7 +330,7 @@ class Usgs3DepProvider:
                     except requests.HTTPError as e:
                         if e.response is not None and e.response.status_code == 403:
                             logger.warning(
-                                f"403 Forbidden for {href}. Clearing STAC cache and " "local manifest..."
+                                f"403 Forbidden for {href}. Clearing STAC cache and local manifest..."
                             )
                             # 1. Clear In-Memory Cache (lru_cache)
                             _query_stac_cached.cache_clear()
@@ -300,11 +338,7 @@ class Usgs3DepProvider:
                             # 2. Remove Stale Item from Persistent Manifest
                             self.manifest.remove_item_by_href(href)
 
-                            # 3. Recursive Retry (Will re-query API for fresh token)
-                            # Note: use self.fetch_dem logic again implicitly via
-                            # recursive call or just re-call this private method?
-                            # Using private method is safer to avoid changing
-                            # collection priority logic.
+                            # 3. Recursive Retry
                             return self._fetch_collection(bounds, collection_id)
                         raise e
 
@@ -313,8 +347,6 @@ class Usgs3DepProvider:
 
                     # Open local file
                     try:
-                        # Test open to check for corruption
-                        # Test open to check for corruption
                         # Use chunks for lazy loading (Avoid OOM)
                         da_raw = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
                         if isinstance(da_raw, list):
@@ -328,8 +360,6 @@ class Usgs3DepProvider:
                         if "band" in da.dims:
                             da = da.isel(band=0).drop_vars("band")
 
-                        # Verify we can read metadata, but DO NOT load data eagerley
-                        # da.load()  <-- REMOVED to prevent OOM
                         das.append(da)
 
                         break  # Success
@@ -347,8 +377,6 @@ class Usgs3DepProvider:
             if not das:
                 return None
 
-            from rioxarray.merge import merge_arrays
-
             # Merge
             merged = merge_arrays(das)
 
@@ -357,9 +385,7 @@ class Usgs3DepProvider:
                 # STAC Land collections (3DEP/COP-30) are EPSG:4326
                 merged.rio.write_crs("EPSG:4326", inplace=True)
 
-            # Mask Zeros and low-level noise as NaNs
-            # (Water/NoData commonly 0, but can be noisy in 3DEP/COP-30)
-            # We want BlueTopo (Bathy) to handle everything near sea level.
+            # Mask Zeros and low-level noise as NaNs (for bathy fusion)
             merged = merged.where(merged > 0.5)
 
             return merged
@@ -368,15 +394,6 @@ class Usgs3DepProvider:
             logger.error(f"Error fetching {collection_id}: {e}", exc_info=True)
             return None
 
-    def get_grid(
-        self,
-        west: float,
-        south: float,
-        east: float,
-        north: float,
-        target_shape: tuple[int, int] | None = None,
-    ) -> xr.DataArray | None:
-        """
-        Unified access method for Manager compatibility.
-        """
-        return self.fetch_dem(bounds=(west, south, east, north))
+
+# Register
+registry.register("usgs_3dep", Usgs3DepProvider)

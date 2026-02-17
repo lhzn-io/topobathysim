@@ -8,13 +8,13 @@ from affine import Affine
 from rasterio.enums import Resampling
 from rioxarray.merge import merge_arrays
 
-from .gebco_2025 import GEBCO2025Provider
-from .ncei_bag import BAGDiscovery, BAGProvider
-from .ncei_cudem import CUDEMProvider
-from .noaa_bluetopo import NoaaBlueTopoProvider
-from .noaa_topobathy import NoaaTopobathyProvider
-from .usgs_3dep import Usgs3DepProvider
-from .usgs_lidar import UsgsLidarProvider
+from .providers.gebco_2025 import GEBCO2025Provider
+from .providers.ncei_bag import BAGDiscovery, BAGProvider
+from .providers.ncei_cudem import CUDEMProvider
+from .providers.noaa_bluetopo import NoaaBlueTopoProvider
+from .providers.noaa_topobathy import NoaaTopobathyProvider
+from .providers.usgs_3dep import Usgs3DepProvider
+from .providers.usgs_lidar import UsgsLidarProvider
 
 logger = logging.getLogger(__name__)
 
@@ -259,13 +259,13 @@ class BathyManager:
 
         if self.lidar:
             try:
-                lidar_da = self.lidar.get_grid(west, south, east, north)
+                lidar_da = self.lidar.fetch_layer((west, south, east, north))
             except Exception as e:
                 logger.warning(f"Lidar error: {e}")
 
         if self.topobathy:
             try:
-                topo_da = self.topobathy.get_grid(west, south, east, north)
+                topo_da = self.topobathy.fetch_layer((west, south, east, north))
             except Exception as e:
                 logger.warning(f"Topobathy error: {e}")
 
@@ -336,7 +336,7 @@ class BathyManager:
         # Tier 3: CUDEM (Coastal Gap Fill)
         if self.cudem:
             try:
-                da = self.cudem.get_grid(west, south, east, north)
+                da = self.cudem.fetch_layer((west, south, east, north))
                 if da is not None:
                     valid_layers.append((3, "CUDEM", da))
             except Exception as e:
@@ -345,7 +345,7 @@ class BathyManager:
         # Tier 3.5: Land (3DEP / NASADEM)
         if self.land:
             try:
-                da = self.land.get_grid(west, south, east, north)
+                da = self.land.fetch_layer((west, south, east, north))
                 if da is not None:
                     # Using priority 3.5 to ensure it fills gaps but respects Bathy sources (BlueTopo/CUDEM)
                     # unless it's Lidar (which is Tier 1, handled above).

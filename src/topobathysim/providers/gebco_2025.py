@@ -1,13 +1,27 @@
+"""
+GEBCO 2025 Provider module.
+
+This module implements the provider for the GEBCO 2025 Grid, a global terrain model for ocean and land.
+It uses 'bmi-topography' or OPeNDAP access to fetch data, managing caching locally.
+"""
+
 import logging
+from collections import namedtuple
 from pathlib import Path
+from typing import Any
 
 import xarray as xr
 from bmi_topography import Topography
 
+from .base import Provider
+from .registry import registry
+
 logger = logging.getLogger(__name__)
 
+BBox = namedtuple("BBox", ["west", "south", "east", "north"])
 
-class GEBCO2025Provider(Topography):
+
+class GEBCO2025Provider(Topography, Provider):
     """
     BMI-compliant interface for GEBCO 2025 data.
     Wraps bmi-topography to fetch from OPeNDAP with specific corrections.
@@ -30,6 +44,15 @@ class GEBCO2025Provider(Topography):
         output_format: str = "GTiff",
         cache_dir: str = "~/.cache/topobathysim",
     ):
+        """
+        Initialize the GEBCO provider.
+
+        Args:
+            dem_type: Type of DEM (default: GEBCO_2025).
+            south, north, west, east: Global bounds.
+            output_format: Output format (default: GTiff).
+            cache_dir: Directory to store cached data files.
+        """
         p = Path(cache_dir).expanduser() / "gebco_2025"
         p.mkdir(parents=True, exist_ok=True)
         (p / "zarr").mkdir(exist_ok=True)  # Zarr subdir
@@ -45,7 +68,41 @@ class GEBCO2025Provider(Topography):
         self.tid_data: xr.DataArray | None = None
         self._da: xr.DataArray | None = None
 
-    def fetch(self) -> xr.DataArray:
+    def extract_subset(self, bbox: BBox) -> xr.DataArray:
+        """
+        Implementation of Topography.extract_subset.
+        For now just raises NotImplementedError as we use fetch_layer.
+        """
+        raise NotImplementedError("Use fetch_layer instead")
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Implements Provider.fetch_layer
+        """
+        south, west, north, east = bbox
+        bbox_override = BBox(west, south, east, north)
+        return self.fetch(bbox_override=bbox_override)
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the GEBCO provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "GEBCO 2025",
+            "citation": "GEBCO Compilation Group (2025) GEBCO 2025 Grid.",
+            "resolution": "15 arc-second",
+            "url": self.OPENDAP_URL,
+        }
+
+    def fetch(self, bbox_override: BBox | None = None) -> xr.DataArray:
         """
         Fetch data from GEBCO 2025 OPeNDAP server, utilizing a local Zarr cache
         tiled by 1x1 degree chunks to minimize repeat OPeNDAP hits.
@@ -54,9 +111,10 @@ class GEBCO2025Provider(Topography):
         import math
         import warnings
 
+        current_bbox = bbox_override if bbox_override else self.bbox
+
         # Round bounds to nearest degree to find covering tiles
-        # bmi-topography (0.9+) exposes bounds via .bbox property (BoundingBox object)
-        s, w, n, e = self.bbox.south, self.bbox.west, self.bbox.north, self.bbox.east
+        s, w, n, e = current_bbox.south, current_bbox.west, current_bbox.north, current_bbox.east
 
         min_lat = math.floor(s)
         max_lat = math.ceil(n)  # Use ceil for north/east to ensure coverage
@@ -186,14 +244,13 @@ class GEBCO2025Provider(Topography):
                     das_to_merge.append(da_tile)
 
         if not das_to_merge:
-            raise KeyError(f"Failed to load any GEBCO data for bounds {self.bbox}")
+            raise KeyError(f"Failed to load any GEBCO data for bounds {current_bbox}")
 
         # 2. Merge tiles if multiple
         try:
             if len(das_to_merge) == 1:
                 self._da = das_to_merge[0]
             else:
-                # rename to ensure consistency strictly
                 normalized = []
                 for d in das_to_merge:
                     d.name = "elevation"
@@ -243,3 +300,7 @@ class GEBCO2025Provider(Topography):
         # xarray's interp handles bilinear interpolation by default (linear)
         val = self._da.interp(lat=lat, lon=lon, method="linear")
         return float(val.values)
+
+
+# Register the provider
+registry.register("gebco", GEBCO2025Provider)

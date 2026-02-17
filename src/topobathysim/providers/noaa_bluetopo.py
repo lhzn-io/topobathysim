@@ -1,3 +1,10 @@
+"""
+NOAA BlueTopo Provider module.
+
+This module implements the provider for NOAA's BlueTopo data set, providing high-resolution
+bathymetry from modern surveys. It handles S3 access, tile resolution via RAT, and Zarr caching.
+"""
+
 import logging
 from pathlib import Path
 from typing import Any
@@ -7,15 +14,18 @@ import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
-from shapely.geometry import Point
+from rioxarray.merge import merge_arrays
+from shapely.geometry import Point, box
 
-from .quality import QualityClass
-from .vdatum import VDatumResolver
+from ..quality import QualityClass
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
 
-class NoaaBlueTopoProvider:
+class NoaaBlueTopoProvider(Provider):
     """
     Provider for NOAA BlueTopo High-Resolution Bathymetry.
     Accesses Cloud Optimized GeoTIFFs (COGs) from AWS S3.
@@ -33,6 +43,12 @@ class NoaaBlueTopoProvider:
     )
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+        """
+        Initialize the BlueTopo provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+        """
         self.vdatum = VDatumResolver()
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "noaa_bluetopo"
@@ -41,6 +57,82 @@ class NoaaBlueTopoProvider:
         # Tile Scheme stays in root or moves? Let's move to bluetopo dir too to be clean.
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        """
+        Fetch BlueTopo layer for the given bounding box.
+        Resolves, fetches, and merges all intersecting tiles.
+        """
+        west, south, east, north = bbox
+
+        # 1. Resolve Tiles
+        tile_ids = self.resolve_tiles_in_bbox(west, south, east, north)
+        if not tile_ids:
+            raise KeyError(f"No BlueTopo tiles found for bbox {bbox}")
+
+        logger.info(f"BlueTopo fetch: Resolved {len(tile_ids)} tiles for bbox {bbox}")
+
+        # 2. Fetch/Load Tiles
+        das = []
+        for tid in tile_ids:
+            # Pass the query bbox to maximize efficiency if underlying method supports it
+            # defaulting to full tile load via existing method
+            da = self.load_tile_as_da(tid, bbox)
+            if da is not None:
+                das.append(da)
+
+        if not das:
+            raise KeyError(f"Failed to load any BlueTopo data for bbox {bbox}")
+
+        # 3. Merge
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                # Merge arrays
+                merged = merge_arrays(das)
+            except Exception as e:
+                logger.error(f"Failed to merge BlueTopo tiles: {e}")
+                merged = das[0]  # Fallback
+
+        # 4. Reproject/Clip to Requested CRS/BBox
+
+        # Reproject to Requested CRS if needed
+        if crs and merged.rio.crs and merged.rio.crs != crs:
+            try:
+                logger.info(f"Reprojecting BlueTopo from {merged.rio.crs} to {crs}")
+                merged = merged.rio.reproject(crs)
+            except Exception as e:
+                logger.warning(f"Reprojection failed: {e}")
+
+        # Final Clip to exact bbox
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
+        except Exception as e:
+            logger.warning(f"Clip failed (possibly no overlap after reprojection): {e}")
+            pass
+
+        merged.name = "elevation"
+        return merged
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the BlueTopo provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA BlueTopo",
+            "citation": "NOAA Office of Coast Survey (2025). BlueTopo™.",
+            "resolution": "Variable (approx 4-8m)",
+            "url": "https://nauticalcharts.noaa.gov/data/bluetopo.html",
+        }
 
     def _resolve_scheme_url(self) -> str:
         """
@@ -146,8 +238,6 @@ class NoaaBlueTopoProvider:
         if self._gdf is None:
             return []
 
-        from shapely.geometry import box
-
         search_box = box(west, south, east, north)
 
         # CRS check
@@ -179,6 +269,9 @@ class NoaaBlueTopoProvider:
         return list(set(results))
 
     def is_covered(self, lat: float, lon: float) -> bool:
+        """
+        Check if the given coordinate is covered by the BlueTopo dataset.
+        """
         return self.resolve_tile_id(lat, lon) is not None
 
     def _ensure_tile_cached(self, tile_id: str) -> Path | None:
@@ -296,6 +389,10 @@ class NoaaBlueTopoProvider:
             return None
 
     def get_quality_tier(self, lat: float, lon: float) -> QualityClass:
+        """
+        Return the quality tier for the given coordinate.
+        Returns QualityClass.DIRECT if covered, else UNKNOWN.
+        """
         if self.is_covered(lat, lon):
             return QualityClass.DIRECT
         return QualityClass.UNKNOWN
@@ -403,9 +500,10 @@ class NoaaBlueTopoProvider:
         return str(row.get("tile_id", row.get("tile")))
 
     def get_source_survey_id(self, lat: float, lon: float) -> str | None:
-        # Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
-        # Strategy Cascade: Embedded RAT -> Sidecar RAT -> HSMDB API.
-
+        """
+        Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
+        Strategy Cascade: Embedded RAT -> Sidecar RAT -> HSMDB API.
+        """
         # 1. Tile Resolution
         tile_id = self.get_tile_id(lat, lon)
         if not tile_id:
@@ -483,7 +581,9 @@ class NoaaBlueTopoProvider:
         return self._resolve_from_hsmdb_api(lat, lon)
 
     def _geo_to_pixel(self, ds: Any, lat: float, lon: float) -> tuple[int | None, int | None]:
-        # Helper to transform lat/lon to pixel coordinates.
+        """
+        Helper to transform lat/lon to pixel coordinates.
+        """
         try:
             from osgeo import gdal, osr
 
@@ -519,7 +619,9 @@ class NoaaBlueTopoProvider:
         return None, None
 
     def _lookup_rat(self, rat: Any, pixel_val: int) -> str | None:
-        # Helper to query a GDAL RAT.
+        """
+        Helper to query a GDAL RAT.
+        """
         for i in range(rat.GetColumnCount()):
             col_name = rat.GetNameOfCol(i)
             if (
@@ -533,7 +635,9 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_sidecar_rat(self, tile_id: str, pixel_val: int) -> str | None:
-        # Downloads and parses the sidecar RAT linked in the GPKG.
+        """
+        Downloads and parses the sidecar RAT linked in the GPKG.
+        """
         self._ensure_scheme_loaded()
         if self._gdf is None:
             return None
@@ -588,7 +692,9 @@ class NoaaBlueTopoProvider:
             logger.warning(f"Sidecar parsing failed: {e}")
 
     def _parse_aux_xml_rat(self, xml_path: Path, pixel_val: int) -> str | None:
-        # Parses GDAL PAM XML to find Survey ID.
+        """
+        Parses GDAL PAM XML to find Survey ID.
+        """
         import xml.etree.ElementTree as Et
 
         try:
@@ -649,7 +755,9 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_hsmdb_api(self, lat: float, lon: float) -> str | None:
-        # Tertiary fallback: Query NCEI HSMDB API.
+        """
+        Tertiary fallback: Query NCEI HSMDB API.
+        """
         try:
             from pyproj import Transformer
 
@@ -681,3 +789,7 @@ class NoaaBlueTopoProvider:
         except Exception as e:
             logger.warning(f"HSMDB API Query failed: {e}")
         return None
+
+
+# Register the provider
+registry.register("bluetopo", NoaaBlueTopoProvider)
