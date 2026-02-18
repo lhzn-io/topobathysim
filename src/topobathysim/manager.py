@@ -446,6 +446,10 @@ class BathyManager:
             if return_source_mask:
                 source_da = xr.full_like(base_da, SOURCE_ID_CANVAS)
 
+        assert base_da is not None
+        if return_source_mask:
+            assert source_da is not None
+
         # Apply helper
         def _ensure_crs(d: xr.DataArray) -> xr.DataArray:
             if not d.rio.crs:
@@ -506,6 +510,7 @@ class BathyManager:
                 # Combine:
                 # keep existing valid values in base_da (Higher tiers processed first!)
                 # fill NaNs with new layer
+                assert base_da is not None
                 base_da = base_da.combine_first(reproj_da)
                 base_da.attrs["source"] = (
                     (base_da.attrs.get("source", "") + f" + {name}") if "source" in base_da.attrs else name

@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from dotenv import load_dotenv
 
-from topobathysim.gebco_2025 import GEBCO2025Provider as Gebco2025
-from topobathysim.noaa_bluetopo import NoaaBlueTopoProvider as BlueTopoProvider
+from topobathysim.providers.gebco_2025 import GEBCO2025Provider as Gebco2025
+from topobathysim.providers.noaa_bluetopo import NoaaBlueTopoProvider as BlueTopoProvider
 
 # Coordinates for Execution Rocks, Long Island Sound (near Rye, NY)
 # This should fall into one of the user's identified tiles (e.g. BH4XH5FN or similar)
