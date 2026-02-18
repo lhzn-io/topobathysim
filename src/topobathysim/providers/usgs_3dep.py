@@ -388,7 +388,7 @@ class Usgs3DepProvider(Provider):
             # Mask Zeros and low-level noise as NaNs (for bathy fusion)
             merged = merged.where(merged > 0.5)
 
-            return merged
+            return cast(xr.DataArray | None, merged)
 
         except Exception as e:
             logger.error(f"Error fetching {collection_id}: {e}", exc_info=True)

@@ -12,6 +12,19 @@ import xarray as xr
 from scipy.ndimage import distance_transform_edt
 
 
+def overwrite(base: xr.DataArray, overlay: xr.DataArray, mask: xr.DataArray | None = None) -> xr.DataArray:
+    """
+    Overwrites base with overlay where mask is True (or where overlay is valid if mask is None).
+    """
+    if mask is None:
+        mask = overlay.notnull()
+
+    # Valid overlay pixels replace base pixels.
+    # If overlay is NaN where mask is True, the result will be NaN (desired hard cut behavior).
+
+    return cast(xr.DataArray, base.where(~mask, overlay))
+
+
 def metric_feather(base: xr.DataArray, overlay: xr.DataArray, distance_m: float) -> xr.DataArray:
     """
     Blends an overlay onto a base using a distance-based feathering in meters.
@@ -39,6 +52,11 @@ def metric_feather(base: xr.DataArray, overlay: xr.DataArray, distance_m: float)
     Returns:
         xr.DataArray: The blended elevation array in the same CRS and coordinates as the base.
     """
+    # 0. Handle Zero/Negative Distance (Hard Cut)
+    if distance_m <= 0:
+        return overwrite(base, overlay)
+
+    # 1. Align overlay to base grid
     # 1. Align overlay to base grid
     if not overlay.rio.crs:
         raise ValueError("Overlay must have a CRS defined.")

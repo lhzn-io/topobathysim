@@ -1,0 +1,210 @@
+from typing import Any
+
+import numpy as np
+import pytest
+import xarray as xr
+import yaml
+from affine import Affine
+from pyproj import Transformer
+
+from topobathysim.providers.base import Provider
+from topobathysim.providers.registry import registry
+from topobathysim.runtime import run
+
+
+# Mock Provider for Testing
+class MockParamsProvider(Provider):
+    """
+    Mock Provider that returns a constant value.
+    """
+
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+
+    def get_metadata(self) -> dict[str, Any]:
+        return {"name": "MockParamsProvider"}
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+    ) -> xr.DataArray:
+        # Create grid matching the test scenario (100x100)
+        # We assume a fixed grid for this test, but honor the input bounds for alignment.
+
+        # Test Scenario: 1x1 degree box at (0,0)
+        min_lon, min_lat, max_lon, max_lat = bbox
+
+        # Force a small grid for testing (100x100)
+        width, height = 100, 100
+        res_x = (max_lon - min_lon) / width
+        res_y = (max_lat - min_lat) / height
+
+        transform = Affine.translation(min_lon, max_lat) * Affine.scale(res_x, -res_y)
+
+        data = np.full((height, width), self.value, dtype=np.float32)
+
+        coords = {
+            "y": np.linspace(max_lat - res_y / 2, min_lat + res_y / 2, height),
+            "x": np.linspace(min_lon + res_x / 2, max_lon - res_x / 2, width),
+        }
+
+        da = xr.DataArray(data, coords=coords, dims=("y", "x"))
+        # Force 4326 because we used the bbox (which is 4326) to generate coords
+        # Ignoring the requested 'crs' argument which is just a hint
+        da.rio.write_crs("EPSG:4326", inplace=True)
+        da.rio.write_transform(transform, inplace=True)
+
+        return da
+
+
+# Define Specific Providers
+class BaseProvider(MockParamsProvider):
+    def __init__(self) -> None:
+        super().__init__(value=0.0)
+
+
+class LidarProvider(MockParamsProvider):
+    def __init__(self) -> None:
+        super().__init__(value=10.0)
+
+    def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
+        da = super().fetch_layer(*args, **kwargs)
+        # Occupy LEFT half
+        da.values[:, 50:] = np.nan
+        return da
+
+
+class StructureProvider(MockParamsProvider):
+    def __init__(self) -> None:
+        super().__init__(value=20.0)
+
+    def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
+        da = super().fetch_layer(*args, **kwargs)
+        # Occupy CENTER (overlapping both left and right of canvas)
+        # x indices 25 to 75
+        da.values[:, :25] = np.nan
+        da.values[:, 75:] = np.nan
+        return da
+
+
+# Register them
+# Register mock providers
+# Registry is a singleton, so these persist for the session unless cleared.
+
+
+@pytest.fixture
+def pairwise_policy_file(tmp_path: Any) -> str:
+    # Setup Registry
+    registry.register("base", BaseProvider)
+    registry.register("lidar", LidarProvider)
+    registry.register("structure", StructureProvider)
+
+    # 3 Layers:
+    # 1. Base (Value 0).
+    # 2. Lidar (Value 10) on Left.
+    # 3. Structure (Value 20) in Center.
+    #    - Overlaps Lidar (Left-Center): Transition Rule -> Overwrite
+    #    - Overlaps Base (Right-Center): Default Rule -> Feather
+
+    policy_content = {
+        "name": "PairwiseTest",
+        "crs": "EPSG:32618",  # UTM 18N (Projected)
+        "defaults": {
+            "resolution": 10.0  # 10 meters
+        },
+        "variables": [
+            {
+                "name": "elevation",
+                "steps": [
+                    {"provider": "base", "operation": "overwrite"},
+                    {"provider": "lidar", "operation": "overwrite"},
+                    {
+                        "provider": "structure",
+                        "operation": "metric_feather",
+                        "blend_distance": 50.0,  # 5 pixels if res=10m
+                        "transitions": [{"target_provider": "lidar", "operator": "overwrite"}],
+                    },
+                ],
+            }
+        ],
+    }
+
+    p_path = tmp_path / "pairwise.yaml"
+    with open(p_path, "w") as f:
+        yaml.dump(policy_content, f)
+
+    return str(p_path)
+
+
+def test_pairwise_fusion_logic(pairwise_policy_file: str) -> None:
+    # BBox in 4326.
+    # Must pick a bbox that is valid for UTM 18N (e.g., NYC area).
+    # NYC is approx 74W, 40.7N.
+    bbox = (-74.01, 40.70, -74.00, 40.71)
+
+    ds = run(pairwise_policy_file, bbox, resolution=10.0)
+
+    assert isinstance(ds, xr.Dataset)
+    assert ds.attrs["crs"] == "EPSG:32618"
+
+    # Verify Dimensions/Resolution
+    # 0.01 deg width / 10m resolution -> approx 100 pixels
+
+    # Check IDs
+    # Base=1, Lidar=2, Structure=3
+    # (assuming order in generate_provider_legend matches policy order or alphabet?)
+    # generate_provider_legend usually iterates steps.
+    # Let's inspect source_elevation to confirm IDs.
+
+    elev = ds["elevation"]
+
+    # Expected Composition:
+    # Left: Lidar (10)
+    # Center-Left: Structure (20) covering Lidar [Overwrite]
+    # Center-Right: Structure (20->0) fading onto Base [Feather]
+    # Right: Base (0)
+
+    # 1. Check Output CRS
+    assert ds.rio.crs.to_string() == "EPSG:32618"
+
+    # 2. Check Overwrite Transition (Structure on Lidar)
+    # Finding a point where structure overlaps lidar.
+    # Lidar is strictly valid on left half. Structure is valid in center.
+    # So overlap is the intersection.
+    # Because logic is Overwrite, values should be exactly 20.0, no blending from 10.0.
+
+    # Find mask where source is structure
+    # We need to know the IDs.
+    # Legend is stored in attrs.
+    # Use pyproj to convert 4326 test points to UTM 18N for querying
+    trans = Transformer.from_crs("EPSG:4326", "EPSG:32618", always_xy=True)
+
+    # Test Points (Longitudes):
+    # A: Pure Lidar (-74.009) - Left side
+    # B: Structure on Lidar (-74.006) - Center-Left Overlap
+    # C: Structure on Base (-74.0027) - Center-Right Overlap (Feather Zone)
+
+    lons = [-74.009, -74.006, -74.0027]
+    lats = [40.705, 40.705, 40.705]
+
+    xs, ys = trans.transform(lons, lats)
+
+    # query with expected tolerance
+    # Point A: Pure Lidar
+    val_a = elev.sel(x=xs[0], y=ys[0], method="nearest").item()
+    assert val_a == 10.0, f"Expected Pure Lidar (10.0), got {val_a}"
+
+    # Point B: Overwrite Zone (Structure on Lidar)
+    val_b = elev.sel(x=xs[1], y=ys[1], method="nearest").item()
+    assert val_b == 20.0, f"Expected Overwrite (20.0), got {val_b}"
+
+    # Point C: Feather Zone (Structure on Base)
+    # Should be blended between Base(0) and Structure(20)
+    val_c = elev.sel(x=xs[2], y=ys[2], method="nearest").item()
+    assert 0.0 < val_c < 20.0, f"Expected Feathering (0 < x < 20), got {val_c}"
+    assert val_c != 20.0
+    assert val_c != 0.0
+
+    print("Integration Test Passed: Pairwise logic confirmed.")

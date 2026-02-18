@@ -134,7 +134,7 @@ class GBR100Provider(Provider):
             da = da.rio.clip_box(minx=wd, miny=sd, maxx=ed, maxy=nd)
             da.name = "elevation"
 
-            return da
+            return cast(xr.DataArray, da)
 
         except Exception as e:
             logger.error(f"Failed to load GBR100 data: {e}")

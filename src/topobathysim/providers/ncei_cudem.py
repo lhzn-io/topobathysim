@@ -269,28 +269,29 @@ class CUDEMProvider(Provider):
             elif isinstance(da, xr.Dataset):
                 da = da.to_array().isel(variable=0)
 
-            if "band" in da.dims:
-                da = da.isel(band=0).drop_vars("band")
-            if da.rio.nodata is not None:
-                da = da.where(da != da.rio.nodata)
+            # Explicit cast to a new variable to force mypy narrowing
+            da_final: xr.DataArray = cast(xr.DataArray, da)
 
-            da = cast(xr.DataArray, da)
+            if "band" in da_final.dims:
+                da_final = da_final.isel(band=0).drop_vars("band")
+            if da_final.rio.nodata is not None:
+                da_final = da_final.where(da_final != da_final.rio.nodata)
 
             # Robust CRS
-            if da.rio.crs is None:
-                da.rio.write_crs("EPSG:4269", inplace=True)
+            if da_final.rio.crs is None:
+                da_final.rio.write_crs("EPSG:4269", inplace=True)
 
             # Cache to Zarr
             try:
-                if da.size > 0:
-                    da = da.chunk({"y": 1024, "x": 1024})
-                    da.name = "elevation"
-                    da.to_zarr(zarr_path, mode="w", consolidated=True)
+                if da_final.size > 0:
+                    da_final = da_final.chunk({"y": 1024, "x": 1024})
+                    da_final.name = "elevation"
+                    da_final.to_zarr(zarr_path, mode="w", consolidated=True)
                     return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
             except Exception as e:
                 logger.warning(f"Zarr cache write failed: {e}")
 
-            return cast(xr.DataArray, da)
+            return da_final
 
         except Exception as e:
             logger.error(f"Error reading CUDEM tile {path}: {e}")

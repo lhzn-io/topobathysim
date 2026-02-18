@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel, field_validator, model_validator
@@ -15,16 +16,33 @@ class ZoneRule(BaseModel):
     priority: int = 0
 
 
+class OperatorType(str, Enum):
+    metric_feather = "metric_feather"
+    overwrite = "overwrite"
+    linear_blend = "linear_blend"
+
+
+class TransitionRule(BaseModel):
+    """
+    Rule for transitioning from a specific underlying provider.
+    """
+
+    target_provider: str
+    operator: OperatorType
+    blend_distance: float | None = None
+
+
 class CompositionStep(BaseModel):
     """
     A single step in the composition process.
     """
 
     provider: str
-    operation: Literal["overlay", "mask", "blend"] = "overlay"
-    blend_mode: Literal["linear", "feather"] | None = None
+    operation: OperatorType = OperatorType.metric_feather
+    blend_mode: Literal["linear", "feather"] | None = None  # Deprecated in favor of operation
     blend_distance: float | None = None  # In meters
     zone: ZoneRule | None = None
+    transitions: list[TransitionRule] = []
 
     @field_validator("provider")
     @classmethod
