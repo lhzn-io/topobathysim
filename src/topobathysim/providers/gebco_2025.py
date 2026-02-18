@@ -123,13 +123,7 @@ class GEBCO2025Provider(Topography, Provider):
 
         das_to_merge = []
 
-        # OPeNDAP specific handling for requests
-        # We need a fresh dataset instance sometimes if timeouts occur
-        try:
-            ds_remote = xr.open_dataset(self.OPENDAP_URL, engine="pydap")
-        except Exception as connection_err:
-            logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
-            raise
+        ds_remote = None  # Lazy init
 
         for lat_idx in range(min_lat, max_lat):
             for lon_idx in range(min_lon, max_lon):
@@ -195,6 +189,13 @@ class GEBCO2025Provider(Topography, Provider):
                         else:
                             logger.info(f"GEBCO Zarr Cache Miss: {tile_key}")
                             try:
+                                if ds_remote is None:
+                                    try:
+                                        ds_remote = xr.open_dataset(self.OPENDAP_URL, engine="pydap")
+                                    except Exception as connection_err:
+                                        logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
+                                        raise
+
                                 logger.info(f"Downloading GEBCO 1x1 Tile to Cache: {tile_key}")
 
                                 # Slice exactly this 1x1 degree chunk
@@ -317,4 +318,4 @@ class GEBCO2025Provider(Topography, Provider):
 
 
 # Register the provider
-registry.register("gebco", GEBCO2025Provider)
+registry.register(Path(__file__).stem, GEBCO2025Provider)

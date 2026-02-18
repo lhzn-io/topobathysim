@@ -6,6 +6,7 @@ from NOAA's National Centers for Environmental Information (NCEI). It handles di
 downloading, caching, and reading of BAG files.
 """
 
+import contextlib
 import json
 import logging
 from collections.abc import Iterator
@@ -546,17 +547,50 @@ class BAGProvider(Provider):
         # 2. Fetch/Load Each
         das = []
         for url in urls:
-            # We treat the URL as the ID for caching purposes basically
-            # fetch_bag will handle downloading
             try:
+                # Load (Lazy/Zarr if available)
                 da = self.fetch_bag(survey_id="unknown_bbox_fetch", download_url=url)
-                if da is not None:
-                    das.append(da)
+                if da is None:
+                    continue
+
+                # OPTIMIZATION: Clip EARLY (before reprojection/merge)
+                # This drastically reduces memory usage for large surveys
+                try:
+                    # Clip using EPSG:4326 bounds. rioxarray handles transformations.
+                    da = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+                except Exception as e:
+                    # rioxarray.exceptions.NoDataInBounds (or similar) - Skip this tile
+                    logger.debug(f"BAG tile empty after clip (url={url}): {e}")
+                    continue
+
+                if da.size == 0:
+                    continue
+
+                # Reproject individual chunk to target CRS
+                if crs and da.rio.crs and da.rio.crs != crs:
+                    try:
+                        # Optional: Pass resolution if provided to enforce downsampling early
+                        reproj_knn = {}
+                        # If target is projected (meters) and we have input_res (meters)
+                        if resolution and "EPSG:4326" not in crs:
+                            reproj_knn["resolution"] = resolution
+
+                        da = da.rio.reproject(crs, **reproj_knn)
+                    except Exception as e:
+                        logger.warning(f"Reprojection failed for BAG segment: {e}")
+                        continue
+
+                das.append(da)
+
             except Exception as e:
-                logger.warning(f"Failed to fetch BAG {url}: {e}")
+                logger.warning(f"Failed to process BAG {url}: {e}")
 
         if not das:
-            raise KeyError(f"Failed to load any BAG data for bbox {bbox}")
+            # It is possible all BAGs were clipped out or failed
+            # This is not necessarily an error, just no coverage in this detailed window
+            # Return empty or raise?
+            # Runtime expects an array. Raise KeyError to trigger 'continue' in runtime loop.
+            raise KeyError(f"No BAG data intersects bbox {bbox} after clipping")
 
         # 3. Merge
         if len(das) == 1:
@@ -564,28 +598,18 @@ class BAGProvider(Provider):
         else:
             try:
                 # Sort by resolution (finest first) if possible
-                # merge_arrays
                 merged = merge_arrays(das)
             except Exception as e:
                 logger.error(f"Failed to merge BAGs: {e}")
                 merged = das[0]
 
-        # 4. Reproject/Clip
-        if crs and merged.rio.crs and merged.rio.crs != crs:
-            try:
-                logger.info(f"Reprojecting BAG merged from {merged.rio.crs} to {crs}")
-                merged = merged.rio.reproject(crs)
-            except Exception as e:
-                logger.warning(f"Reprojection failed: {e}")
-
-        # Clip
-        try:
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
-        except Exception as e:
-            logger.warning(f"Clip failed: {e}")
+        # 4. Final Clip (Cleanup)
+        # Ensure exact bounds (reprojection might have introduced slight over-run)
+        with contextlib.suppress(Exception):
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
 
         merged.name = "elevation"
-        return merged
+        return cast(xr.DataArray, merged)
 
     def get_metadata(self) -> dict[str, Any]:
         """
@@ -703,4 +727,4 @@ class BAGProvider(Provider):
 
 
 # Register the provider
-registry.register("bag", BAGProvider)
+registry.register(Path(__file__).stem, BAGProvider)

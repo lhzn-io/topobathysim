@@ -24,4 +24,4 @@ RUN pip install .
 COPY service/topobathyserve /app/topobathyserve
 
 # Run
-CMD ["uvicorn", "topobathyserve.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "topobathyserve.main:app", "--host", "0.0.0.0", "--port", "9595", "--workers", "4"]

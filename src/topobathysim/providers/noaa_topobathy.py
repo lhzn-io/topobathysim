@@ -579,7 +579,16 @@ class NoaaTopobathyProvider(Provider):
         folder_name = self._projects[self._active_project_id]
 
         # Construct Remote and Local paths
-        http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{folder_name}/{tile_filename}"
+        if "https://" in tile_filename or "http://" in tile_filename:
+            # If tile_filename comes in as a full URL (from 'URL' column in index)
+            # Use it directly as the download source
+            http_url = tile_filename
+            # Extract just the name for local storage
+            tile_filename = tile_filename.split("/")[-1]
+        else:
+            # Construct standard URL
+            http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{folder_name}/{tile_filename}"
+
         local_filename = f"{self._active_project_id}_{tile_filename}"
         local_cog_path = self.cache_dir / local_filename
 
@@ -721,4 +730,4 @@ class NoaaTopobathyProvider(Provider):
 
 
 # Register
-registry.register("topobathy", NoaaTopobathyProvider)
+registry.register(Path(__file__).stem, NoaaTopobathyProvider)

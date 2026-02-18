@@ -1,4 +1,5 @@
 import logging
+import warnings
 from pathlib import Path
 from typing import cast
 
@@ -34,6 +35,9 @@ class BathyManager:
     """
     Orchestrates bathymetry data access, intelligently switching between
     Global GEBCO 2025 and High-Res BlueTopo based on coverage and availability.
+
+    .. deprecated:: 0.2.0
+        Use `topobathysim.runtime` instead.
     """
 
     def __init__(
@@ -54,6 +58,12 @@ class BathyManager:
             use_land: Enable 3DEP/NASADEM Land (Mid Res Land) (Tier 3)
             offline_mode: If True, fail if network request is required. Use only cached data.
         """
+        warnings.warn(
+            "BathyManager is deprecated and will be removed in a future version. "
+            "Please use `topobathysim.runtime` for fusion policies.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.cache_dir = Path(cache_dir).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.offline_mode = offline_mode

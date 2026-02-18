@@ -794,4 +794,4 @@ class NoaaBlueTopoProvider(Provider):
 
 
 # Register the provider
-registry.register("bluetopo", NoaaBlueTopoProvider)
+registry.register(Path(__file__).stem, NoaaBlueTopoProvider)

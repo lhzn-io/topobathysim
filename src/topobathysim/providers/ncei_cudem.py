@@ -308,4 +308,4 @@ class CUDEMProvider(Provider):
 
 
 # Register
-registry.register("cudem", CUDEMProvider)
+registry.register(Path(__file__).stem, CUDEMProvider)

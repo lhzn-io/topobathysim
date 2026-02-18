@@ -6,11 +6,11 @@ variables:
   - name: "elevation"
     steps:
       # Base Layer: Global GEBCO 2025
-      - provider: "gebco"
+      - provider: "gebco_2025"
         operation: "overwrite"
 
       # Overlay: High-Res GBR100
       # Uses metric_feather to blend 500m into the base layer
-      - provider: "gbr100"
+      - provider: "jcu_gbr100"
         operation: "metric_feather"
         blend_distance: 500.0

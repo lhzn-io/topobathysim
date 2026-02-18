@@ -396,4 +396,4 @@ class Usgs3DepProvider(Provider):
 
 
 # Register
-registry.register("usgs_3dep", Usgs3DepProvider)
+registry.register(Path(__file__).stem, Usgs3DepProvider)

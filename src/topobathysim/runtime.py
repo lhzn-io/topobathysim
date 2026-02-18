@@ -46,6 +46,35 @@ def run(
     policy = load_policy(policy_path)
     target_crs = policy.crs
 
+    start_lon, start_lat, end_lon, end_lat = bbox
+
+    # Validate CRS Area of Use
+    try:
+        from pyproj import CRS
+
+        crs_obj = CRS(target_crs)
+        if crs_obj.area_of_use:
+            # Area of Use bounds are (west, south, east, north)
+            aou_w, aou_s, aou_e, aou_n = crs_obj.area_of_use.bounds
+
+            # Simple intersection check (1D overlap in both X and Y)
+            # Fail if completely disjoint
+            if start_lon > aou_e or end_lon < aou_w or start_lat > aou_n or end_lat < aou_s:
+                error_msg = (
+                    f"Requested bounds {bbox} are outside the validity area for policy CRS {target_crs}. "
+                    f"Area of Use: {crs_obj.area_of_use.name} ({aou_w}, {aou_s}, {aou_e}, {aou_n})"
+                )
+                # User asked for loud failure
+                raise ValueError(error_msg)
+    except ImportError:
+        pass  # pyproj not installed? Unlikely given usage
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise e
+        # Don't block execution if validation itself fails weirdly (e.g. CRS lookup fail)
+        # But maybe we should?
+        pass
+
     # 2. Setup Canvas Extents & Resolution
     min_lon, min_lat, max_lon, max_lat = bbox
 

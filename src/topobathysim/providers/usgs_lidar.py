@@ -365,6 +365,10 @@ class UsgsLidarProvider(Provider):
             return da
 
         except Exception as e:
+            # Handle empty clip gracefully
+            if "No data found in bounds" in str(e):
+                logger.debug(f"Lidar tile empty after clip: {e}")
+                return None
             logger.error(f"Lidar Read Error: {e}", exc_info=True)
             return None
 
@@ -707,4 +711,4 @@ class UsgsLidarProvider(Provider):
 
 
 # Register
-registry.register("lidar", UsgsLidarProvider)
+registry.register(Path(__file__).stem, UsgsLidarProvider)

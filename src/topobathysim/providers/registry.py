@@ -71,6 +71,35 @@ class ProviderRegistry:
         """
         return {k: v.__name__ for k, v in cls._providers.items()}
 
+    @classmethod
+    def auto_discover(cls) -> None:
+        """
+        Automatically discover and import all provider modules in the package.
+        This triggers the registration logic within each module.
+        """
+        import importlib
+        import pkgutil
+        from pathlib import Path
+
+        # Get the package of the registry module
+        package_name = __package__
+        if not package_name:
+            package_name = "topobathysim.providers"
+
+        # Iterate over modules in the same directory
+        package_dir = Path(__file__).parent
+        for _, module_name, _ in pkgutil.iter_modules([str(package_dir)]):
+            if module_name in ["base", "registry"]:
+                continue
+
+            try:
+                importlib.import_module(f"{package_name}.{module_name}")
+            except Exception as e:
+                # Log warning but don't crash
+                import logging
+
+                logging.getLogger(__name__).warning(f"Failed to auto-import provider {module_name}: {e}")
+
 
 # Global instance for convenience (optional, but good for direct import)
 registry = ProviderRegistry()

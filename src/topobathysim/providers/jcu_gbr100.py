@@ -156,4 +156,4 @@ class GBR100Provider(Provider):
 
 
 # Register the provider
-registry.register("gbr100", GBR100Provider)
+registry.register(Path(__file__).stem, GBR100Provider)
