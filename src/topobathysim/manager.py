@@ -357,10 +357,10 @@ class BathyManager:
         # Tier 4: GEBCO (Always Fetch as last resort or context)
         try:
             g = GEBCO2025Provider(south=south, north=north, west=west, east=east)
-            da = g.fetch()
-            if "lat" in da.coords:
-                da = da.rename({"lat": "y", "lon": "x"})
-            valid_layers.append((4, "GEBCO", da))
+            gebco_da = g.fetch()
+            if "lat" in gebco_da.coords:
+                gebco_da = gebco_da.rename({"lat": "y", "lon": "x"})
+            valid_layers.append((4, "GEBCO", gebco_da))
         except Exception as e:
             logger.warning(f"GEBCO error: {e}")
 
@@ -477,6 +477,7 @@ class BathyManager:
             return SOURCE_ID_GEBCO  # Default
 
         for tier, name, src_da in valid_layers:
+            assert base_da is not None
             try:
                 # Ensure 2D (remove band dimension if present)
                 if "band" in src_da.dims:
@@ -512,14 +513,19 @@ class BathyManager:
                 # fill NaNs with new layer
                 assert base_da is not None
                 base_da = base_da.combine_first(reproj_da)
-                base_da.attrs["source"] = (
-                    (base_da.attrs.get("source", "") + f" + {name}") if "source" in base_da.attrs else name
-                )
+
+                if base_da is not None:
+                    base_da.attrs["source"] = (
+                        (base_da.attrs.get("source", "") + f" + {name}")
+                        if "source" in base_da.attrs
+                        else name
+                    )
 
             except Exception as e:
                 logger.warning(f"Failed to fill {name} into grid: {e}")
 
         if return_source_mask:
-            return base_da, source_da
+            # Cast to satisfy strict tuple return type
+            return cast(tuple[xr.DataArray, xr.DataArray | None], (base_da, source_da))
 
-        return base_da
+        return cast(xr.DataArray, base_da)

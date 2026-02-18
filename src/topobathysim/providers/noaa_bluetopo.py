@@ -455,6 +455,8 @@ class NoaaBlueTopoProvider(Provider):
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")
 
+            da = cast(xr.DataArray, da)
+
             # 4. Cache to Zarr (Optimized Format)
             try:
                 # Ensure name

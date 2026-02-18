@@ -274,6 +274,8 @@ class CUDEMProvider(Provider):
             if da.rio.nodata is not None:
                 da = da.where(da != da.rio.nodata)
 
+            da = cast(xr.DataArray, da)
+
             # Robust CRS
             if da.rio.crs is None:
                 da.rio.write_crs("EPSG:4269", inplace=True)
