@@ -7,33 +7,25 @@
 
 ![TopoBathySim Screenshot](docs/source/_static/topobathyscreenshot.png)
 
-**TopoBathySim** is a Python library and microservice designed to generate seamless, high-resolution Digital Elevation Models (DEMs) by fusing disparate geospatial datasets. Originally developed for amphibious robotics simulations, it intelligently merges terrestrial Lidar, coastal bathymetry, and global terrain data into cohesive, unified tiles.
+**TopoBathySim** is a policy-driven geospatial fusion engine designed to generate seamless, high-resolution Digital Elevation Models (DEMs). It intelligently merges terrestrial Lidar, coastal bathymetry, and global terrain data into cohesive tiles based on configurable **Fusion Policies**.
 
 ## Key Features
 
-- **Multi-Source Fusion (Priority Overwrite)**:
-  - **Tier 0**: NOAA BAG (Raw Survey Data, e.g., *H13385*). **Absolute Priority**.
-  - **Tier 1 (Fusion)**: Airborne Lidar (Upland > 0m) fused with Greenwave Topobathy (Intertidal/Shallow).
-  - **Tier 2**: NOAA CUDEM (Gap-Fill Coastal).
-  - **Tier 3**: NOAA BlueTopo (Regional Bathy).
-  - **Tier 4**: GEBCO 2025 (Global Fallback).
-- **Intelligent Composition**: Merges datasets based on strict sensor suitability (Airborne vs Green Lidar) and spatial availability.
-- **Offline-First Architecture**:
-  - **Asset Manifests**: Records online assets for true offline playback.
-  - **Smart Caching**: Local caching of COGs, LAZ files, and tile schemes.
-- **Microservice Ready**: Includes `TopoBathyServe`, a FastAPI-based tile server offering:
-  - Standard XYZ interpolation (`/tiles/{z}/{x}/{y}.png`).
-  - Raw NumPy buffers (`format=npy`) for direct ingestion into physics engines (e.g., NVIDIA Warp).
-- **Geodetic Accuracy**: Automated vertical datum transformation (NAVD88 ↔ LMSL ↔ WGS84) using VDatum.
+- **Policy-Driven Runtime**: Define your fusion logic (sources, priorities, blending operations) in simple YAML files.
+- **Multi-Source Support**:
+  - **Survey Data**: NOAA BAG (Bathymetric Attributed Grids).
+  - **Lidar**: USGS 3DEP & NOAA Topobathy.
+  - **Regional/Global**: NOAA BlueTopo™, NOAA CUDEM, GEBCO 2025.
+- **Smart Caching**:
+  - **Lazy Network Loading**: Only fetches data when needed.
+  - **Zarr-Based Storage**: High-performance local caching for repeated access.
+- **Microservice Ready**: `TopoBathyServe` (FastAPI) provides XYZ tiles and raw NumPy buffers for physics engines.
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/lhzn-io/topobathysim.git
 cd topobathysim
-
-# Install using pip (Editable mode recommended)
 pip install -e .
 ```
 
@@ -41,108 +33,62 @@ pip install -e .
 
 ### 1. Running the Tile Service
 
-The topobathymetry microservice exposes fused data via HTTP.
+Start the server with a specific fusion policy (defaults to US Coastal / WLIS):
 
 ```bash
-# Navigate to root
-cd topobathysim
-
-# Run using the helper script (Recommended)
-python service/run_server.py
-
-# OR run module directly
-python -m uvicorn topobathyserve.main:app --host 0.0.0.0 --port 9595 --workers 4
+# Set policy and run
+TOPOBATHY_POLICY=policies/examples/wlis.yaml python service/run_server.py
 ```
 
-### 2. Running via Docker
+Access the viewer at `http://localhost:9595/viewer`.
 
-```bash
-# Build the image
-docker build -f service/Dockerfile -t topobathyserve .
+### 2. Python API Usage
 
-# Run the container
-docker run -p 9595:8000 topobathyserve
-```
-
-*Access the viewer at `http://localhost:9595/viewer`*
-
-### 2. Cache Maintenance
-
-Since TopoBathySim caches large datasets, use the built-in integrity tool to audit and repair storage health.
-See [CLI Tools Documentation](docs/source/cli_tools.rst) for full usage details.
-
-```bash
-# Quick Audit
-micromamba run -n topobathysim python src/topobathysim/scripts/verify_cache_integrity.py --check
-```
-
-### 3. Python API Usage
-
-Use the library directly for custom analysis or data extraction.
+Directly invoke the runtime to generate data for a specific bounding box.
 
 ```python
-from topobathysim.fusion import FusionEngine
-from topobathysim.lidar import LidarProvider
-from topobathysim.bluetopo import BlueTopoProvider
+from topobathysim.runtime import run
 
-# 1. Fetch Source Data
-lidar = LidarProvider().fetch_lidar_from_ept(url="...", bounds=(...))
-bathy = BlueTopoProvider().fetch_blue_topo(bounds=(...))
+# Run fusion for a specific bounding box (West, South, East, North)
+ds = run(
+    policy_path="policies/examples/wlis.yaml",
+    bbox=(-73.85, 40.92, -73.80, 40.95),
+    resolution=10.0  # Meters
+)
 
-# 2. Fuse Datasets
-engine = FusionEngine()
-fused_dem = engine.fuse_seamline(lidar, bathy, blend_dist=20.0)
-
-# 3. Save or Analyze
-fused_dem.rio.to_raster("fused_coastline.tif")
+# Save result
+ds.rio.to_raster("fused_output.tif")
 ```
 
 ## Documentation
 
-Full documentation, including methodology and API reference, is available in the `docs/` directory.
+Full documentation is available in the `docs/` directory.
 
-- [Data Fusion Methodology](docs/source/methodology.rst)
-- [API Reference](docs/source/api.rst)
+- [Policy DSL Guide](docs/source/policy_dsl.rst): Learn how to write fusion policies.
+- [Runtime Architecture](docs/source/runtime_architecture.rst): Understanding the engine.
+- [Data Sources](docs/source/data_sources.rst): Supported providers.
 
 ## Architecture
 
-TopoBathySim acts as a central broker between simulation clients (Game Engines, Simulators) and raw geospatial infrastructure (USGS/NOAA Cloud Buckets).
+TopoBathySim uses a stateless, policy-driven runtime to compose data on the fly.
 
 ```mermaid
 graph TD
-    Client["Simulation Client"] -->|"Get Tile (XYZ)"| API[TopoBathyServe]
-    API --> Manager[BathyManager]
+    User["User / API"] -->|Request (BBox + Policy)| Runtime[Runtime Engine]
 
-    subgraph "Data Sources"
+    subgraph "Providers"
         L["USGS Lidar"]
-        B["NOAA BlueTopo"]
-        C["NOAA CUDEM"]
-        G["GEBCO 2025"]
+        B["BlueTopo"]
+        G["GEBCO"]
+        S["Survey (BAG)"]
     end
 
-    Manager -->|Fusion| Fusion["Fusion Engine"]
-    L --> Fusion
-    C --> Fusion
-    B --> Fusion
-    G --> Fusion
+    Runtime -->|Fetch & Cache| Providers
+    Runtime -->|Reproject & Resample| Canvas["Unified Canvas"]
 
-    Fusion -->|"Fused DEM"| Cache["Disk Cache"]
-    Cache --> API
+    Canvas -->|Blend (Metric Feather)| Output["Fused DEM"]
 ```
 
-## License & Acknowledgements
-
-This project uses data and methodologies from:
-
-- **Data Sources**: For a complete list of specific surveys and citatations (e.g. Long Island Sound, BlueTopo), see [the documentation](docs/source/data_sources.rst).
-
-- **Research**:
-  - *Continuously Updated Digital Elevation Models (CUDEMs) to
-Support Coastal Inundation Modeling*. <https://doi.org/10.3390/rs15061702>
-- **csdms/bmi-topography**: This library relies heavily on the `bmi-topography` package for standardized data fetching. A special thanks to the CSDMS community.
-  > **Note**: This project has a potential fragility regarding `bmi-topography` versions. Please ensure compatibility when upgrading.
-- **USGS 3DEP & CoNED**: Adaptive Topobathymetric Fusion logic.
-- **NOAA**: BlueTopo & VDatum.
-- **GEBCO**: The General Bathymetric Chart of the Oceans.
+## License
 
 Released under the MIT License.

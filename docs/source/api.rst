@@ -1,47 +1,33 @@
-API Reference
-=============
-
-.. automodule:: topobathysim
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Fusion Engine
--------------
-
-.. automodule:: topobathysim.fusion
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-GEBCO Interface
----------------
-
-.. automodule:: topobathysim.gebco
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Lidar Provider
+Runtime Engine
 --------------
 
-.. automodule:: topobathysim.lidar
+.. automodule:: topobathysim.runtime
    :members:
    :undoc-members:
    :show-inheritance:
 
-Land Provider (USGS 3DEP)
--------------------------
+Policy Schema
+-------------
 
-.. automodule:: topobathysim.land
+.. automodule:: topobathysim.policy.schema
    :members:
    :undoc-members:
    :show-inheritance:
 
-Data Management
----------------
+Providers
+---------
 
-.. automodule:: topobathysim.manager
+.. automodule:: topobathysim.providers.base
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: topobathysim.providers.gebco_2025
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: topobathysim.providers.ncei_bag
    :members:
    :undoc-members:
    :show-inheritance:
