@@ -37,6 +37,10 @@ def run(
 
     Returns:
         xr.Dataset: The generated dataset containing 'elevation' and 'source_elevation'.
+
+    Note:
+        **Edge Case**: If a policy rule specifies `operator: metric_feather` but omits `blend_distance`
+        (i.e., it is None), the runtime falls back to `overwrite` (Hard Cut) behavior.
     """
     # 1. Load Policy
     policy = load_policy(policy_path)
@@ -120,13 +124,17 @@ def run(
             provider_cls = registry.get_provider_class(step.provider)
             provider_instance = provider_cls()
 
-            # Fetch using the original EPSG:4326 bbox
-            # Pass target_crs as a hint to the provider for potential optimization
-            fetched_data = provider_instance.fetch_layer(
-                bbox,
-                resolution=input_resolution_meters,
-                crs=target_crs,
-            )
+            try:
+                # Fetch using the original EPSG:4326 bbox.
+                # The provider handles reprojection if necessary or optimized.
+                fetched_data = provider_instance.fetch_layer(
+                    bbox,
+                    resolution=input_resolution_meters,
+                    crs=target_crs,
+                )
+            except (KeyError, ValueError, RuntimeError):
+                # Skip provider if data is missing or fetch fails (common for sparse datasets)
+                continue
 
             if fetched_data is None:
                 continue
@@ -162,7 +170,9 @@ def run(
                 elif rule.operator == OperatorType.overwrite:
                     blended = overwrite(elevation, aligned_data, transition_mask)
                 else:
-                    # Fallback to overwrite for unsupported operators in V0
+                    # Fallback to overwrite for unsupported operators in V0.
+                    # Edge Case: If operator is 'metric_feather' but blend_distance is None,
+                    # we fall through to here (Safe Default: Hard Cut).
                     blended = overwrite(elevation, aligned_data, transition_mask)
 
                 # Update Canvas for this transition region

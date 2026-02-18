@@ -30,6 +30,10 @@ class TransitionRule(BaseModel):
     target_provider: str
     operator: OperatorType
     blend_distance: float | None = None
+    """
+    Distance in meters for feathering/blending.
+    Note: If operator is 'metric_feather' and this is None, runtime defaults to 'overwrite'.
+    """
 
 
 class CompositionStep(BaseModel):

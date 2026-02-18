@@ -84,7 +84,7 @@ class GEBCO2025Provider(Topography, Provider):
         """
         Implements Provider.fetch_layer
         """
-        south, west, north, east = bbox
+        west, south, east, north = bbox
         bbox_override = BBox(west, south, east, north)
         return self.fetch(bbox_override=bbox_override)
 
@@ -157,6 +157,11 @@ class GEBCO2025Provider(Topography, Provider):
                             da_tile = xr.open_dataarray(
                                 cache_path, engine="zarr", chunks="auto", decode_coords="all"
                             )
+                        # Ensure CRS
+                        if da_tile.rio.crs is None:
+                            logger.warning(f"GEBCO Zarr Cache {tile_key} missing CRS. Setting EPSG:4326")
+                            da_tile.rio.write_crs("EPSG:4326", inplace=True)
+
                         # Basic check
                         if da_tile.size == 0:
                             da_tile = None
@@ -207,6 +212,8 @@ class GEBCO2025Provider(Topography, Provider):
                                     continue
 
                                 da_source = da_source.load()
+                                if da_source.rio.crs is None:
+                                    da_source.rio.write_crs("EPSG:4326", inplace=True)
 
                                 if "grid_mapping" in da_source.attrs:
                                     del da_source.attrs["grid_mapping"]
@@ -227,6 +234,13 @@ class GEBCO2025Provider(Topography, Provider):
                                         da_tile = xr.open_dataarray(
                                             cache_path, engine="zarr", chunks="auto", decode_coords="all"
                                         )
+                                        if da_tile.rio.crs is None:
+                                            logger.warning(
+                                                f"GEBCO Zarr (Newly Created) {tile_key} missing CRS. "
+                                                "Setting EPSG:4326"
+                                            )
+                                            da_tile.rio.write_crs("EPSG:4326", inplace=True)
+
                                 else:
                                     logger.warning(f"GEBCO Tile {tile_key} returned empty data.")
                             except Exception as tile_err:
