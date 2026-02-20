@@ -228,10 +228,42 @@ class BathyManager:
                             if res:
                                 results.append(res)
 
-                    # Sort results Newest -> Oldest (Index Descending)
-                    # Because merge_arrays uses "First Wins" logic
-                    results.sort(key=lambda x: x[0], reverse=True)
-                    bbox_das = [r[1] for r in results]
+                    # Sort results:
+                    # 1. By Date (Newest first)
+                    # 2. By Resolution (Finest/Smallest pixel size first)
+
+                    # Augment results with resolution for sorting
+                    augmented_results = []
+                    for idx, da in results:
+                        resolution = 999.0  # Default coarse
+                        try:
+                            # Use X resolution from transform
+                            if da.rio.resolution():
+                                resolution = abs(da.rio.resolution()[0])
+                        except Exception:
+                            pass
+                        augmented_results.append((idx, resolution, da))
+
+                    # Sort Logic for "First Wins" Merge:
+                    # Primary: Date (Highest Index = Newest).
+                    # Secondary: Resolution (Smallest = Finest).
+                    # We want (Newest, Finest) at the top of the list.
+                    # Sort key: (-idx, res) ->
+                    #   -idx: -10 < -1 (Higher idx comes first)
+                    #   res: 1.0 < 2.0 (Smaller res comes first for same idx)
+
+                    # NOTE: 'idx' comes from bag_urls which was sorted Old->New.
+                    # So higher idx is newer.
+
+                    augmented_results.sort(key=lambda x: (-x[0], x[1]))
+
+                    logger.info("--- BAG Merge Priority Order ---")
+                    for i, (idx, resolution, da) in enumerate(augmented_results):
+                        src = da.attrs.get("survey_source", "Unknown")
+                        logger.info(f"Priority {i}: DateRank={idx}, Res={resolution:.2f}, Source={src}")
+                    logger.info("-------------------------------")
+
+                    bbox_das = [r[2] for r in augmented_results]
 
                     if bbox_das:
                         try:
