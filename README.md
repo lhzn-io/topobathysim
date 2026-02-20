@@ -131,6 +131,8 @@ Use the viewer to:
 - switch to **provenance/source** view
 - verify that the policy is doing what you expect
 
+For cache sizing and practical runtime expectations, see the documentation page: `docs/source/performance.rst`.
+
 ## Policy preset gallery
 
 Policy presets live in `policies/`:

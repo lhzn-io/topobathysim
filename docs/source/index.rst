@@ -20,6 +20,7 @@ TopoBathySim
    data_sources
    api
    cli_tools
+   performance
 
 Indices and tables
 ==================
