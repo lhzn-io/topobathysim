@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -46,6 +46,20 @@ class TransitionRule(BaseModel):
     """
 
 
+class FilterConfig(BaseModel):
+    """
+    Configuration for data filtering, cleaning, and constraints.
+    """
+
+    max_depth_change: float | None = None
+    max_deviation: float | None = None
+    min_elevation: float | None = None
+    max_elevation: float | None = None
+
+    # Allow arbitrary extra fields for custom provider logic (like ncei_bag)
+    model_config = {"extra": "allow"}
+
+
 class CompositionStep(BaseModel):
     """
     A single step in the composition process.
@@ -57,7 +71,7 @@ class CompositionStep(BaseModel):
     blend_distance: float | None = None  # In meters
     zone: ZoneRule | None = None
     transitions: list[TransitionRule] = []
-    filter: dict[str, Any] | None = None
+    filter: FilterConfig | None = None
 
     @field_validator("provider")
     @classmethod

@@ -206,7 +206,7 @@ def run(
                     bbox,
                     resolution=input_resolution_meters,
                     crs=target_crs,
-                    filter=step.filter,
+                    filter=step.filter.model_dump() if step.filter else {},
                 )
             except (KeyError, ValueError, RuntimeError):
                 # Skip provider if data is missing or fetch fails (common for sparse datasets)
@@ -214,6 +214,13 @@ def run(
 
             if fetched_data is None:
                 continue
+
+            # --- Global Filter Constraints ---
+            if step.filter:
+                if step.filter.min_elevation is not None:
+                    fetched_data = fetched_data.where(fetched_data >= step.filter.min_elevation)
+                if step.filter.max_elevation is not None:
+                    fetched_data = fetched_data.where(fetched_data <= step.filter.max_elevation)
 
             # --- Enforce 2D Array Shape ---
             # Providers might return (Band, Y, X) or (Y, X, Band)
