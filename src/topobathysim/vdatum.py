@@ -59,7 +59,10 @@ class VDatumResolver:
             data = response.json()
 
             if "t_z" in data:
-                return float(data["t_z"])
+                val = float(data["t_z"])
+                if val < -90000.0 or val > 90000.0:
+                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
@@ -95,7 +98,10 @@ class VDatumResolver:
 
             if "t_z" in data:
                 # If s_z=0, t_z is the height of MLLW zero in NAVD88 frame.
-                return float(data["t_z"])
+                val = float(data["t_z"])
+                if val < -90000.0 or val > 90000.0:
+                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
@@ -130,7 +136,10 @@ class VDatumResolver:
             data = response.json()
 
             if "t_z" in data:
-                return float(data["t_z"])
+                val = float(data["t_z"])
+                if val < -90000.0 or val > 90000.0:
+                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
@@ -164,7 +173,10 @@ class VDatumResolver:
             data = response.json()
 
             if "t_z" in data:
-                return float(data["t_z"])
+                val = float(data["t_z"])
+                if val < -90000.0 or val > 90000.0:
+                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 

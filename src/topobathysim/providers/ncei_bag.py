@@ -91,22 +91,15 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
                     da = cast(xr.DataArray, da_raw)
 
             # BAGs usually have 'elevation' and 'uncertainty'.
-            # Rasterio usually reads band 1 as elevation.
             elev = da.isel(band=0).drop_vars("band")
 
             # MASK SUSPICIOUS VALUES
-            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
-            # Removed hardcoded -99.0 mask to avoid deleting valid deep ocean data.
+            # Mask standard BAG NoData values (1,000,000 or -1,000,000).
+            # These can leak through if GDAL doesn't parse the BAG XML correctly.
+            elev = elev.where((elev > -100000.0) & (elev < 100000.0))
 
-            # --- CLEANING FILTER (Deviation from Median) ---
-            # Remove single-pixel spikes (common in sonar edges)
-            # Default to fairly aggressive 80m threshold if not specified,
-            # to target the specific "deep sea" artifact issue.
-            # Ideally this is configurable via kwargs, but _read_bag_cached is cached
-            # and doesn't accept dynamic kwargs easily without breaking cache key.
-            # We'll implement a safe default here, or move this logic to `fetch_layer`
-            # where we have the policy.
-            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
+            # Note: Additional dynamic filtering (e.g., configurable spike removal or NoData masking)
+            # is deferred to `fetch_layer` where policy configuration (`kwargs`) is available.
 
             # Check for Ellipsoid vs MLLW
             filename = local_path.name
@@ -186,39 +179,26 @@ def clean_data_deviation(da: xr.DataArray, threshold: float = 50.0) -> xr.DataAr
         from scipy.ndimage import median_filter
 
         def _filter_block(block: Any) -> Any:
-            # 3x3 median
-            # Only apply if block has data
             if block.size == 0:
                 return block
 
-            # Handle NaNs? median_filter might propagate them or ignore depending on implementation.
-            # standard median_filter doesn't handle NaNs well (results in NaN).
-            # We might want generic_filter or a nan-safe version, but for speed standard is used.
-            # For now, let's assume we are targeting massive spikes in valid data strings.
+            # Apply standard median filter (fast, but NaN propagates)
             med = median_filter(block, size=3)
             diff = np.abs(block - med)
 
-            # Mask out spikes (replace with NaN)
-            # return np.where(diff > threshold, np.nan, block)
-            # CAREFUL: If block is integer, np.nan converts to int (bad).
-            # Ensure float.
             if not np.issubdtype(block.dtype, np.floating):
                 block = block.astype(np.float32)
 
+            # Mask spikes exceeding threshold with NaN
             return np.where(diff > threshold, np.nan, block)
 
-        # Check if Dask
         if da.chunks is not None:
-            # It is a dask array. Access .data to get the dask array object
-            # dask.array.map_overlap
-
-            # We must re-wrap the result in a DataArray
-            # da.data is the dask array
+            # Apply via dask map_overlap for chunked processing
             cleaned_dask = da.data.map_overlap(
                 _filter_block,
                 depth=1,
                 boundary="reflect",
-                dtype=da.dtype,  # Maintain type (floats)
+                dtype=da.dtype,
             )
 
             # Return new DataArray with same coords
@@ -646,13 +626,9 @@ class BAGProvider(Provider):
                     continue
 
                 # --- CLEANING / FILTERING ---
-                # Check for filter config in kwargs
                 filter_cfg = kwargs.get("filter", {})
 
-                # 1. Deviation/Spike Removal (Change-based Cleanse)
-                # Defaults to None (disabled) unless specified, OR we can default it on?
-                # Check for 'max_depth_change' or 'max_deviation' keys for uncertainty.
-                # Logic: If 'max_depth_change' is present use it.
+                # 1. Deviation/Spike Removal
                 max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
 
                 if max_dev:

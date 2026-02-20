@@ -278,12 +278,17 @@ class GEBCO2025Provider(Topography, Provider):
             logger.error(f"Merge failed: {merge_err}")
             self._da = das_to_merge[0]  # Fallback to first
 
-        # 3. Slice to exact request bounds (Crop)
-        # This crop is fast against the lazy Zarr backends
+        # 3. Slice to request bounds with padding
+        # Pad bounds by 0.01 degrees to ensure data is returned for high zoom levels
+        # where the requested extent is smaller than the native (15 arcsec) resolution.
         if self._da is not None:
-            self._da = self._da.sel(lat=slice(s, n), lon=slice(w, e))
+            pad = 0.01
+            self._da = self._da.sel(
+                lat=slice(max(s - pad, -90), min(n + pad, 90)),
+                lon=slice(max(w - pad, -180), min(e + pad, 180)),
+            )
 
-        if self._da is None:
+        if self._da is None or self._da.size == 0:
             raise KeyError(f"Failed to fetch GEBCO data for {self.layer_name}")
 
         logger.debug("Found GEBCO 2025 Coverage")
