@@ -1,3 +1,10 @@
+"""
+Cache Priming Utility.
+
+Pre-fetches map tiles for a given bounding box to 'prime' the local cache,
+useful for offline operations.
+"""
+
 import math
 import time
 from typing import Any
@@ -13,6 +20,9 @@ SERVICE_URL = "http://localhost:9595/tiles"
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> tuple[int, int]:
+    """
+    Convert geographic coordinates to XYZ tile index.
+    """
     lat_rad = math.radians(lat_deg)
     n = 2.0**zoom
     xtile = int((lon_deg + 180.0) / 360.0 * n)
@@ -38,6 +48,9 @@ def num2deg(xtile: int, ytile: int, zoom: int) -> tuple[float, float, float, flo
 
 
 def fetch_tile(z: int, x: int, y: int) -> tuple[int, float]:
+    """
+    Fetch a single tile from the local service endpoint.
+    """
     url = f"{SERVICE_URL}/{z}/{x}/{y}?format=png"
     try:
         t0 = time.time()
@@ -104,6 +117,9 @@ def get_bluetopo_coverage(west: float, south: float, east: float, north: float) 
 
 
 def main() -> None:
+    """
+    Main entry point for the cache priming script.
+    """
     import argparse
 
     from shapely.geometry import box

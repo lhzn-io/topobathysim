@@ -1,9 +1,7 @@
 import logging
 import math
 import os
-import shutil
 import sys
-import tempfile
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
@@ -15,18 +13,17 @@ matplotlib.use("Agg")
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Any
 
 import numpy as np
 import xarray as xr
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
-from rasterio.enums import Resampling
+from fastapi.responses import FileResponse, Response
 
-from topobathysim.manager import BathyManager
-from topobathysim.quality import source_report
+from topobathysim.runtime import run
 
+# from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
 
 # Configure Logging
@@ -93,7 +90,10 @@ logging.getLogger("topobathyserve").setLevel(log_level)
 logging.getLogger("topobathysim").setLevel(log_level)
 
 logger = logging.getLogger("topobathyserve")
-bathy_manager: BathyManager | None = None
+
+# Default Policy Path
+DEFAULT_POLICY = Path(__file__).resolve().parent.parent.parent / "policies" / "examples" / "wlis.yaml"
+POLICY_PATH: Path | None = None
 
 
 @asynccontextmanager
@@ -107,10 +107,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
         os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
 
-    global bathy_manager
-    # Check for OFFLINE_MODE env var
-    offline_mode = os.getenv("OFFLINE_MODE", "False").lower() in ("true", "1", "yes")
-    bathy_manager = BathyManager(offline_mode=offline_mode)
+    global POLICY_PATH
+    policy_env = os.getenv("TOPOBATHY_POLICY")
+    POLICY_PATH = Path(policy_env) if policy_env else DEFAULT_POLICY
+
+    if not POLICY_PATH.exists():
+        logger.warning(f"Policy file not found: {POLICY_PATH}. Service may fail.")
+    else:
+        logger.info(f"Using Fusion Policy: {POLICY_PATH}")
+
     yield
     # clean up logic if needed
 
@@ -151,15 +156,15 @@ def health_check() -> dict[str, str]:
     return {"status": "ok", "service": "topobathyserve"}
 
 
-def get_manager() -> BathyManager:
-    if bathy_manager is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return bathy_manager
+def get_policy_path() -> Path:
+    if POLICY_PATH is None or not POLICY_PATH.exists():
+        raise HTTPException(status_code=503, detail="Policy path not initialized")
+    return POLICY_PATH
 
 
 # Visualization Constants
-GLOBAL_VMIN = -50.0
-GLOBAL_VMAX = 20.0
+GLOBAL_VMIN = -64.0
+GLOBAL_VMAX = 128.0
 
 # Feature Flags
 SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
@@ -169,15 +174,18 @@ SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
 )
 
 
+# So I can change the signature of render_png to accept an optional 'legend' dict.
+
+
 def render_png(
     da: xr.DataArray,
     style: str = "default",
     vmin: float | None = None,
     vmax: float | None = None,
     zoom: int = 13,
+    legend: dict[int, str] | None = None,  # NEW ARGUMENT
 ) -> bytes:
     """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
-
     import matplotlib.colors as mcolors
     import matplotlib.image as mpimg
     import matplotlib.pyplot as plt
@@ -186,32 +194,70 @@ def render_png(
     buf = BytesIO()
     vals = da.values.astype(np.float32)
 
+    # Handle 3D Arrays (e.g. (1, h, w) or (C, h, w))
+    # Handle 3D Arrays
+    if vals.ndim == 3:
+        if vals.shape[0] == 1:
+            # (1, h, w) -> (h, w)
+            vals = vals.squeeze(0)
+        elif vals.shape[-1] == 1:
+            # (h, w, 1) -> (h, w)
+            vals = vals.squeeze(-1)
+        else:
+            # Ambiguous (C, h, w) or (h, w, C).
+            # We assume (C, h, w) standard raster layout if not singleton.
+            logger.warning(f"render_png received 3D array {vals.shape}. Using first band.")
+            vals = vals[0, :, :]
+
+    # Last resort check
+    if vals.ndim != 2:
+        logger.error(f"render_png expected 2D array, got {vals.shape}")
+        # Try to flatten or reshape? No, just fail gracefully or let it crash with better log
+        # But we can try to force 2D if it's (h, w, 1) or similar
+        if vals.ndim == 3 and vals.shape[-1] == 1:
+            vals = vals.squeeze(-1)
+
     # Source Visualization Style
     if style == "source":
-        # Create categorical colormap for IDs
-        # 0=Canvas (Black), 10=BAG (Red), 20=Lidar (Green), 21=Topobathy (Lime),
-        # 22=Fused (Orange), 30=CUDEM (Blue), 40=BlueTopo (Cyan), 50=Land (Brown), 60=GEBCO (Gray)
+        # Qualitative Palette (Set3 / Paired)
+        # https://matplotlib.org/stable/users/explain/colors/colormaps.html#qualitative
+        # Set3 has 12 colors. Paired has 12.
+        # We map Provider ID -> Color Index
 
-        # Colors dict
-        cd = {
-            0: (0, 0, 0, 1),  # Black
-            10: (1, 0, 0, 1),  # Red (BAG)
-            20: (0, 1, 0, 1),  # Green (Lidar)
-            21: (0.5, 1, 0, 1),  # Lime (Topobathy)
-            22: (1, 0.5, 0, 1),  # Orange (Fused)
-            30: (0, 0, 1, 1),  # Blue (CUDEM)
-            40: (0, 1, 1, 1),  # Cyan (BlueTopo)
-            50: (0.6, 0.4, 0.2, 1),  # Brown (Land)
-            60: (0.5, 0.5, 0.5, 1),  # Gray (GEBCO)
-        }
+        # If no legend provided, fallback to random/hash
+        cmap_name = "Set3"  # Good for up to 12 categories
+        base_cmap = plt.get_cmap(cmap_name)
 
-        # Create output RGBA
+        # Create a custom colormap where specific integer values map to specific colors
+        # We know IDs are 1..N
+        # We want ID 1 -> Color 0, ID 2 -> Color 1, etc.
+
+        # Helper to get color for an ID
+        def get_color(uid: int) -> tuple[float, float, float, float]:
+            if uid == 0:
+                return (0, 0, 0, 1)  # No Data / Background
+            if np.isnan(uid):
+                return (0, 0, 0, 0)  # Transparent
+
+            # Map ID to Index
+            # If we have a legend, we can be consistent about sorting?
+            # Using the ID directly is simplest if IDs are stable (1, 2, 3...)
+            # The IDs from generate_provider_legend are 1-based indices into sorted providers.
+            # So ID 1 = First Provider, ID 2 = Second Provider.
+
+            idx = (int(uid) - 1) % 12  # Cycle through 12 colors
+            return base_cmap(idx)
+
         h, w = vals.shape
         rgba = np.zeros((h, w, 4), dtype=np.float32)
 
-        for pid, color in cd.items():
-            mask = np.isclose(vals, pid)
-            rgba[mask] = color
+        unique_ids = np.unique(vals)
+        for uid in unique_ids:
+            if np.isnan(uid) or uid == 0:
+                continue
+
+            mask = np.isclose(vals, uid)
+            rgba[mask] = get_color(uid)
 
         mpimg.imsave(buf, rgba, format="png")
         buf.seek(0)
@@ -223,8 +269,6 @@ def render_png(
 
         # Safety Check for NaN
         if np.isnan(vals).all():
-            # Return transparent 1x1 pixel
-            # Or just clean handling
             fig = plt.figure(figsize=(1, 1), dpi=100)
             fig.savefig(buf, format="png", transparent=True)
             plt.close(fig)
@@ -237,9 +281,6 @@ def render_png(
         ax.set_axis_off()
         fig.add_axes(ax)
 
-        # Adaptive Intervals based on Zoom
-        # Zoom 13 represents ~2km across. 10m contours are reasonable.
-        # Zoom 16 represents ~200m. 2m contours are reasonable.
         interval = 10.0
         if zoom >= 14:
             interval = 5.0
@@ -248,28 +289,19 @@ def render_png(
         if zoom >= 18:
             interval = 1.0
 
-        vmin_cnt = math.floor(np.nanmin(vals) / interval) * interval
-        vmax_cnt = math.ceil(np.nanmax(vals) / interval) * interval
-        levels = np.arange(vmin_cnt, vmax_cnt + interval, interval)
+        # Catch empty range
+        if np.nanmin(vals) == np.nanmax(vals):
+            levels = [np.nanmin(vals)]
+        else:
+            vmin_cnt = math.floor(np.nanmin(vals) / interval) * interval
+            vmax_cnt = math.ceil(np.nanmax(vals) / interval) * interval
+            levels = np.arange(vmin_cnt, vmax_cnt + interval, interval).tolist()
 
-        # origin='upper' is critical for matching array indexing (0,0 at top-left)
-        # origin=None (default) puts (0,0) at bottom-left
-        # Use two sets of contours: normal and index
-
-        # Standard lines
         cs = ax.contour(vals, levels=levels, colors="black", linewidths=0.5, alpha=0.7, origin="upper")
-
-        # Zero line (Coastline) - Thick Red/Black
         ax.contour(vals, levels=[0], colors="red", linewidths=1.5, alpha=0.8, origin="upper")
 
-        # Labels
         if zoom >= 14:
             ax.clabel(cs, inline=True, fontsize=8, fmt="%1.0f")
-
-        # Invert Y axis was previously used here, but 'origin="upper"' correctly places
-        # array index 0 (North/Top) at the top of the figure (Y-max).
-        # Inverting the axis flips this, causing N/S inversion.
-        # ax.invert_yaxis()
 
         fig.savefig(buf, format="png", transparent=True)
         plt.close(fig)
@@ -280,7 +312,6 @@ def render_png(
     ls = LightSource(azdeg=315, altdeg=45)
 
     if style == "hillshade":
-        # Pure Grayscale Hillshade
         hillshade = ls.hillshade(vals, vert_exag=10, dx=1.0, dy=1.0)
         mpimg.imsave(buf, hillshade, cmap="gray", format="png")
         buf.seek(0)
@@ -294,7 +325,6 @@ def render_png(
     norm: mcolors.Normalize | None = None
 
     if style in ["chart", "default"]:
-        # Chart Style logic
         blues = plt.get_cmap("Blues_r")
         land_colors = [
             (0.0, "#F7E5B5"),
@@ -319,12 +349,14 @@ def render_png(
 
     else:
         if eff_vmax <= 0:
+            # Depth only
             try:
                 cmap = plt.get_cmap("turbo")
             except ValueError:
                 cmap = plt.get_cmap("jet")
             norm = mcolors.Normalize(vmin=eff_vmin, vmax=eff_vmax)
         elif eff_vmin >= 0:
+            # Land only
             _terrain = plt.get_cmap("terrain")
             land_rgba = _terrain(np.linspace(0.5, 1.0, 256))
             land_cmap = mcolors.LinearSegmentedColormap.from_list("terrain_land", land_rgba)
@@ -354,22 +386,89 @@ def render_png(
     return buf.getvalue()
 
 
-@app.get("/elevation", response_model=ElevationResponse)
+@app.get("/legend")
+async def get_legend(policy_path: Annotated[Path, Depends(get_policy_path)]) -> dict[str, Any]:
+    """
+    Returns the legend mapping (Provider Name -> Color Hex) for the active policy.
+    Used by the frontend to render the dynamic legend.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    from topobathysim.policy.loader import generate_provider_legend, load_policy
+
+    # Reload policy to be safe (or assume it's loaded in runtime, but runtime doesn't expose object easily)
+    # We load it here to get the legend mapping
+    try:
+        policy = load_policy(str(policy_path))
+        legend_map = generate_provider_legend(policy)  # {1: "ProviderA", 2: "ProviderB"}
+
+        # Generate Colors matching render_png logic (Set3)
+        cmap = plt.get_cmap("Set3")
+
+        items = []
+        for pid, name in legend_map.items():
+            # ID to Color
+            idx = (pid - 1) % 12
+            rgba = cmap(idx)
+            hex_color = mcolors.to_hex(rgba)
+
+            items.append({"id": pid, "name": name, "color": hex_color})
+
+        return {"items": items}
+
+    except Exception as e:
+        logger.error(f"Failed to generate legend: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/elevation")
 async def get_elevation(
-    lat: float, lon: float, manager: Annotated[BathyManager, Depends(get_manager)]
+    lat: float, lon: float, policy_path: Annotated[Path, Depends(get_policy_path)]
 ) -> ElevationResponse:
     try:
-        depth = manager.get_elevation(lat, lon)
-        return ElevationResponse(elevation=depth)
+        # Request a reasonable area to ensure we catch grid cells (GEBCO is ~450m)
+        delta = 0.02  # ~2km buffer
+        bbox = (lon - delta, lat - delta, lon + delta, lat + delta)
+
+        # Run inference
+        # Use 10m resolution for sampling
+        ds = run(str(policy_path), bbox, resolution=10.0)
+
+        if ds["elevation"].size == 0:
+            return ElevationResponse(elevation=None)  # type: ignore
+
+        # Sample closest using x/y (Projected CRS or EPSG:4326 uses x/y dims in runtime)
+        # Note: runtime run() returns Dataset with dims ('y', 'x')
+        val = ds["elevation"].sel(x=lon, y=lat, method="nearest").item()
+
+        return ElevationResponse(elevation=float(val) if not np.isnan(val) else None)
+    except ValueError as e:
+        # Catch CRS validation errors from runtime
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
+        logger.error(f"get_elevation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/source_info")
 async def get_source_info(
-    lat: float, lon: float, manager: Annotated[BathyManager, Depends(get_manager)]
+    lat: float, lon: float, policy_path: Annotated[Path, Depends(get_policy_path)]
 ) -> dict[str, str]:
-    return manager.get_source_info(lat, lon)
+    try:
+        delta = 0.00015
+        bbox = (lon - delta, lat - delta, lon + delta, lat + delta)
+        ds = run(str(policy_path), bbox, resolution=10.0)
+
+        if ds["source_elevation"].size == 0:
+            return {"source": "No Data", "id": "NaN"}
+
+        sid = ds["source_elevation"].sel(lat=lat, lon=lon, method="nearest").item()
+
+        # TODO: Lookup ID in ds.attrs or legend
+        return {"source": f"Provider ID {sid}", "id": str(sid), "policy": policy_path.name}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/metadata", response_model=TIDReportResponse)
@@ -378,16 +477,17 @@ async def get_metadata(
     south: float,
     west: float,
     east: float,
-    manager: Annotated[BathyManager, Depends(get_manager)],
+    policy_path: Annotated[Path, Depends(get_policy_path)],
 ) -> TIDReportResponse:
     try:
-        manager.fetch_global_context(north, south, west, east)
-        tid_data = manager.gebco.get_tid_classification()
-
-        if tid_data is None:
-            raise HTTPException(status_code=404, detail="No TID data found for region")
-
-        report = source_report(tid_data)
+        # Metadata logic in runtime is minimal, mostly about the policy
+        # Just run a coarse integration to get attrs?
+        # Or just return policy details?
+        # For now, return a stub report
+        report = {
+            "policy": str(policy_path),
+            "status": "Runtime Metadata Not Generally Available via API yet",
+        }
         return TIDReportResponse(report=report)
 
     except Exception as e:
@@ -472,15 +572,13 @@ def get_tile_metadata(
     z: int,
     x: int,
     y: int,
-    manager: Annotated[BathyManager, Depends(get_manager)],
+    policy_path: Annotated[Path, Depends(get_policy_path)],
     lidar_url: str | None = None,
     ept_url: str | None = None,
     use_seam_blending: bool = True,
 ) -> TileMetadataResponse:
     """
-    Returns metadata for a specific fused tile (XYZ), including cache status,
-    creation time, and contributing sources.
-    Does NOT generate the tile if missing (returns cache_status='miss').
+    Returns metadata for a specific fused tile (XYZ).
     """
     n = 2.0**z
     west = x / n * 360.0 - 180.0
@@ -490,53 +588,18 @@ def get_tile_metadata(
     lat_rad_south = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
     south = math.degrees(lat_rad_south)
 
-    import hashlib
+    # Cache key based on Policy + Geometry
+    # data_sig_str = f"n={north:.6f}_s={south:.6f}_w={west:.6f}_e={east:.6f}_z={z}_policy={policy_path.name}"
+    # data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
 
-    # Use same signature logic as get_fused_tile
-    data_sig_str = (
-        f"n={north:.6f}_s={south:.6f}_w={west:.6f}_e={east:.6f}_z={z}_"
-        f"l={lidar_url}_e={ept_url}_sb={use_seam_blending}"
-    )
-    data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
-
-    data_cache_dir = manager.cache_dir / "fused_zarr"
-    data_cache_path = data_cache_dir / f"{data_hash}.zarr"
-
+    # We don't really have a metadata cache in the same way anymore,
+    # but we could check if the tile output exists.
+    # For now, return a generic status
     bounds = {"north": north, "south": south, "west": west, "east": east}
 
-    if not data_cache_path.exists():
-        return TileMetadataResponse(z=z, x=x, y=y, bounds=bounds, cache_status="miss", fusion_sources=None)
-
-    try:
-        # Load Metadata ONLY (Fast)
-        ds = xr.open_dataset(data_cache_path, engine="zarr", chunks=None)
-
-        # We need to access the 'elevation' variable attributes or dataset attributes
-        # Our previous code writes attributes to the 'elevation' Array or the Dataset?
-        # Let's check both.
-
-        attrs = {}
-        if "created_at" in ds.attrs:
-            attrs = ds.attrs
-        elif "elevation" in ds and "created_at" in ds["elevation"].attrs:
-            attrs = ds["elevation"].attrs
-
-        return TileMetadataResponse(
-            z=z,
-            x=x,
-            y=y,
-            bounds=bounds,
-            cache_status="hit",
-            created_at=str(attrs.get("created_at")),
-            fusion_sources=str(attrs.get("fusion_sources", "Unknown")),
-            request_params=str(attrs.get("request_params")),
-        )
-
-    except Exception as e:
-        logger.warning(f"Failed to read metadata for {data_hash}: {e}")
-        return TileMetadataResponse(
-            z=z, x=x, y=y, bounds=bounds, cache_status="corrupt", fusion_sources=str(e)
-        )
+    return TileMetadataResponse(
+        z=z, x=x, y=y, bounds=bounds, cache_status="unknown", fusion_sources=policy_path.name
+    )
 
 
 @app.get("/tiles/{z}/{x}/{y}")
@@ -549,7 +612,7 @@ def get_xyz_tile(
     z: int,
     x: int,
     y: int,
-    manager: Annotated[BathyManager, Depends(get_manager)],
+    policy_path: Annotated[Path, Depends(get_policy_path)],
     format: str = "tiff",
     lidar_url: str | None = None,
     ept_url: str | None = None,
@@ -561,7 +624,7 @@ def get_xyz_tile(
     """
     XYZ Tile Endpoint.
     """
-    # Infer format from extension if not explicitly provided (assuming default 'tiff')
+    # Infer format
     path = request.url.path
     if format == "tiff":  # Only override if default
         if path.endswith(".png"):
@@ -579,459 +642,157 @@ def get_xyz_tile(
     lat_rad_south = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
     south = math.degrees(lat_rad_south)
 
-    # Enhanced Logging for Request Details
-    logger.info(
-        f"XYZ Request: z={z} x={x} y={y} | Format={format} | Style={style} | "
-        f"VMin={vmin} VMax={vmax} | "
-        f"Bounds: N={north:.5f} S={south:.5f} W={west:.5f} E={east:.5f}"
-    )
+    logger.info(f"XYZ Request: z={z} x={x} y={y} | Format={format} | Style={style} | VMin={vmin} VMax={vmax}")
 
-    # Use manager's cache root so tests can override it
-    base_cache_dir = manager.cache_dir / "tiles"
-    # Separate cache by format
-    if format in ["png"]:
-        # Organize visual tiles by style
+    # --- Caching Logic ---
+    base_cache_dir = Path("~/.cache/topobathysim/tiles").expanduser()
+
+    # Determine Cache Subdirectory based on format/style (Parity with Legacy)
+    if format in ["png", "jpg", "jpeg"]:
+        # Visual Cache: tiles/visual/{style}/{z}/{x}/
         safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
-        cache_dir = base_cache_dir / "visual" / safe_style
+        tile_dir = base_cache_dir / "visual" / safe_style / str(z) / str(x)
+        ext = format
     elif format in ["npy", "npz"]:
-        cache_dir = base_cache_dir / "data"  # Raw Data
+        # Data Cache: tiles/data/{z}/{x}/
+        tile_dir = base_cache_dir / "data" / str(z) / str(x)
+        ext = format
     else:
-        cache_dir = base_cache_dir / "raw"  # TIFFs, etc.
+        # Raw/Other Cache (TIFF): tiles/raw/{z}/{x}/
+        tile_dir = base_cache_dir / "raw" / str(z) / str(x)
+        ext = "tif" if format == "tiff" else format
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    if format == "png":
-        parts = [str(z), str(x), str(y)]
-        if style != "default":
-            parts.append(style)
-        if vmin is not None:
-            parts.append(f"min{vmin}")
-        if vmax is not None:
-            parts.append(f"max{vmax}")
-        tile_filename = "_".join(parts) + ".png"
-    else:
-        # Include style in non-png filenames? Usually NO, data is data.
-        # But if we did different fusion blends?
-        tile_filename = f"{z}_{x}_{y}.{format}"
-
-    tile_path = cache_dir / tile_filename
-
-    if tile_path.exists():
-        media_type = "image/tiff"
-        if format == "png":
-            media_type = "image/png"
-        elif format == "npy" or format == "npz":
-            media_type = "application/octet-stream"
-
-        logger.info(f"Serving cached tile: {tile_filename}")
-        with open(tile_path, "rb") as f:
-            return Response(content=f.read(), media_type=media_type)
-
-    start_time = time.time()
-
-    response = get_fused_tile(
-        north=north,
-        south=south,
-        west=west,
-        east=east,
-        format=format,
-        lidar_url=lidar_url,
-        ept_url=ept_url,
-        use_seam_blending=use_seam_blending,
-        manager=manager,
-        style=style,
-        vmin=vmin,
-        vmax=vmax,
-        zoom=z,
-    )
-
-    if response.status_code == 200:
-        try:
-            tmp_tile_path = cache_dir / f".tmp_{tile_filename}_{os.getpid()}_{time.time_ns()}"
-            with open(tmp_tile_path, "wb") as f:
-                f.write(response.body)
-            tmp_tile_path.rename(tile_path)
-        except Exception as e:
-            logger.warning(f"Failed to cache tile {z}/{x}/{y}: {e}")
-            if "tmp_tile_path" in locals() and tmp_tile_path.exists():
-                tmp_tile_path.unlink()
-
-    logger.info(f"Tile {z}/{x}/{y} generated in {time.time() - start_time:.2f}s")
-    return response
-
-
-def get_fused_tile(
-    north: float,
-    south: float,
-    west: float,
-    east: float,
-    manager: Annotated[BathyManager, Depends(get_manager)],
-    format: str = "tiff",
-    lidar_url: str | None = None,
-    ept_url: str | None = None,
-    use_seam_blending: bool = True,
-    style: str = "default",
-    vmin: float | None = None,
-    vmax: float | None = None,
-    zoom: int = 13,
-) -> Response:
-    """
-    Returns a Logistic-Fused GeoTIFF merging NOAA Lidar (Land) and BlueTopo (Sea).
-    """
-    start_time = time.time()
-
-    # Detailed logging
-    logger.info(
-        f"Fused Tile Request: Bounds(N={north:.6f}, S={south:.6f}, W={west:.6f}, E={east:.6f}) | "
-        f"Format={format} | Style={style} | Zoom={zoom} | "
-        f"VMin={vmin} VMax={vmax}"
-    )
-
-    # 1. Caching Logic for /fused_tile (based on request signature)
-    # We use a hash of the parameters to create a unique cache key
-    # This allows clients sending identical float bounds to benefit from caching
+    # Hash unique parameters (Policy, VMin/Max) to handle different renderings of same tile
+    params_str = f"{policy_path.name}|{vmin}|{vmax}"
     import hashlib
 
-    # 1a. Data Signature (Geometry + Sources + Fusion Logic)
-    # This determines the CONTENT of the grid, independent of visualization
-    # We round coordinates to 6 decimal places to ensure consistent cache keys across requests
-    # that might have microscopic floating point differences
-    data_sig_str = (
-        f"n={north:.6f}_s={south:.6f}_w={west:.6f}_e={east:.6f}_z={zoom}_"
-        f"l={lidar_url}_e={ept_url}_sb={use_seam_blending}"
-    )
-    data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
+    param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
 
-    # Log the cache key generation for debugging
-    logger.debug(f"Cache Key Generation | Style: {style} | Hash: {data_hash} | Sig: {data_sig_str}")
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    tile_path = tile_dir / f"{y}_{param_hash}.{ext}"
 
-    # 1b. Output Signature (Format + Style + Contrast)
-    # This determines the FILE returned to the client
-    sig_str = f"{data_hash}_fmt={format}_st={style}_vm={vmin}_vx={vmax}"
-    sig_hash = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
-
-    # Structured Cache Directory for Fused Outputs
-    base_fused_dir = manager.cache_dir / "fused"
-
-    if format == "png":
-        # Organize visual outputs by style
-        safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
-        cache_dir = base_fused_dir / "visual" / safe_style
-    elif format in ["npy", "npz"]:
-        cache_dir = base_fused_dir / "data"
-    else:
-        cache_dir = base_fused_dir / "raw"
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Data Cache Directory (Fused Zarr L1 Cache)
-    data_cache_dir = manager.cache_dir / "fused_zarr"
-    data_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Extension mapping
-    ext = "bin"
-    if format == "png":
-        ext = "png"
-    elif format == "tiff" or format == "tif":
-        ext = "tif"
-    elif format == "npy":
-        ext = "npy"
-    elif format == "npz":
-        ext = "npz"
-
-    cache_filename = f"fused_{sig_hash}.{ext}"
-    cache_path = cache_dir / cache_filename
-
-    if cache_path.exists():
-        logger.info(f"Serving cached fused tile: {cache_filename}")
+    media_type = "image/tiff" if format == "tiff" else f"image/{format}"
+    if format in ["npy", "npz"]:
         media_type = "application/octet-stream"
-        if format == "png":
-            media_type = "image/png"
-        elif format in ["tiff", "tif"]:
-            media_type = "image/tiff"
 
-        with open(cache_path, "rb") as f:
-            return Response(content=f.read(), media_type=media_type)
+    # 1. Check Cache
+    if tile_path.exists() and tile_path.stat().st_size > 0:
+        logger.debug(f"Cache Hit: {tile_path}")
+        return FileResponse(tile_path, media_type=media_type)
 
-    final_da = None
+    start_time = time.time()
 
-    # 1.5 Try Data Cache (Zarr)
-    # We now cache both elevation and source data in the same Zarr group if available
-    data_cache_path = data_cache_dir / f"{data_hash}.zarr"
-    source_da = None
+    # Calculate Resolution in Meters for this Zoom Level (Approx at center Lat)
+    center_lat = (north + south) / 2.0
+    # Web Mercator resolution equation
+    res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
 
-    if data_cache_path.exists():
-        try:
-            # Check for valid Zarr
-            # Use chunks=None to eagerly load since these are small tiles (512x512)
-            # This avoids Dask overhead for tiny arrays and ensures immediate validation
-
-            # Try loading as Dataset first (supports multiple variables)
-            ds_cached = xr.open_dataset(data_cache_path, engine="zarr", chunks=None, decode_coords="all")
-            ds_cached.load()
-
-            if "elevation" in ds_cached:
-                final_da = ds_cached["elevation"]
-                logger.info(f"Fused Zarr Cache Hit (Elevation): {data_hash}")
-
-            if "source" in ds_cached:
-                source_da = ds_cached["source"]
-                logger.info(f"Fused Zarr Cache Hit (Source): {data_hash}")
-
-            # Fallback for old caches that were DataArrays
-            if final_da is None:
-                # Try opening as DataArray
-                final_da = xr.open_dataarray(data_cache_path, engine="zarr", chunks=None, decode_coords="all")
-                final_da.load()
-                logger.info(f"Fused Zarr Cache Hit (Legacy DataArray): {data_hash}")
-
-        except Exception as e:
-            logger.warning(f"Corrupt Fused Zarr {data_cache_path}: {e}")
-            shutil.rmtree(data_cache_path, ignore_errors=True)
-            final_da = None
-            source_da = None
-
-    # If we requested style=source but cache didn't have source_da, we must regenerate?
-    # Yes, unless we want to fail. But generally checking final_da is None triggers regeneration.
-    # If final_da exists but source_da is missing and style=source, we force regen.
-    if style == "source" and source_da is None:
-        logger.info("Cache hit for elevation but missing source mask for style='source'. Regenerating.")
-        final_da = None
-
-    if final_da is None:
-        try:
-            # 0. Define Target Grid (Standard Tile Size)
-            tile_size = 512
-
-            # 1. Fetch Lidar (Land) - Buffered Fetch
-            lat_span = north - south
-            lon_span = east - west
-            buf_factor = 0.2
-
-            b_north = north + (lat_span * buf_factor)
-            b_south = south - (lat_span * buf_factor)
-            b_east = east + (lon_span * buf_factor)
-            b_west = west - (lon_span * buf_factor)
-
-            # 2. Main Calc
-            # Calculate target shape for buffer (to maintain resolution matching tile_size)
-            b_height = max(1, int(tile_size * ((b_north - b_south) / (north - south))))
-            b_width = max(1, int(tile_size * ((b_east - b_west) / (east - west))))
-
-            logger.info(f"Requests Manager Grid with Shape: {b_height}x{b_width}")
-
-            # Determine if we need source mask
-            # We ALWAYS ask for source mask now to populate the cache fully
-            need_source = True
-
-            result = manager.get_grid(
-                south=b_south,
-                north=b_north,
-                west=b_west,
-                east=b_east,
-                target_shape=(b_height, b_width),
-                return_source_mask=need_source,
-            )
-
-            source_da_raw = None
-            if need_source:
-                if isinstance(result, tuple):
-                    bathy_da, source_da_raw = result
-                else:
-                    bathy_da = cast(xr.DataArray, result)
-            else:
-                bathy_da = cast(xr.DataArray, result)
-
-            logger.info("Main received bathy_da from manager.")
-
-            # Create Standard Target Grid for reproject
-            lon_res = (east - west) / tile_size
-            lat_res = (north - south) / tile_size
-            xs = np.linspace(west + lon_res / 2, east - lon_res / 2, num=tile_size)
-            ys = np.linspace(north - lat_res / 2, south + lat_res / 2, num=tile_size)
-            target_grid = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
-            target_grid.rio.write_crs("EPSG:4326", inplace=True)
-
-            # Reproject Source Mask if available
-            if source_da_raw is not None:
-                source_da = source_da_raw.rio.reproject_match(target_grid, resampling=Resampling.nearest)
-                if isinstance(source_da, xr.DataArray):
-                    source_da.name = "source"
-
-            # If style=source, we verify we have it
-            if style == "source" and source_da is not None:
-                # We still proceed to cache below, then return response
-                pass
-
-            # The Manager returns a fully fused grid (Lidar + Topobathy + BlueTopo + CUDEM + GEBCO)
-            if bathy_da is not None:
-                final_da = bathy_da
-                # Reproject to target grid
-                final_da = final_da.rio.reproject_match(target_grid, resampling=Resampling.bilinear)
-                final_da.name = "elevation"
-            else:
-                raise HTTPException(status_code=404, detail="No data available")
-
-            # Write Data Cache (Zarr)
-            # We cache the REPROJECTED grid (the 'final_da') so it's ready for any visualization
-            # We now write BOTH elevation and source to a Dataset
-            try:
-                from filelock import FileLock
-
-                lock_path = data_cache_path.with_suffix(".lock")
-                with FileLock(lock_path):
-                    if data_cache_path.exists():
-                        logger.info(f"Fused Zarr Cache created by another process: {data_hash}")
-                    else:
-                        try:
-                            tmp_zarr = data_cache_dir / f".tmp_{data_hash}_{os.getpid()}_{time.time_ns()}"
-
-                            # Add Metadata to elevation array (primary)
-                            from datetime import datetime
-
-                            existing_source_attr = final_da.attrs.get("source", "Unknown")
-                            final_da.attrs.update(
-                                {
-                                    "created_at": datetime.utcnow().isoformat(),
-                                    "zoom_level": zoom,
-                                    "tile_bounds": {
-                                        "north": north,
-                                        "south": south,
-                                        "west": west,
-                                        "east": east,
-                                    },
-                                    "fusion_sources": existing_source_attr,
-                                    "request_params": data_sig_str,
-                                }
-                            )
-
-                            # Create Dataset
-                            ds_to_save = xr.Dataset({"elevation": final_da})
-                            if source_da is not None:
-                                ds_to_save["source"] = source_da
-
-                            # Save
-                            ds_to_save.to_zarr(tmp_zarr, mode="w", consolidated=True)
-
-                            # Atomic Move
-                            if data_cache_path.exists():
-                                shutil.rmtree(data_cache_path)
-                            tmp_zarr.rename(data_cache_path)
-
-                            logger.info(f"Fused Zarr Cache Created (Dataset): {data_hash}")
-                        except Exception as e:
-                            logger.warning(f"Failed to write Fused Zarr: {e}")
-                            if "tmp_zarr" in locals() and tmp_zarr.exists():
-                                shutil.rmtree(tmp_zarr)
-
-                # Attempt to clean up lock file if cache was successfully created
-                try:
-                    if data_cache_path.exists() and lock_path.exists():
-                        lock_path.unlink()
-                except Exception:
-                    pass
-
-            except Exception as e:
-                logger.error(f"Zarr Cache Lock Error: {e}")
-
-            # If explicit source style requested, render it here after generation/caching
-            if style == "source" and source_da is not None:
-                png_data = render_png(cast(xr.DataArray, source_da), style="source")
-                return Response(content=png_data, media_type="image/png")
-
-        except Exception as e:
-            logger.error(f"Error in get_fused_tile generation: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e)) from e
-
-    # 4. Serialize
-    # At this point final_da is populated (either from Zarr cache or fresh generation)
-    resp_content = None
-    out_media_type: str | None = None
-
+    # Run Fusion
     try:
-        if format == "png":
-            # If style is source, we MUST render the source_da, not elevation
-            da_to_render = final_da
-            if style == "source":
-                if source_da is not None:
-                    da_to_render = source_da
-                else:
-                    logger.warning(
-                        "Requested style='source' but source_da is None. Rendering elevation instead."
-                    )
-
-            resp_content = render_png(
-                cast(xr.DataArray, da_to_render),
-                style=style,
-                vmin=vmin,
-                vmax=vmax,
-                zoom=zoom,
-            )
-            out_media_type = "image/png"
-
-        elif format == "npy":
-            buf = BytesIO()
-            np.save(buf, final_da.values.astype(np.float32))
-            buf.seek(0)
-            resp_content = buf.read()
-            out_media_type = "application/octet-stream"
-
-        elif format == "npz":
-            buf = BytesIO()
-            np.savez_compressed(buf, elevation=final_da.values.astype(np.float32))
-            buf.seek(0)
-            resp_content = buf.read()
-            out_media_type = "application/octet-stream"
-
-        elif format == "tif" or format == "tiff":
-            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-                tmp_name = tmp.name
-                from dask.diagnostics import ProgressBar
-
-                with ProgressBar():
-                    final_da.rio.to_raster(tmp_name)
-                tmp.seek(0)
-                resp_content = tmp.read()
-            Path(tmp_name).unlink()
-            out_media_type = "image/tiff"
-
-        if resp_content:
-            # Save to cache
-            try:
-                tmp_cache_path = cache_dir / f".tmp_{cache_filename}_{os.getpid()}_{time.time_ns()}"
-                with open(tmp_cache_path, "wb") as f:
-                    f.write(resp_content)
-                tmp_cache_path.rename(cache_path)
-            except Exception as e:
-                logger.warning(f"Failed to cache fused tile: {e}")
-                if "tmp_cache_path" in locals() and tmp_cache_path.exists():
-                    tmp_cache_path.unlink()
-
-            logger.info(f"Fused tile generated in {time.time() - start_time:.2f}s")
-            return Response(content=resp_content, media_type=out_media_type)
-
-        return Response(status_code=400, content="Unsupported format")
-
+        ds = run(str(policy_path), (west, south, east, north), resolution=res_meters)
+    except ValueError as e:
+        # CRS Validation Error
+        logger.warning(f"Tile {z}/{x}/{y} out of bounds for policy: {e}")
+        return Response(content=f"Policy/CRS Mismatch: {e}", status_code=400)
     except Exception as e:
-        logger.error(f"Error in get_fused_tile: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        import traceback
+
+        logger.error(f"Runtime failed: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
+        return Response(content=f"Error: {e}", status_code=500)
+
+    # Render
+    if format == "png":
+        if style == "source":
+            # Generate Legend Map for Dynamic Coloring
+            from topobathysim.policy.loader import generate_provider_legend, load_policy
+
+            # We have policy_path, but need the object.
+            # load_policy is cached? Let's hope it's fast enough or LRU cached.
+            # In production, we'd cache this at app level.
+            # Assuming load_policy is cheap enough for now (parsing YAML)
+            try:
+                pol = load_policy(str(policy_path))
+                legend_map = generate_provider_legend(pol)
+            except Exception as e:
+                logger.warning(f"Failed to load legend for source rendering: {e}")
+                legend_map = None
+
+            data = render_png(
+                ds["source_elevation"], style="source", vmin=vmin, vmax=vmax, zoom=z, legend=legend_map
+            )
+        else:
+            data = render_png(ds["elevation"], style=style, vmin=vmin, vmax=vmax, zoom=z)
+        media_type = "image/png"
+
+    elif format in ["npy", "npz"]:
+        import io
+
+        buf = io.BytesIO()
+        if format == "npy":
+            np.save(buf, ds["elevation"].values)
+        else:
+            np.savez_compressed(
+                buf, elevation=ds["elevation"].values, source_elevation=ds["source_elevation"].values
+            )
+        data = buf.getvalue()
+        media_type = "application/octet-stream"
+
+    else:  # TIFF
+        import io
+
+        buf = io.BytesIO()
+        da_out = ds["elevation"]
+
+        # Ensure proper dimension order (Band, Y, X) for GDAL
+        if da_out.ndim == 3 and da_out.shape[-1] == 1:
+            # If shape is (H, W, 1), move band to front
+            da_out = da_out.transpose("band", "y", "x")
+            # If shape is (1, H, W) it's already fine
+
+        # Write to Raster
+        da_out.rio.to_raster(buf, driver="GTiff")
+        data = buf.getvalue()
+        media_type = "image/tiff"
+
+    # 2. Write to Cache
+    try:
+        with open(tile_path, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        logger.warning(f"Failed to write cache file {tile_path}: {e}")
+
+    logger.info(f"Tile {z}/{x}/{y} generated in {time.time() - start_time:.2f}s")
+    return Response(content=data, media_type=media_type)
 
 
 @app.post("/cache/clear")
-async def clear_cache(
-    manager: Annotated[BathyManager, Depends(get_manager)], type: str = "output"
-) -> dict[str, object]:
+async def clear_cache(type: str = "output") -> dict[str, object]:
     import shutil
 
-    cache_root = manager.cache_dir
+    # Default cache location
+    cache_root = Path("~/.cache/topobathysim").expanduser()
     deleted = []
+
     try:
         if type in ["output", "all"]:
             tiles_dir = cache_root / "tiles"
             if tiles_dir.exists():
                 shutil.rmtree(tiles_dir)
                 deleted.append("tiles")
-            # Updated subdirectories
+
+            fused_dir = cache_root / "fused"
+            if fused_dir.exists():
+                shutil.rmtree(fused_dir)
+                deleted.append("fused")
+
+            fused_zarr = cache_root / "fused_zarr"
+            if fused_zarr.exists():
+                shutil.rmtree(fused_zarr)
+                deleted.append("fused_zarr")
+
+        if type in ["source", "all"]:
+            # Clear provider caches
             for subdir in [
                 "usgs_3dep",
                 "noaa_bluetopo",
@@ -1044,13 +805,6 @@ async def clear_cache(
                 if p.exists():
                     shutil.rmtree(p)
                     deleted.append(subdir)
-
-                    # Clean root items?
-                    shutil.rmtree(p)
-                    deleted.append(subdir)
-            for f in cache_root.glob("*.tiff"):
-                f.unlink()
-            deleted.append("root_inputs")
 
         return {
             "status": "success",

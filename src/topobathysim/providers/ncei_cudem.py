@@ -1,3 +1,11 @@
+"""
+NOAA NCEI CUDEM Provider module.
+
+This module implements the provider for the Continuously Updated Digital Elevation Model (CUDEM).
+It handles tile resolution, downloading, caching, and processing of CUDEM data.
+"""
+
+import contextlib
 import fcntl
 import logging
 import zipfile
@@ -8,15 +16,18 @@ import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
+from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
-from .quality import QualityClass
-from .vdatum import VDatumResolver
+from ..quality import QualityClass
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
 
-class CUDEMProvider:
+class CUDEMProvider(Provider):
     """
     Provider for NOAA/NCEI Continuously Updated Digital Elevation Model (CUDEM).
     Ninth-Arc-Second (~3m) Resolution.
@@ -29,14 +40,101 @@ class CUDEMProvider:
     TILE_INDEX_ZIP = "tileindex_NCEI_ninth_Topobathy_2014.zip"
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+        """
+        Initialize the CUDEM provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+        """
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_cudem"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
 
         self.index_path = self.cache_dir / self.TILE_INDEX_ZIP
         self.index_shp_dir = self.cache_dir / "index_shp"
-        self._gdf = None
+        self._gdf: gpd.GeoDataFrame | None = None
         self.vdatum = VDatumResolver()
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """
+        Fetch CUDEM data for the given bounding box.
+        """
+        west, south, east, north = bbox
+        matches = self.resolve_tiles(west, south, east, north)
+
+        if matches.empty:
+            raise KeyError(f"No CUDEM tiles found for bbox {bbox}")
+
+        logger.info(f"Found {len(matches)} CUDEM tiles for bbox.")
+
+        das: list[xr.DataArray] = []
+        for _, row in matches.iterrows():
+            url = self._get_tile_url(row)
+            if url:
+                tile_result = self.load_tile(row, (west, south, east, north))
+
+                if isinstance(tile_result, xr.DataArray):
+                    das.append(tile_result)
+                elif tile_result is not None:
+                    with contextlib.suppress(Exception):
+                        das.append(cast(xr.DataArray, tile_result))
+
+        if not das:
+            raise KeyError(f"Failed to load valid CUDEM data for bbox {bbox}")
+
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                merged = merge_arrays(das)
+            except Exception as e:
+                logger.error(f"Failed to merge CUDEM tiles: {e}")
+                merged = das[0]
+
+        # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds) to avoid reprojecting full tile
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+        except Exception as e:
+            logger.warning(f"Clip failed (no overlap?): {e}")
+            if not das:  # If this was a single tile flow
+                raise KeyError(f"CUDEM tile clipped out: {bbox}") from e
+
+        # Reproject if needed
+        if crs and merged.rio.crs and merged.rio.crs != crs:
+            try:
+                # logger.info(f"Reprojecting CUDEM from {merged.rio.crs} to {crs}")
+                merged = merged.rio.reproject(crs)
+            except Exception as e:
+                logger.warning(f"Reprojection failed: {e}")
+
+        # Final Exact Clip (to target bbox in target CRS)
+        # This ensures pixel alignment with the requested window
+        with contextlib.suppress(Exception):
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+
+        merged.name = "elevation"
+        logger.debug("Found CUDEM Coverage")
+        return cast(xr.DataArray, merged)
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the CUDEM provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA CUDEM (Continuously Updated DEM)",
+            "citation": "NOAA National Centers for Environmental Information.",
+            "resolution": "~3m (1/9th arc-second)",
+            "url": "https://coast.noaa.gov/digitalcoast/data/cudem.html",
+        }
 
     def _ensure_index_loaded(self) -> None:
         """Download and load the spatial tile index."""
@@ -70,7 +168,6 @@ class CUDEMProvider:
         try:
             shps = list(self.index_shp_dir.glob("*.shp"))
             if not shps:
-                # deeper search?
                 shps = list(self.index_shp_dir.rglob("*.shp"))
 
             if not shps:
@@ -79,7 +176,6 @@ class CUDEMProvider:
 
             self._gdf = gpd.read_file(shps[0])
 
-            # Check for None (read_file signature returns Optional)
             if self._gdf is None:
                 logger.warning("CUDEM Index Shapefile read returned None.")
                 return
@@ -90,7 +186,7 @@ class CUDEMProvider:
             elif self._gdf.crs.to_string() != "EPSG:4326":
                 self._gdf = self._gdf.to_crs("EPSG:4326")
 
-            # Normalize Columns to lowercase for easier lookup
+            # Normalize Columns to lowercase
             if self._gdf is not None:
                 self._gdf.columns = [c.lower() for c in self._gdf.columns]
 
@@ -109,17 +205,12 @@ class CUDEMProvider:
 
     def _get_tile_url(self, row: Any) -> str | None:
         """Determine URL from row metadata."""
-        # Check standard columns
         for col in ["url", "path", "location", "fileurl"]:
             if row.get(col):
                 val = str(row[col])
                 if val.startswith("http"):
                     return val
-                # Handle relative path or filename
                 return f"{self.BASE_S3_URL}/{val}"
-
-        # Fallback to name/tile_id construction if predictable?
-        # Typically indexes have the URL.
         return None
 
     def _ensure_tile_cached(self, url: str) -> Path | None:
@@ -128,14 +219,14 @@ class CUDEMProvider:
         local_path = self.cache_dir / filename
         lock_path = self.cache_dir / f"{filename}.lock"
 
-        # Check cache
         if local_path.exists():
             return local_path
 
-        # Download
-        with open(lock_path, "w") as lock_file:
-            try:
+        try:
+            with open(lock_path, "w") as lock_file:
+                # Blocking lock
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
+
                 if local_path.exists():
                     return local_path
 
@@ -149,24 +240,14 @@ class CUDEMProvider:
                     for chunk in r.iter_content(chunk_size=16384):
                         f.write(chunk)
 
-                # Cleanup Lock on success
-                # Ensure file handle is closed locally if needed, but 'with' context handles it?
-                lock_file.close()
-                # Actually 'with open' context handles the file object closing,
-                # but os level locks are advisory. Use unlink after success.
                 Path(lock_path).unlink(missing_ok=True)
-
                 return local_path
-            except Exception as e:
-                logger.error(f"Failed to download CUDEM tile {url}: {e}")
-                if local_path.exists():
-                    local_path.unlink()
-                return None
-            finally:
-                if not lock_file.closed:
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
-                # We unlinked lock_path above on success.
-                # If failure, we keep it? User asked to remove on success.
+
+        except Exception as e:
+            logger.error(f"Failed to download CUDEM tile {url}: {e}")
+            if local_path.exists():
+                local_path.unlink()
+            return None
 
     def load_tile(self, row: Any, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
         """Load single tile and harmonize datum."""
@@ -196,141 +277,51 @@ class CUDEMProvider:
 
                 if zarr_path.exists():
                     shutil.rmtree(zarr_path)
-
-        logger.info(f"CUDEM Zarr Cache Miss: {zarr_path.name}")
-
+        # Load Raw
         try:
-            # Load Raw
-            # cast result to DataArray (open_rasterio can be ambiguous)
-            from typing import cast
+            da = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
+            if isinstance(da, list):
+                da = da[0]
+            elif isinstance(da, xr.Dataset):
+                da = da.to_array().isel(variable=0)
 
-            # Use chunking on read to allow large tiles to be processed in chunks
-            da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
-            da: xr.DataArray
+            # Explicit cast to a new variable to force mypy narrowing
+            da_final: xr.DataArray = cast(xr.DataArray, da)
 
-            if isinstance(da_raw, list):
-                da = cast(xr.DataArray, da_raw[0])
-            elif isinstance(da_raw, xr.Dataset):
-                # Should not happen with open_rasterio default behavior but safe check
-                da = da_raw.to_array().isel(variable=0)
-            else:
-                da = cast(xr.DataArray, da_raw)
+            if "band" in da_final.dims:
+                da_final = da_final.isel(band=0).drop_vars("band")
+            if da_final.rio.nodata is not None:
+                da_final = da_final.where(da_final != da_final.rio.nodata)
 
-            if "band" in da.dims:
-                da = da.isel(band=0).drop_vars("band")
+            # Robust CRS
+            if da_final.rio.crs is None:
+                da_final.rio.write_crs("EPSG:4269", inplace=True)
 
-            # Handle NoData
-            if da.rio.nodata is not None:
-                da = da.where(da != da.rio.nodata)
-
-            # --- Datum Check ---
-            # CUDEM is usually NAVD88.
-            v_datum = "NAVD88"  # Assumption
-            for col in ["vert_datum", "v_datum", "vertical_datum"]:
-                if row.get(col):
-                    v_datum = str(row[col]).upper()
-                    break
-
-            # If CUDEM is EGM2008 (Ellipsoidal?), we need correction.
-            if "EGM" in v_datum:
-                logger.warning(f"CUDEM Tile {path.name} is {v_datum}. Vertical transformation recommended.")
-                # TODO: Implement VDatum shift here if strictly required
-
-            # -- Ensure variable is imported from contextlib for safety inside the tool
-            import contextlib
-
-            # Robustness: Ensure CRS is written if missing
-            if da.rio.crs is None:
-                logger.warning(f"CUDEM tile {path.name} missing CRS. Assuming EPSG:4269 (NAD83).")
-                with contextlib.suppress(Exception):
-                    da.rio.write_crs("EPSG:4269", inplace=True)
-
-            # --- CACHE WRITE ---
-            # We persist the Zarr version to speed up future access and parallelism
+            # Cache to Zarr
             try:
-                # Transpose to canonical (y, x) if needed
-                if da.dims != ("y", "x") and "y" in da.dims and "x" in da.dims:
-                    da = da.transpose("y", "x")
-
-                # Ensure we have a Name for the DataArray
-                da.name = "elevation"
-
-                # Check bounds validity before writing (sometimes nodata logic strips everything)
-                if da.size > 0:
-                    # Setup robust chunking
-                    da = da.chunk({"y": 1024, "x": 1024})
-
-                    from filelock import FileLock
-
-                    lock_path = zarr_path.with_suffix(".zarr.lock")
-                    with FileLock(lock_path):
-                        logger.info(f"Caching CUDEM tile to Zarr: {zarr_path.name}")
-                        da.to_zarr(zarr_path, mode="w", consolidated=True)
-                    logger.info(f"CUDEM Zarr Cache Created: {zarr_path.name}")
-
-                    # Re-open from Zarr
+                if da_final.size > 0:
+                    da_final = da_final.chunk({"y": 1024, "x": 1024})
+                    da_final.name = "elevation"
+                    da_final.to_zarr(zarr_path, mode="w", consolidated=True)
                     return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
-
             except Exception as e:
-                logger.error(f"Failed to cache CUDEM to Zarr: {e}")
-                # Fallback to returning the raw dask array if write failed
-                return da
+                logger.warning(f"Zarr cache write failed: {e}")
 
-            return da  # Fallback if write skipped logic
+            return da_final
 
         except Exception as e:
             logger.error(f"Error reading CUDEM tile {path}: {e}")
             return None
 
-    def get_grid(self, west: float, south: float, east: float, north: float) -> xr.DataArray | None:
-        """
-        Get fused CUDEM grid for the area.
-        """
-        matches = self.resolve_tiles(west, south, east, north)
-        if matches.empty:
-            return None
-
-        logger.info(f"Found {len(matches)} CUDEM tiles for bbox.")
-
-        das: list[xr.DataArray] = []
-        for _, row in matches.iterrows():
-            # Loading full tile
-            da = self.load_tile(row, (west, south, east, north))
-            if da is not None:
-                # We could clip here to save memory before merge?
-                # Clipping usually safe if we reproject_match later.
-                try:
-                    clipped = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north)
-                    # Use clipped if it has data
-                    if clipped.count() > 0:
-                        das.append(clipped)
-                except Exception:
-                    # Clip might fail if no overlap with bbox (geometry vs bbox precision)
-                    # Just skip
-                    pass
-
-        if not das:
-            return None
-
-        if len(das) == 1:
-            return das[0]
-
-        try:
-            from rioxarray.merge import merge_arrays
-
-            merged = merge_arrays(das)
-            return cast(xr.DataArray, merged)
-        except Exception as e:
-            logger.error(f"Failed to merge CUDEM tiles: {e}")
-            return das[0]
-
     def get_quality_tier(self, lat: float, lon: float) -> QualityClass:
         """
         Return quality tier for the given coordinate.
-        Mark DIRECT where high-res is known, INDIRECT otherwise.
-        Without pixel-level source masks, CUDEM is treated as INDIRECT (Modeled).
         """
         matches = self.resolve_tiles(lon, lat, lon, lat)
         if not matches.empty:
             return QualityClass.INDIRECT
         return QualityClass.UNKNOWN
+
+
+# Register
+registry.register(Path(__file__).stem, CUDEMProvider)

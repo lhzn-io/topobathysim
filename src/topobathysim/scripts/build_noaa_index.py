@@ -1,3 +1,11 @@
+"""
+NOAA Index Builder Script.
+
+This script scans NOAA's data repositories (S3 and InPort) to construct a localized
+GeoJSON index of available Topobathymetric surveys, including their bounding boxes,
+CRS, and resolution metadata for faster runtime querying.
+"""
+
 import concurrent.futures
 import logging
 from pathlib import Path
@@ -7,7 +15,7 @@ import fsspec
 import geopandas as gpd
 from shapely.geometry import box
 
-from topobathysim.noaa_topobathy import NoaaTopobathyProvider
+from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -130,6 +138,12 @@ def process_project(
             # Metadata
             meta = provider.fetch_inport_metadata(project_id) or {}
 
+            # Extract Resolution from Meta
+            # resolution_meters = None # Unused
+
+            # Note: The `meta` dict handles parsing the XML tags such as <spatial-resolution>
+            # The resolution extraction logic is implemented in `NoaaTopobathyProvider._parse_inport_xml`.
+
             return {
                 "project_id": str(project_id),
                 "project_name": project_name,
@@ -140,6 +154,10 @@ def process_project(
                 "end_date": meta.get("end_date"),
                 "vertical_datum": meta.get("vertical_datum"),
                 "sensor_name": meta.get("sensor_name"),
+                "resolution_meters": meta.get("resolution_meters"),
+                "is_topobathy": meta.get("is_topobathy", False)
+                or "topobathy" in project_name.lower()
+                or "bathymetr" in project_name.lower(),
                 "metadata_url": provider._projects_metadata_urls.get(project_id),
             }
 
@@ -153,6 +171,10 @@ def process_project(
 
 
 def main() -> None:
+    """
+    Main entry point for building the NOAA spatial index.
+    Orchestrates the discovery and parallel processing of projects.
+    """
     logger.info("Starting NOAA Spatial Index Builder...")
 
     provider = NoaaTopobathyProvider()

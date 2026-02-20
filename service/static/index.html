@@ -54,6 +54,7 @@
             line-height: 1;
             color: #333;
         }
+
         button.icon-btn:hover {
             background: #e0e0e0;
         }
@@ -94,46 +95,44 @@
             <p style="font-size: 13px; margin-top: 8px;"><i>Auto-Lookup active for US Coastal Lidar (STAC/3DEP)</i></p>
 
             <div style="margin-top: 10px; margin-bottom: 10px;">
-            <label for="style-select" style="font-size: 14px; font-weight: bold;">Colormap:</label>
-            <select id="style-select" style="width: 100%; padding: 5px; margin-top: 5px;">
-                <option value="default">Default (Hybrid Chart)</option>
-                <option value="classic">Classic (Adaptive / Turbo)</option>
-                <option value="chart">Chart (Forced Hybrid)</option>
-                <option value="blues">Blues (Monochromatic)</option>
-                <option value="hillshade">Hillshade (Grayscale)</option>
-                <option value="source">Source Map (Debug)</option>
-            </select>
-        </div>
-
-        <div style="margin-top: 10px;">
-             <label><input type="checkbox" id="contour-toggle"> Show Contours (Debug)</label>
-        </div>
-
-        <!-- Default Legend -->
-        <div id="legend-default" class="legend">
-            Elevation (Terrain Colormap)
-            <div class="colorbar"></div>
-            <div style="display:flex; justify-content:space-between; margin-top:2px;">
-                <span>Low</span>
-                <span>High</span>
+                <label for="style-select" style="font-size: 14px; font-weight: bold;">Colormap:</label>
+                <select id="style-select" style="width: 100%; padding: 5px; margin-top: 5px;">
+                    <option value="default">Default (Hybrid Chart)</option>
+                    <option value="classic">Classic (Adaptive / Turbo)</option>
+                    <option value="chart">Chart (Forced Hybrid)</option>
+                    <option value="blues">Blues (Monochromatic)</option>
+                    <option value="hillshade">Hillshade (Grayscale)</option>
+                    <option value="source">Source Map (Debug)</option>
+                </select>
             </div>
-        </div>
 
-        <!-- Source Legend (Hidden by default) -->
-        <div id="legend-source" class="legend" style="display: none;">
-            <b>Source Map Legend</b>
-            <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 5px; font-size: 11px;">
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:red; margin-right:5px; border:1px solid #ccc;"></span> <b>BAG</b> (Tier 0: Survey)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(255,128,0); margin-right:5px; border:1px solid #ccc;"></span> <b>Fused Land/Water</b> (Tier 1)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(0,255,0); margin-right:5px; border:1px solid #ccc;"></span> Airborne Lidar (USGS 3DEP)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(128,255,0); margin-right:5px; border:1px solid #ccc;"></span> Topobathy Lidar (NOAA)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:cyan; margin-right:5px; border:1px solid #ccc;"></span> <b>BlueTopo™</b> (Tier 2: Model)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:blue; margin-right:5px; border:1px solid #ccc;"></span> <b>CUDEM</b> (Tier 3: 1/9")</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:rgb(153,102,51); margin-right:5px; border:1px solid #ccc;"></span> Land DEM (USGS/NASADEM)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:gray; margin-right:5px; border:1px solid #ccc;"></span> <b>GEBCO 2025</b> (Tier 4: Global)</div>
-                <div style="display:flex; align-items:center;"><span style="width:12px; height:12px; background:black; margin-right:5px; border:1px solid #ccc;"></span> No Data</div>
+            <div style="margin-top: 10px;">
+                <label><input type="checkbox" id="contour-toggle"> Show Contours (Debug)</label>
             </div>
-        </div>
+
+            <!-- Default Legend -->
+            <div id="legend-default" class="legend">
+                Elevation (Terrain Colormap)
+                <div class="colorbar"></div>
+                <div style="display:flex; justify-content:space-between; margin-top:2px;">
+                    <span>Low</span>
+                    <span>High</span>
+                </div>
+            </div>
+
+            <!-- Source Legend (Hidden by default) -->
+            <div id="legend-source" class="legend" style="display: none;">
+                <b>Source Map Legend</b>
+                <div class="legend-items"
+                    style="display: flex; flex-direction: column; gap: 4px; margin-top: 5px; font-size: 11px;">
+                    <!-- Filled dynamically via /legend -->
+                </div>
+                <div style="margin-top:5px; font-size:10px; color:#666;">
+                    <div style="display:flex; align-items:center;"><span
+                            style="width:12px; height:12px; background:black; margin-right:5px; border:1px solid #ccc;"></span>
+                        No Data / Background</div>
+                </div>
+            </div>
             <div id="debug-info"
                 style="margin-top:10px; border-top:1px solid #ccc; padding-top:5px; font-family:monospace; font-size:11px; color:#333;">
                 <b>Debug Info:</b><br />
@@ -251,7 +250,7 @@
         var toggleBtn = document.getElementById('toggle-controls');
         var controlsContent = document.getElementById('controls-content');
 
-        toggleBtn.addEventListener('click', function() {
+        toggleBtn.addEventListener('click', function () {
             if (controlsContent.style.display === 'none') {
                 controlsContent.style.display = 'block';
                 toggleBtn.innerText = '−';
@@ -264,7 +263,7 @@
         // Contours Toggle Logic
         var contourToggle = document.getElementById('contour-toggle');
 
-        contourToggle.addEventListener('change', function() {
+        contourToggle.addEventListener('change', function () {
             if (this.checked) {
                 contourLayer.addTo(map);
             } else {
@@ -281,10 +280,45 @@
             if (style === 'source') {
                 legendDefault.style.display = 'none';
                 legendSource.style.display = 'block';
+                fetchSourceLegend();
             } else {
                 legendDefault.style.display = 'block';
                 legendSource.style.display = 'none';
             }
+        }
+
+        function fetchSourceLegend() {
+            var legendContainer = document.querySelector('#legend-source .legend-items');
+            if (!legendContainer) return;
+
+            legendContainer.innerHTML = '<i>Loading legend...</i>';
+
+            // Get policy params from URL if any (not supported yet in URL, but backend uses default or env)
+            // Ideally we pass ?policy_path=... if user selects one.
+            // For now, just hit /legend which uses the active policy.
+
+            fetch('/legend')
+                .then(response => response.json())
+                .then(data => {
+                    var html = '';
+                    if (data.items) {
+                        data.items.forEach(item => {
+                            html += `
+                                <div style="display:flex; align-items:center;">
+                                    <span style="width:12px; height:12px; background:${item.color}; margin-right:5px; border:1px solid #ccc;"></span>
+                                    ${item.name}
+                                    <span style="color:#999; font-size:9px; margin-left:4px;">(ID:${item.id})</span>
+                                </div>`;
+                        });
+                    } else {
+                        html = 'No legend items found.';
+                    }
+                    legendContainer.innerHTML = html;
+                })
+                .catch(err => {
+                    legendContainer.innerHTML = '<span style="color:red">Failed to load legend</span>';
+                    console.error(err);
+                });
         }
 
         styleSelect.value = initStyle;
@@ -414,7 +448,7 @@
                 })
                 .catch(err => {
                     var el = document.getElementById(`tile-meta-${tile.z}-${tile.x}-${tile.y}`);
-                    if(el) el.innerHTML = '<span style="color:red">Meta Error</span>';
+                    if (el) el.innerHTML = '<span style="color:red">Meta Error</span>';
                 });
         });
     </script>

@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from typing import Any
+
+from pydantic import BaseModel, Field, ValidationInfo, field_validator  # type: ignore
 
 
 class LatLonRequest(BaseModel):
@@ -20,12 +22,12 @@ class BoundingBoxRequest(BaseModel):
 
 
 class ElevationResponse(BaseModel):
-    elevation: float
+    elevation: float | None
     unit: str = "meters"
 
 
 class TIDReportResponse(BaseModel):
-    report: dict[str, float]
+    report: dict[str, Any]
     description: str = "Percentage of data sources by quality tier."
 
 

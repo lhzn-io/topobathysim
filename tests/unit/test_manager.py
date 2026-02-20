@@ -16,7 +16,7 @@ def clean_sys_modules() -> Generator[None, None, None]:
 
 
 from topobathysim.manager import BathyManager  # noqa: E402
-from topobathysim.noaa_bluetopo import NoaaBlueTopoProvider  # noqa: E402
+from topobathysim.providers.noaa_bluetopo import NoaaBlueTopoProvider  # noqa: E402
 from topobathysim.vdatum import VDatumResolver  # noqa: E402
 
 
@@ -55,8 +55,8 @@ def test_bluetopo_coverage() -> None:
         assert provider.is_covered(0.0, 0.0) is False
 
 
-@patch("topobathysim.noaa_bluetopo.fsspec.filesystem")
-@patch("topobathysim.noaa_bluetopo.rioxarray.open_rasterio")
+@patch("topobathysim.providers.noaa_bluetopo.fsspec.filesystem")
+@patch("topobathysim.providers.noaa_bluetopo.rioxarray.open_rasterio")
 def test_bluetopo_caching_and_fetch(mock_open_rasterio: MagicMock, mock_filesystem: MagicMock) -> None:
     provider = NoaaBlueTopoProvider()
 

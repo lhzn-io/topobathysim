@@ -1,4 +1,5 @@
 import logging
+import warnings
 from pathlib import Path
 from typing import cast
 
@@ -8,13 +9,13 @@ from affine import Affine
 from rasterio.enums import Resampling
 from rioxarray.merge import merge_arrays
 
-from .gebco_2025 import GEBCO2025Provider
-from .ncei_bag import BAGDiscovery, BAGProvider
-from .ncei_cudem import CUDEMProvider
-from .noaa_bluetopo import NoaaBlueTopoProvider
-from .noaa_topobathy import NoaaTopobathyProvider
-from .usgs_3dep import Usgs3DepProvider
-from .usgs_lidar import UsgsLidarProvider
+from .providers.gebco_2025 import GEBCO2025Provider
+from .providers.ncei_bag import BAGDiscovery, BAGProvider
+from .providers.ncei_cudem import CUDEMProvider
+from .providers.noaa_bluetopo import NoaaBlueTopoProvider
+from .providers.noaa_topobathy import NoaaTopobathyProvider
+from .providers.usgs_3dep import Usgs3DepProvider
+from .providers.usgs_lidar import UsgsLidarProvider
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ class BathyManager:
     """
     Orchestrates bathymetry data access, intelligently switching between
     Global GEBCO 2025 and High-Res BlueTopo based on coverage and availability.
+
+    .. deprecated:: 0.2.0
+        Use `topobathysim.runtime` instead.
     """
 
     def __init__(
@@ -54,6 +58,12 @@ class BathyManager:
             use_land: Enable 3DEP/NASADEM Land (Mid Res Land) (Tier 3)
             offline_mode: If True, fail if network request is required. Use only cached data.
         """
+        warnings.warn(
+            "BathyManager is deprecated and will be removed in a future version. "
+            "Please use `topobathysim.runtime` for fusion policies.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.cache_dir = Path(cache_dir).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.offline_mode = offline_mode
@@ -242,8 +252,8 @@ class BathyManager:
                     #   -idx: -10 < -1 (Higher idx comes first)
                     #   res: 1.0 < 2.0 (Smaller res comes first for same idx)
 
-                    # NOTE: 'idx' comes from bag_urls which was sorted Old->New.
-                    # So higher idx is newer.
+                    # The index 'idx' derives from bag_urls, which is sorted chronologically.
+                    # Higher index equals newer survey.
 
                     augmented_results.sort(key=lambda x: (-x[0], x[1]))
 
@@ -291,13 +301,13 @@ class BathyManager:
 
         if self.lidar:
             try:
-                lidar_da = self.lidar.get_grid(west, south, east, north)
+                lidar_da = self.lidar.fetch_layer((west, south, east, north))
             except Exception as e:
                 logger.warning(f"Lidar error: {e}")
 
         if self.topobathy:
             try:
-                topo_da = self.topobathy.get_grid(west, south, east, north)
+                topo_da = self.topobathy.fetch_layer((west, south, east, north))
             except Exception as e:
                 logger.warning(f"Topobathy error: {e}")
 
@@ -368,7 +378,7 @@ class BathyManager:
         # Tier 3: CUDEM (Coastal Gap Fill)
         if self.cudem:
             try:
-                da = self.cudem.get_grid(west, south, east, north)
+                da = self.cudem.fetch_layer((west, south, east, north))
                 if da is not None:
                     valid_layers.append((3, "CUDEM", da))
             except Exception as e:
@@ -377,7 +387,7 @@ class BathyManager:
         # Tier 3.5: Land (3DEP / NASADEM)
         if self.land:
             try:
-                da = self.land.get_grid(west, south, east, north)
+                da = self.land.fetch_layer((west, south, east, north))
                 if da is not None:
                     # Using priority 3.5 to ensure it fills gaps but respects Bathy sources (BlueTopo/CUDEM)
                     # unless it's Lidar (which is Tier 1, handled above).
@@ -389,19 +399,16 @@ class BathyManager:
         # Tier 4: GEBCO (Always Fetch as last resort or context)
         try:
             g = GEBCO2025Provider(south=south, north=north, west=west, east=east)
-            da = g.fetch()
-            if "lat" in da.coords:
-                da = da.rename({"lat": "y", "lon": "x"})
-            valid_layers.append((4, "GEBCO", da))
+            gebco_da = g.fetch()
+            if "lat" in gebco_da.coords:
+                gebco_da = gebco_da.rename({"lat": "y", "lon": "x"})
+            valid_layers.append((4, "GEBCO", gebco_da))
         except Exception as e:
             logger.warning(f"GEBCO error: {e}")
 
         if not valid_layers:
             if return_source_mask:
-                # Must satisfy Tuple[DataArray, DataArray | None] per annotation logic?
-                # No, annotation says: "xr.DataArray | tuple[xr.DataArray, xr.DataArray | None]"
-                # Checking None return is cleaner if we modify signature or cast.
-                # Let's verify the signature.
+                # Return generic empty tuple based on signature.
                 return cast(tuple[xr.DataArray, xr.DataArray | None], (None, None))
 
             return cast(xr.DataArray, None)
@@ -425,7 +432,7 @@ class BathyManager:
             xs = np.linspace(west + lon_res / 2, east - lon_res / 2, num=width)
             ys = np.linspace(north - lat_res / 2, south + lat_res / 2, num=height)
 
-            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
+            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"), name="elevation")
             base_da.rio.set_spatial_dims("x", "y", inplace=True)
             base_da.rio.write_crs("EPSG:4326", inplace=True)
             transform = Affine.translation(west, north) * Affine.scale(lon_res, -lat_res)
@@ -467,7 +474,7 @@ class BathyManager:
             xs = np.linspace(west + lon_res / 2, east - lon_res / 2, num=width)
             ys = np.linspace(north - lat_res / 2, south + lat_res / 2, num=height)
 
-            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"))
+            base_da = xr.DataArray(np.nan, coords={"y": ys, "x": xs}, dims=("y", "x"), name="elevation")
             base_da.rio.set_spatial_dims("x", "y", inplace=True)
             base_da.rio.write_crs("EPSG:4326", inplace=True)
             transform = Affine.translation(west, north) * Affine.scale(lon_res, -lat_res)
@@ -477,6 +484,10 @@ class BathyManager:
 
             if return_source_mask:
                 source_da = xr.full_like(base_da, SOURCE_ID_CANVAS)
+
+        assert base_da is not None
+        if return_source_mask:
+            assert source_da is not None
 
         # Apply helper
         def _ensure_crs(d: xr.DataArray) -> xr.DataArray:
@@ -505,6 +516,7 @@ class BathyManager:
             return SOURCE_ID_GEBCO  # Default
 
         for tier, name, src_da in valid_layers:
+            assert base_da is not None
             try:
                 # Ensure 2D (remove band dimension if present)
                 if "band" in src_da.dims:
@@ -538,15 +550,21 @@ class BathyManager:
                 # Combine:
                 # keep existing valid values in base_da (Higher tiers processed first!)
                 # fill NaNs with new layer
+                assert base_da is not None
                 base_da = base_da.combine_first(reproj_da)
-                base_da.attrs["source"] = (
-                    (base_da.attrs.get("source", "") + f" + {name}") if "source" in base_da.attrs else name
-                )
+
+                if base_da is not None:
+                    base_da.attrs["source"] = (
+                        (base_da.attrs.get("source", "") + f" + {name}")
+                        if "source" in base_da.attrs
+                        else name
+                    )
 
             except Exception as e:
                 logger.warning(f"Failed to fill {name} into grid: {e}")
 
         if return_source_mask:
-            return base_da, source_da
+            # Cast to satisfy strict tuple return type
+            return cast(tuple[xr.DataArray, xr.DataArray | None], (base_da, source_da))
 
-        return base_da
+        return cast(xr.DataArray, base_da)

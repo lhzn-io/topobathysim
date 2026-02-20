@@ -28,7 +28,7 @@ class TestCUDEMFusion(unittest.TestCase):
 
         data = np.full(shape, val, dtype=float)
         coords = {"y": ys, "x": xs}
-        da = xr.DataArray(data, coords=coords, dims=("y", "x"))
+        da = xr.DataArray(data, coords=coords, dims=("y", "x"), name="elevation")
         da.rio.write_crs("EPSG:4326", inplace=True)
         # Nodata needs to be handled carefully. Using NaN is fine, but rioxarray must know.
         da.rio.write_nodata(np.nan, inplace=True)
@@ -89,7 +89,7 @@ class TestCUDEMFusion(unittest.TestCase):
         mock_cudem_da.values = vals
 
         self.manager.cudem = MagicMock()
-        self.manager.cudem.get_grid.return_value = mock_cudem_da
+        self.manager.cudem.fetch_layer.return_value = mock_cudem_da
 
         # Mock BAG to None
         self.manager.bag = None
@@ -102,6 +102,12 @@ class TestCUDEMFusion(unittest.TestCase):
         result = cast(xr.DataArray, self.manager.get_grid(40.0, 40.1, -70.1, -70.0, target_shape=(10, 10)))
 
         self.assertIsNotNone(result)
+
+        if isinstance(result, xr.Dataset):
+            if len(result.data_vars) == 1:
+                result = next(iter(result.data_vars.values()))
+            else:
+                result = result.to_array().squeeze()
 
         # Verify Left Half (CUDEM Valid, BlueTopo Valid) -> Should be ~50.0 (BlueTopo overrides CUDEM)
         # Verify Right Half (CUDEM NaN, BlueTopo Valid) -> Should be ~50.0 (BlueTopo)

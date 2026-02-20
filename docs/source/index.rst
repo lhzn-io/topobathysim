@@ -13,7 +13,9 @@ TopoBathySim
    :maxdepth: 2
    :caption: Contents:
 
-   methodology
+   policy_dsl
+   policy_walkthrough
+   runtime_architecture
    data_sources
    api
    cli_tools

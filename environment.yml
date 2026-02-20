@@ -1,6 +1,7 @@
 name: topobathysim
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
   - python=3.10
   - pip
@@ -8,8 +9,10 @@ dependencies:
   - python-pdal
   - gdal
   - rasterio
+  - geopandas
   - xarray
   - rioxarray
+  - zarr
   - numpy
   - scipy
   - laspy

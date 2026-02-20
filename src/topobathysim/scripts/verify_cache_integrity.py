@@ -1,18 +1,3 @@
-import argparse
-import logging
-import os
-import shutil
-import sys
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
-from pathlib import Path
-
-import laspy
-import rasterio
-import xarray as xr
-from rasterio.errors import RasterioIOError
-
 """
 TopoBathySim Cache Verification Tool
 ====================================
@@ -34,6 +19,21 @@ Usage:
     # 3. Custom Timeout (e.g. locks considered stale after 2 hours)
     python src/topobathysim/scripts/verify_cache_integrity.py --check --lock-timeout 7200
 """
+
+import argparse
+import logging
+import os
+import shutil
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+import laspy
+import rasterio
+import xarray as xr
+from rasterio.errors import RasterioIOError
 
 # Configure basics
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -211,6 +211,9 @@ def scan_provider(provider_name: str, clean: bool = False, lock_timeout: int = 3
 
 
 def main() -> None:
+    """
+    Main entry point for verifying cache integrity.
+    """
     parser = argparse.ArgumentParser(description="Verify and clean TopoBathySim cache.")
     parser.add_argument("--clean", action="store_true", help="Delete corrupt files and stale locks.")
     parser.add_argument("--check", action="store_true", help="Only check integrity (Default).")

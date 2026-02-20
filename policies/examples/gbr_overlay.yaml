@@ -1,0 +1,16 @@
+name: "Great Barrier Reef Reference Fusion"
+description: "A reference implementation fusing GEBCO 2025 (Global ~450m) with GBR100 (High-Res 100m) using metric feathering in a geographic CRS."
+crs: "EPSG:4326"
+
+variables:
+  - name: "elevation"
+    steps:
+      # Base Layer: Global GEBCO 2025
+      - provider: "gebco_2025"
+        operation: "overwrite"
+
+      # Overlay: High-Res GBR100
+      # Uses metric_feather to blend 500m into the base layer
+      - provider: "jcu_gbr100"
+        operation: "metric_feather"
+        blend_distance: 500.0

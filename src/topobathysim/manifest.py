@@ -19,7 +19,7 @@ class OfflineManifest:
     def _ensure_manifest(self) -> None:
         if not self.manifest_path.exists():
             with open(self.manifest_path, "w") as f:
-                json.dump({"items": []}, f)
+                json.dump({"items": [], "searches": []}, f)
 
     def add_item(
         self, collection_id: str, bbox: tuple, asset_href: str, properties: dict | None = None
@@ -120,3 +120,74 @@ class OfflineManifest:
                 fcntl.flock(f, fcntl.LOCK_UN)
         except Exception as e:
             logger.error(f"Failed to remove item from manifest: {e}")
+
+    def record_search(self, collection_id: str, bbox: tuple, found_count: int) -> None:
+        """
+        Records a search result. Useful for Negative Caching (recording 0 results).
+        """
+        # Only record empty searches for now to save space/complexity
+        if found_count > 0:
+            return
+
+        entry = {
+            "collection": collection_id,
+            "bbox": bbox,
+            "found": 0,
+        }
+
+        try:
+            with open(self.manifest_path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                data = json.load(f)
+
+                if "searches" not in data:
+                    data["searches"] = []
+
+                # Naive append for now. Could implement spatially merging bboxes later.
+                # Check for exact duplicate to avoid spam
+                is_duplicate = False
+                for s in data["searches"]:
+                    if s["collection"] == collection_id and s["bbox"] == list(bbox) and s["found"] == 0:
+                        is_duplicate = True
+                        break
+
+                if not is_duplicate:
+                    data["searches"].append(entry)
+                    f.seek(0)
+                    json.dump(data, f, indent=2)
+                    f.truncate()
+
+                fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            logger.error(f"Failed to record search in manifest: {e}")
+
+    def has_no_coverage(self, collection_id: str, search_bbox: tuple) -> bool:
+        """
+        Checks if the search_bbox is strictly contained within a previously searched
+        region that returned 0 results.
+        """
+        try:
+            with open(self.manifest_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                data = json.load(f)
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+            s_minx, s_miny, s_maxx, s_maxy = search_bbox
+
+            for s in data.get("searches", []):
+                if s["collection"] != collection_id:
+                    continue
+                if s["found"] != 0:
+                    continue
+
+                # Check Containment: Is search_bbox INSIDE the empty_bbox?
+                e_minx, e_miny, e_maxx, e_maxy = s["bbox"]
+
+                if s_minx >= e_minx and s_maxx <= e_maxx and s_miny >= e_miny and s_maxy <= e_maxy:
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to check negative cache: {e}")
+            return False

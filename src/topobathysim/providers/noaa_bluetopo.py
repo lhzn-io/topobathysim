@@ -1,3 +1,11 @@
+"""
+NOAA BlueTopo Provider module.
+
+This module implements the provider for NOAA's BlueTopo data set, providing high-resolution
+bathymetry from modern surveys. It handles S3 access, tile resolution via RAT, and Zarr caching.
+"""
+
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -7,15 +15,18 @@ import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
-from shapely.geometry import Point
+from rioxarray.merge import merge_arrays
+from shapely.geometry import Point, box
 
-from .quality import QualityClass
-from .vdatum import VDatumResolver
+from ..quality import QualityClass
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
 
-class NoaaBlueTopoProvider:
+class NoaaBlueTopoProvider(Provider):
     """
     Provider for NOAA BlueTopo High-Resolution Bathymetry.
     Accesses Cloud Optimized GeoTIFFs (COGs) from AWS S3.
@@ -33,6 +44,12 @@ class NoaaBlueTopoProvider:
     )
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+        """
+        Initialize the BlueTopo provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+        """
         self.vdatum = VDatumResolver()
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "noaa_bluetopo"
@@ -41,6 +58,86 @@ class NoaaBlueTopoProvider:
         # Tile Scheme stays in root or moves? Let's move to bluetopo dir too to be clean.
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """
+        Fetch BlueTopo layer for the given bounding box.
+        Resolves, fetches, and merges all intersecting tiles.
+        """
+        west, south, east, north = bbox
+
+        # 1. Resolve Tiles
+        tile_ids = self.resolve_tiles_in_bbox(west, south, east, north)
+        if not tile_ids:
+            raise KeyError(f"No BlueTopo tiles found for bbox {bbox}")
+
+        logger.info(f"BlueTopo fetch: Resolved {len(tile_ids)} tiles for bbox {bbox}")
+
+        # 2. Fetch/Load Tiles
+        das = []
+        for tid in tile_ids:
+            # Pass the query bbox to maximize efficiency if underlying method supports it
+            # defaulting to full tile load via existing method
+            da = self.load_tile_as_da(tid, bbox)
+            if da is not None:
+                das.append(da)
+
+        if not das:
+            raise KeyError(f"Failed to load any BlueTopo data for bbox {bbox}")
+
+        # 3. Merge
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                # Merge arrays
+                merged = merge_arrays(das)
+            except Exception as e:
+                logger.error(f"Failed to merge BlueTopo tiles: {e}")
+                merged = das[0]  # Fallback
+
+        # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds)
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+        except Exception as e:
+            logger.warning(f"BlueTopo Clip failed (no overlap?): {e}")
+            pass
+
+        # Reproject to Requested CRS if needed
+        if crs and merged.rio.crs and merged.rio.crs != crs:
+            try:
+                # logger.info(f"Reprojecting BlueTopo from {merged.rio.crs} to {crs}")
+                merged = merged.rio.reproject(crs)
+            except Exception as e:
+                logger.warning(f"Reprojection failed: {e}")
+
+        # Final Exact Clip to exact bbox (cleanup)
+        with contextlib.suppress(Exception):
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+
+        merged.name = "elevation"
+        logger.debug("Found BlueTopo Coverage")
+        return merged
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the BlueTopo provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA BlueTopo",
+            "citation": "NOAA Office of Coast Survey (2025). BlueTopo™.",
+            "resolution": "Variable (approx 4-8m)",
+            "url": "https://nauticalcharts.noaa.gov/data/bluetopo.html",
+        }
 
     def _resolve_scheme_url(self) -> str:
         """
@@ -146,8 +243,6 @@ class NoaaBlueTopoProvider:
         if self._gdf is None:
             return []
 
-        from shapely.geometry import box
-
         search_box = box(west, south, east, north)
 
         # CRS check
@@ -178,29 +273,16 @@ class NoaaBlueTopoProvider:
         # logger.debug(f"Resolved BlueTopo Tiles: {results}")
         return list(set(results))
 
-    def is_covered(self, lat: float, lon: float) -> bool:
-        return self.resolve_tile_id(lat, lon) is not None
-
-    def _ensure_tile_cached(self, tile_id: str) -> Path | None:
+    def _resolve_tile_url(self, tile_id: str) -> str | None:
         """
-        Ensures the specified tile is present in the cache.
-        Downloads from S3 if necessary.
-        Returns the local path or None if not found/failed.
+        Resolves the HTTPS URL for a given tile ID by checking S3.
+        Used for streaming access.
         """
-        import fcntl
-
         try:
-            # Check if we already have a file matching this tile ID in cache
-            # This is tricky with globs, so we must rely on specific filename logic if possible.
-            # However, BlueTopo filenames are inconsistent in hash/date.
-            # We will search glob first (Fast Path).
-            candidates = list(self.cache_dir.glob(f"*{tile_id}*.tiff"))
-            if candidates:
-                logger.debug(f"BlueTopo Cache Hit: {candidates[0]}")
-                return candidates[0]
+            # Optimize: Check if we can construct URL directly?
+            # BlueTopo filenames are currently variable (dates), so we must glob.
+            # TODO: Add LRU cache / local map to avoid S3 calls on every tile.
 
-            # Not found locally, attempt download
-            # We need to know the S3 Path to construct a local filename and lock it.
             fs = fsspec.filesystem("s3", anon=True)
             search_pattern = f"{self.BUCKET_BASE}/{tile_id}/*.tiff"
             files = fs.glob(search_pattern)
@@ -210,40 +292,22 @@ class NoaaBlueTopoProvider:
                 return None
 
             source_path = files[0]
-            real_filename = Path(source_path).name
-            local_path = self.cache_dir / real_filename
-            lock_path = self.cache_dir / f"{real_filename}.lock"
-            temp_path = self.cache_dir / f".tmp_{real_filename}"
+            # source_path is like "noaa-ocs-nationalbathymetry-pds/BlueTopo/TileX/BlueTopo_TileX_2024.tiff"
 
-            # 2. Acquire Lock
-            with open(lock_path, "w") as lock_file:
-                try:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # Construct HTTPS URL
+            # BUCKET_BASE = "noaa-ocs-nationalbathymetry-pds/BlueTopo"
+            # We want: https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/BlueTopo/TileX/BlueTopo_TileX_2024.tiff
 
-                    # 3. Double Check
-                    if local_path.exists():
-                        logger.info(f"BlueTopo Cache Hit (After Lock): {local_path}")
-                        return local_path
+            # Split bucket from key
+            parts = source_path.split("/", 1)
+            if len(parts) < 2:
+                return None
+            key = parts[1]
 
-                    logger.info(f"Downloading {source_path} to {local_path}...")
-                    fs.get(source_path, str(temp_path))
-
-                    # Atomic Rename
-                    Path(temp_path).rename(local_path)
-
-                    # Clean up lock on success
-                    lock_path.unlink(missing_ok=True)
-
-                    return local_path
-
-                finally:
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
-                    # lock_file is closed automatically by 'with'
+            return f"https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/{key}"
 
         except Exception as e:
-            logger.error(f"BlueTopo Cache Error: {e}")
-            if "temp_path" in locals() and Path(temp_path).exists():
-                Path(temp_path).unlink()
+            logger.error(f"BlueTopo URL Resolve Error: {e}")
             return None
 
     def fetch_elevation(self, lat: float, lon: float) -> float | None:
@@ -255,47 +319,66 @@ class NoaaBlueTopoProvider:
             return None
 
         try:
-            local_path = self._ensure_tile_cached(tile_id)
-            if not local_path:
+            url = self._resolve_tile_url(tile_id)
+            if not url:
                 return None
 
-            # Open with rioxarray
-            da_raw = rioxarray.open_rasterio(local_path)
-            from typing import cast
+            # Stream with rioxarray
+            # Use chunks=True (or dict) to enable dask streaming, but for single point we want
+            # direct window read if possible.
+            # rioxarray.open_rasterio loads lazily.
+            # .sel() on a lazy array might trigger a download of the chunk.
 
-            if isinstance(da_raw, list):
-                da = cast(xr.DataArray, da_raw[0])
-            elif isinstance(da_raw, xr.Dataset):
-                da = cast(xr.DataArray, da_raw.to_array().isel(variable=0))
-            else:
-                da = cast(xr.DataArray, da_raw)
+            # Note: For single point access, standard requests/vsicurl is best.
+            # rioxarray might read metadata footer first.
 
-            # Sample
-            sample_x, sample_y = lon, lat
-            if da.rio.crs and da.rio.crs != "EPSG:4326":
-                # Project point to raster CRS
-                from pyproj import Transformer
+            with rioxarray.open_rasterio(url) as da_raw:  # type: ignore
+                from typing import cast
 
-                transformer = Transformer.from_crs("EPSG:4326", da.rio.crs, always_xy=True)
-                sample_x, sample_y = transformer.transform(lon, lat)
+                if isinstance(da_raw, list):
+                    da = cast(xr.DataArray, da_raw[0])
+                elif isinstance(da_raw, xr.Dataset):
+                    da = cast(xr.DataArray, da_raw.to_array().isel(variable=0))
+                else:
+                    da = cast(xr.DataArray, da_raw)
 
-            val = da.sel(x=sample_x, y=sample_y, method="nearest")
-            if "band" in val.dims or val.size > 1:
-                val = val.isel(band=0)
-            val = val.values.item()
+                # Reproject point to raster CRS
+                sample_x, sample_y = lon, lat
+                if da.rio.crs and da.rio.crs != "EPSG:4326":
+                    from pyproj import Transformer
 
-            if val == da.rio.nodata:
-                return None
+                    transformer = Transformer.from_crs("EPSG:4326", da.rio.crs, always_xy=True)
+                    sample_x, sample_y = transformer.transform(lon, lat)
 
-            # VDatum
-            offset = self.vdatum.get_navd88_to_lmsl_offset(lat, lon)
-            return float(val) - offset
+                # Sample nearest
+                val = da.sel(x=sample_x, y=sample_y, method="nearest")
+                if "band" in val.dims or val.size > 1:
+                    val = val.isel(band=0)
+
+                val_item = val.values.item()
+
+                if val_item == da.rio.nodata:
+                    return None
+
+                # VDatum
+                offset = self.vdatum.get_navd88_to_lmsl_offset(lat, lon)
+                return float(val_item) - offset
 
         except Exception as e:
             logger.error(f"BlueTopo Fetch Error: {e}", exc_info=True)
             return None
 
+    def is_covered(self, lat: float, lon: float) -> bool:
+        """
+        Check if the coordinate is covered by a BlueTopo tile.
+        """
+        return self.resolve_tile_id(lat, lon) is not None
+
     def get_quality_tier(self, lat: float, lon: float) -> QualityClass:
+        """
+        Return the quality tier for the given coordinate.
+        Returns QualityClass.DIRECT if covered, else UNKNOWN.
+        """
         if self.is_covered(lat, lon):
             return QualityClass.DIRECT
         return QualityClass.UNKNOWN
@@ -303,24 +386,20 @@ class NoaaBlueTopoProvider:
     def load_tile_as_da(self, tile_id: str, bbox: tuple[float, float, float, float]) -> "xr.DataArray | None":
         """
         Loads the cached tile and clips to bbox (west, south, east, north).
-        Downloads if missing.
+        Uses Streaming Access (VSICURL) to avoid full download.
         Applies caching to Zarr format for faster subsequent reads.
         """
-        path = self._ensure_tile_cached(tile_id)
-        if not path:
-            return None
+        # 1. Check Zarr Cache First (Fastest)
+        zarr_name = f"{tile_id}.zarr"
+        zarr_dir = self.cache_dir / "zarr"
+        zarr_path = zarr_dir / zarr_name
 
-        zarr_dir = path.parent / "zarr"
-        zarr_path = zarr_dir / path.with_suffix(".zarr").name
-
-        # 1. Zarr Cache Hit
         if zarr_path.exists():
             try:
                 ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
-                logger.info(f"BlueTopo Zarr Cache Hit: {zarr_path.name}")
+                logger.debug(f"BlueTopo Zarr Cache Hit: {zarr_name}")
                 if "elevation" in ds:
                     return ds["elevation"]
-                # Fallback
                 var_name = next(iter(ds.data_vars))
                 return ds[var_name]
             except Exception as e:
@@ -330,21 +409,18 @@ class NoaaBlueTopoProvider:
                 if zarr_path.exists():
                     shutil.rmtree(zarr_path)
 
-        # 2. Cache Miss - Acquire Lock
-        from filelock import FileLock
+        # 2. Resolve Remote URL (Cache Miss)
+        http_url = self._resolve_tile_url(tile_id)
+        if not http_url:
+            return None
 
-        lock_path = zarr_path.with_suffix(".zarr.lock")
-        with FileLock(lock_path):
-            # Double check if another process created it while we waited
-            if zarr_path.exists():
-                logger.info(f"BlueTopo Zarr Cache Hit (after lock): {zarr_path.name}")
-                ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
-                return ds["elevation"] if "elevation" in ds else ds[next(iter(ds.data_vars))]
+        logger.info(f"Streaming BlueTopo Asset: {http_url}")
 
-            logger.info(f"BlueTopo Zarr Cache Miss: {zarr_path.name}")
+        # 3. Stream & Cache to Zarr
+        try:
+            # Open Streaming
+            da_raw = rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048})
 
-            # 3. Load Raw
-            da_raw = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})
             da: xr.DataArray
             from typing import cast
 
@@ -358,29 +434,33 @@ class NoaaBlueTopoProvider:
             if "band" in da.dims:
                 da = da.isel(band=0).drop_vars("band")
 
-            # 4. Cache to Zarr (Optimized Format)
-            try:
-                # Ensure name
-                da.name = "elevation"
+            da = cast(xr.DataArray, da)
+            da.name = "elevation"
 
-                # Check bounds validity
+            # Cache to Zarr
+            # Lock to prevent race conditions
+            from filelock import FileLock
+
+            lock_path = zarr_path.with_suffix(".zarr.lock")
+
+            with FileLock(lock_path):
+                if zarr_path.exists():
+                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto")["elevation"]
+
                 if da.size > 0:
-                    # 1024 chunks
                     if "y" in da.dims and "x" in da.dims:
                         da = da.chunk({"y": 1024, "x": 1024})
 
-                    logger.info(f"Caching BlueTopo tile to Zarr: {zarr_path.name}")
+                    logger.info(f"Caching BlueTopo tile to Zarr: {zarr_name}")
                     da.to_zarr(zarr_path, mode="w", consolidated=True)
-                    logger.info(f"BlueTopo Zarr Cache Created: {zarr_path.name}")
 
-                    # Re-open
                     return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
-            except Exception as e:
-                logger.error(f"Failed to write BlueTopo Zarr: {e}")
+        except Exception as e:
+            logger.error(f"Failed to stream/cache BlueTopo tile {tile_id}: {e}")
+            return None
 
-            # Clip - handled by consumer, but returned DA is full tile
-            return da
+        return None
 
     def get_tile_id(self, lat: float, lon: float) -> str | None:
         """
@@ -403,9 +483,10 @@ class NoaaBlueTopoProvider:
         return str(row.get("tile_id", row.get("tile")))
 
     def get_source_survey_id(self, lat: float, lon: float) -> str | None:
-        # Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
-        # Strategy Cascade: Embedded RAT -> Sidecar RAT -> HSMDB API.
-
+        """
+        Identifies the Source Survey ID (e.g., 'H13385') at the given coordinate.
+        Strategy Cascade: Embedded RAT -> Sidecar RAT -> HSMDB API.
+        """
         # 1. Tile Resolution
         tile_id = self.get_tile_id(lat, lon)
         if not tile_id:
@@ -413,13 +494,13 @@ class NoaaBlueTopoProvider:
             return self._resolve_from_hsmdb_api(lat, lon)
 
         # 2. Local File Inspection (Embedded RAT + Pixel Value)
-        local_path = self._ensure_tile_cached(tile_id)
+        url = self._resolve_tile_url(tile_id)
         pixel_val: int | None = None
 
-        if local_path:
+        if url:
             try:
                 # Use rioxarray/rasterio as osgeo.gdal is unreliable in this env
-                with rioxarray.open_rasterio(local_path, masked=True) as da:  # type: ignore
+                with rioxarray.open_rasterio(url, masked=True) as da:  # type: ignore
                     # Reproject point to tile CRS
                     import numpy as np
                     from pyproj import Transformer
@@ -483,7 +564,9 @@ class NoaaBlueTopoProvider:
         return self._resolve_from_hsmdb_api(lat, lon)
 
     def _geo_to_pixel(self, ds: Any, lat: float, lon: float) -> tuple[int | None, int | None]:
-        # Helper to transform lat/lon to pixel coordinates.
+        """
+        Helper to transform lat/lon to pixel coordinates.
+        """
         try:
             from osgeo import gdal, osr
 
@@ -519,7 +602,9 @@ class NoaaBlueTopoProvider:
         return None, None
 
     def _lookup_rat(self, rat: Any, pixel_val: int) -> str | None:
-        # Helper to query a GDAL RAT.
+        """
+        Helper to query a GDAL RAT.
+        """
         for i in range(rat.GetColumnCount()):
             col_name = rat.GetNameOfCol(i)
             if (
@@ -533,7 +618,9 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_sidecar_rat(self, tile_id: str, pixel_val: int) -> str | None:
-        # Downloads and parses the sidecar RAT linked in the GPKG.
+        """
+        Downloads and parses the sidecar RAT linked in the GPKG.
+        """
         self._ensure_scheme_loaded()
         if self._gdf is None:
             return None
@@ -588,7 +675,9 @@ class NoaaBlueTopoProvider:
             logger.warning(f"Sidecar parsing failed: {e}")
 
     def _parse_aux_xml_rat(self, xml_path: Path, pixel_val: int) -> str | None:
-        # Parses GDAL PAM XML to find Survey ID.
+        """
+        Parses GDAL PAM XML to find Survey ID.
+        """
         import xml.etree.ElementTree as Et
 
         try:
@@ -649,7 +738,9 @@ class NoaaBlueTopoProvider:
         return None
 
     def _resolve_from_hsmdb_api(self, lat: float, lon: float) -> str | None:
-        # Tertiary fallback: Query NCEI HSMDB API.
+        """
+        Tertiary fallback: Query NCEI HSMDB API.
+        """
         try:
             from pyproj import Transformer
 
@@ -681,3 +772,7 @@ class NoaaBlueTopoProvider:
         except Exception as e:
             logger.warning(f"HSMDB API Query failed: {e}")
         return None
+
+
+# Register the provider
+registry.register(Path(__file__).stem, NoaaBlueTopoProvider)

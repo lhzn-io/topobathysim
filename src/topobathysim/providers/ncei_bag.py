@@ -1,16 +1,29 @@
+"""
+NOAA NCEI BAG Provider module.
+
+This module implements the provider for accessing Bathymetric Attributed Grid (BAG) files
+from NOAA's National Centers for Environmental Information (NCEI). It handles discovery,
+downloading, caching, and reading of BAG files.
+"""
+
+import contextlib
 import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import numpy as np  # Added numpy import
 import requests  # type: ignore
 import xarray as xr
 from filelock import FileLock
+from rioxarray.merge import merge_arrays
 
-from .vdatum import VDatumResolver
+from ..vdatum import VDatumResolver
+from .base import Provider
+from .registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +86,27 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
                 if isinstance(da_raw, list):
                     da = cast(xr.DataArray, da_raw[0])
                 elif isinstance(da_raw, xr.Dataset):
-                    da = da_raw.to_array().isel(variable=0)
+                    da = cast(xr.DataArray, da_raw.to_array().isel(variable=0))
                 else:
                     da = cast(xr.DataArray, da_raw)
 
             # BAGs usually have 'elevation' and 'uncertainty'.
             # Rasterio usually reads band 1 as elevation.
             elev = da.isel(band=0).drop_vars("band")
+
+            # MASK SUSPICIOUS VALUES
+            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
+            # Removed hardcoded -99.0 mask to avoid deleting valid deep ocean data.
+
+            # --- CLEANING FILTER (Deviation from Median) ---
+            # Remove single-pixel spikes (common in sonar edges)
+            # Default to fairly aggressive 80m threshold if not specified,
+            # to target the specific "deep sea" artifact issue.
+            # Ideally this is configurable via kwargs, but _read_bag_cached is cached
+            # and doesn't accept dynamic kwargs easily without breaking cache key.
+            # We'll implement a safe default here, or move this logic to `fetch_layer`
+            # where we have the policy.
+            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
 
             # Check for Ellipsoid vs MLLW
             filename = local_path.name
@@ -141,6 +168,69 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     except Exception as e:
         logger.error(f"Error reading BAG {local_path}: {e}")
         return None
+
+
+def clean_data_deviation(da: xr.DataArray, threshold: float = 50.0) -> xr.DataArray:
+    """
+    Apply a 'Deviation from Median' filter to remove spikes.
+    Calculates median of 3x3 neighborhood. If abs(pixel - median) > threshold, mask as NaN.
+
+    Args:
+        da: Input DataArray (elevation)
+        threshold: Max allowed deviation from local median (meters)
+
+    Returns:
+        xr.DataArray: Filtered data
+    """
+    try:
+        from scipy.ndimage import median_filter
+
+        def _filter_block(block: Any) -> Any:
+            # 3x3 median
+            # Only apply if block has data
+            if block.size == 0:
+                return block
+
+            # Handle NaNs? median_filter might propagate them or ignore depending on implementation.
+            # standard median_filter doesn't handle NaNs well (results in NaN).
+            # We might want generic_filter or a nan-safe version, but for speed standard is used.
+            # For now, let's assume we are targeting massive spikes in valid data strings.
+            med = median_filter(block, size=3)
+            diff = np.abs(block - med)
+
+            # Mask out spikes (replace with NaN)
+            # return np.where(diff > threshold, np.nan, block)
+            # CAREFUL: If block is integer, np.nan converts to int (bad).
+            # Ensure float.
+            if not np.issubdtype(block.dtype, np.floating):
+                block = block.astype(np.float32)
+
+            return np.where(diff > threshold, np.nan, block)
+
+        # Check if Dask
+        if da.chunks is not None:
+            # It is a dask array. Access .data to get the dask array object
+            # dask.array.map_overlap
+
+            # We must re-wrap the result in a DataArray
+            # da.data is the dask array
+            cleaned_dask = da.data.map_overlap(
+                _filter_block,
+                depth=1,
+                boundary="reflect",
+                dtype=da.dtype,  # Maintain type (floats)
+            )
+
+            # Return new DataArray with same coords
+            return xr.DataArray(cleaned_dask, coords=da.coords, dims=da.dims, attrs=da.attrs)
+        else:
+            # Numpy array - Direct application
+            cleaned_np = _filter_block(da.values)
+            return xr.DataArray(cleaned_np, coords=da.coords, dims=da.dims, attrs=da.attrs)
+
+    except Exception as e:
+        logger.warning(f"Failed to apply cleaning filter: {e}")
+        return da
 
 
 @contextmanager
@@ -497,16 +587,137 @@ class BAGDiscovery:
         return found_urls
 
 
-class BAGProvider:
+class BAGProvider(Provider):
     """
     Manages downloading, caching, and reading of NOAA BAG files.
     """
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+        """
+        Initialize the BAG provider.
+
+        Args:
+            cache_dir: Directory to store cached data files.
+        """
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_bag"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.vdatum = VDatumResolver()
+
+    def fetch_layer(
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """
+        Fetches and merges BAG files intersecting the bounding box.
+        """
+        west, south, east, north = bbox
+
+        # 1. Discover BAGs
+        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
+        if not urls:
+            raise KeyError(f"No BAG files found for bbox {bbox}")
+
+        logger.info(f"BAG fetch: Found {len(urls)} files to process.")
+
+        # 2. Fetch/Load Each
+        das = []
+        for url in urls:
+            try:
+                # Load (Lazy/Zarr if available)
+                da = self.fetch_bag(survey_id="unknown_bbox_fetch", download_url=url)
+                if da is None:
+                    continue
+
+                # OPTIMIZATION: Clip EARLY (before reprojection/merge)
+                # This drastically reduces memory usage for large surveys
+                try:
+                    # Clip using EPSG:4326 bounds. rioxarray handles transformations.
+                    da = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+                except Exception as e:
+                    # rioxarray.exceptions.NoDataInBounds (or similar) - Skip this tile
+                    logger.debug(f"BAG tile empty after clip (url={url}): {e}")
+                    continue
+
+                if da.size == 0:
+                    continue
+
+                # --- CLEANING / FILTERING ---
+                # Check for filter config in kwargs
+                filter_cfg = kwargs.get("filter", {})
+
+                # 1. Deviation/Spike Removal (Change-based Cleanse)
+                # Defaults to None (disabled) unless specified, OR we can default it on?
+                # Check for 'max_depth_change' or 'max_deviation' keys for uncertainty.
+                # Logic: If 'max_depth_change' is present use it.
+                max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
+
+                if max_dev:
+                    logger.info(f"Applying BAG Deviation Filter (Threshold={max_dev}m) to {url}")
+                    da = clean_data_deviation(da, threshold=float(max_dev))
+
+                # Reproject individual chunk to target CRS
+                if crs and da.rio.crs and da.rio.crs != crs:
+                    try:
+                        # Optional: Pass resolution if provided to enforce downsampling early
+                        reproj_knn = {}
+                        # If target is projected (meters) and we have input_res (meters)
+                        if resolution and "EPSG:4326" not in crs:
+                            reproj_knn["resolution"] = resolution
+
+                        da = da.rio.reproject(crs, **reproj_knn)
+                    except Exception as e:
+                        logger.warning(f"Reprojection failed for BAG segment: {e}")
+                        continue
+
+                das.append(da)
+
+            except Exception as e:
+                logger.warning(f"Failed to process BAG {url}: {e}")
+
+        if not das:
+            # It is possible all BAGs were clipped out or failed
+            # This is not necessarily an error, just no coverage in this detailed window
+            # Return empty or raise?
+            # Runtime expects an array. Raise KeyError to trigger 'continue' in runtime loop.
+            raise KeyError(f"No BAG data intersects bbox {bbox} after clipping")
+
+        # 3. Merge
+        if len(das) == 1:
+            merged = das[0]
+        else:
+            try:
+                # Sort by resolution (finest first) if possible
+                merged = merge_arrays(das)
+            except Exception as e:
+                logger.error(f"Failed to merge BAGs: {e}")
+                merged = das[0]
+
+        # 4. Final Clip (Cleanup)
+        # Ensure exact bounds (reprojection might have introduced slight over-run)
+        with contextlib.suppress(Exception):
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+
+        merged.name = "elevation"
+        logger.debug("Found NCEI BAG Coverage")
+        return cast(xr.DataArray, merged)
+
+    def get_metadata(self) -> dict[str, Any]:
+        """
+        Return metadata for the BAG provider.
+
+        Returns:
+            Dictionary containing provider name, citation, resolution, and URL.
+        """
+        return {
+            "name": "NOAA NCEI BAG (Bathymetric Attributed Grid)",
+            "citation": "NOAA National Centers for Environmental Information.",
+            "resolution": "High (Variable, typically 0.5m - 4m)",
+            "url": "https://www.ncei.noaa.gov/products/bathymetry",
+        }
 
     def fetch_bag(self, survey_id: str, download_url: str | list[str] | None = None) -> xr.DataArray | None:
         """
@@ -552,8 +763,7 @@ class BAGProvider:
             return cast(xr.DataArray, merged)
         except Exception as e:
             logger.error(f"Failed to merge BAGs for {survey_id}: {e}")
-            # Fallback: return the largest one? or just the first?
-            # Let's return the first one as best effort
+            # Return the first one as best effort
             return loaded_arrays[0]
 
     def _ensure_downloaded(self, url: str) -> Path | None:
@@ -604,6 +814,9 @@ class BAGProvider:
 
     def _read_bag(self, local_path: Path) -> xr.DataArray | None:
         """wrapper to call standalone cached function."""
-        # Note: B019 warns about lru_cache on method.
-        # We rely on the standalone function's cache.
+        # Use standalone function to leverage python LRU cache safely outside class methods.
         return _read_bag_cached(local_path)
+
+
+# Register the provider
+registry.register(Path(__file__).stem, BAGProvider)
