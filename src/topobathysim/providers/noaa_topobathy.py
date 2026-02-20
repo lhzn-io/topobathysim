@@ -68,73 +68,104 @@ class NoaaTopobathyProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
-        Fetch NOAA Topobathy data for the given bounding box.
-        Auto-selects the best project based on overlap and recency.
+        Fetches and merges Topobathy data from ALL overlapping projects.
+        Prioritizes better datasets (Name/Datum/Recency) by layering them on top.
         """
         west, south, east, north = bbox
 
-        # 1. Identify Project
-        pid = self.find_project_by_box(west, south, east, north)
-        if not pid:
-            raise KeyError(f"No NOAA Topobathy project found for bbox {bbox}")
+        # Extract filter from kwargs
+        filter_criteria = kwargs.get("filter")
 
-        self.set_active_project(pid)
-        if not self._active_project_id:
-            raise KeyError(f"Failed to activate project {pid}")
+        # 1. Identify Projects
+        # Returns sorted list: [Best, ..., Worst]
+        pids = self.find_projects_by_box(west, south, east, north, filter_criteria=filter_criteria)
+        if not pids:
+            # Try to report what happened
+            raise KeyError(f"No NOAA Topobathy projects found for bbox {bbox}")
 
-        # 2. Identify Tiles
-        tiles = self.resolve_tiles_in_bbox(west, south, east, north)
-        if not tiles:
-            raise KeyError(f"No tiles found in project {pid} for bbox {bbox}")
+        logger.info(f"Topobathy fetch: Found {len(pids)} overlapping projects. Processing...")
 
-        logger.info(f"Topobathy fetch: Found {len(tiles)} tiles in project {pid}")
+        project_layers = []
 
-        # 3. Fetch/Load Tiles
-        das = []
-        for t in tiles:
-            da = self.fetch_tile(t)
-            if da is not None:
-                # Pre-clip to save memory?
-                try:
-                    clipped = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=da.rio.crs)
-                    if clipped.size > 0:
-                        das.append(clipped)
-                except Exception:
-                    pass
-
-        if not das:
-            raise KeyError(f"Failed to load valid Topobathy data for bbox {bbox}")
-
-        # 4. Merge
-        if len(das) == 1:
-            merged = das[0]
-        else:
+        # 2. Process Each Project
+        for pid in pids:
             try:
-                merged = merge_arrays(das)
-                raise KeyError("Failed to load or merge NOAA Topobathy data")
+                self.set_active_project(pid)
+
+                # Resolve Tiles
+                tiles = self.resolve_tiles_in_bbox(west, south, east, north)
+                if not tiles:
+                    continue
+
+                # Fetch & Merge Tiles for this Project
+                project_das = []
+                for t in tiles:
+                    try:
+                        # Optimization: Pass bbox to fetch_tile to enable "Clip-then-Cache"
+                        da = self.fetch_tile(t, bbox=bbox)
+                        if da is None:
+                            continue
+
+                        # Optimization: Clip Early
+                        try:
+                            # Use 4326 clip since index is 4326
+                            da = da.rio.clip_box(
+                                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                            )
+                        except Exception:
+                            # Empty after clip
+                            continue
+
+                        if da.size == 0:
+                            continue
+
+                        # Reproject if needed
+                        if crs and da.rio.crs and da.rio.crs != crs:
+                            try:
+                                reproj_knn = {}
+                                if resolution and "EPSG:4326" not in crs:
+                                    reproj_knn["resolution"] = resolution
+                                da = da.rio.reproject(crs, **reproj_knn)
+                            except Exception as e:
+                                logger.warning(f"Reprojection failed for tile {t}: {e}")
+                                continue
+
+                        project_das.append(da)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch tile {t}: {e}")
+
+                if project_das:
+                    # Merge tiles for this project
+                    # Default is last-on-top, but for a single project tiles shouldn't overlap much
+                    try:
+                        p_merged = merge_arrays(project_das)
+                        project_layers.append(p_merged)
+                    except Exception as e:
+                        logger.warning(f"Failed to merge tiles for project {pid}: {e}")
+
             except Exception as e:
-                logger.error(f"Merge error: {e}")
-                merged = das[0]
+                logger.warning(f"Failed to process project {pid}: {e}")
 
-        # 5. Reproject/Clip
-        if crs and merged.rio.crs and merged.rio.crs != crs:
-            try:
-                logger.info(f"Reprojecting Topobathy from {merged.rio.crs} to {crs}")
-                merged = merged.rio.reproject(crs)
-            except Exception as e:
-                logger.warning(f"Reprojection failed: {e}")
+        if not project_layers:
+            raise KeyError(f"No valid data returned from {len(pids)} projects for bbox {bbox}")
 
-        try:
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
-        except Exception as e:
-            logger.warning(f"Final clip failed: {e}")
+        # 3. Merge Projects
+        # project_layers is ordered [Best, ..., Worst]
+        # merge_arrays puts the LAST element on top.
+        # We want Best on top, so we must pass [Worst, ..., Best]
+        # Reverse the list.
+        final_merged = merge_arrays(project_layers[::-1])
 
-        merged.name = "elevation"
-        merged.attrs["source_provider"] = "noaa_topobathy"
-        merged.attrs["project_id"] = pid
-        return cast(xr.DataArray, merged)
+        # 4. Final Clip
+        with contextlib.suppress(Exception):
+            final_merged = final_merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
+
+        final_merged.name = "elevation"
+        logger.debug("Found NOAA Topobathy Coverage")
+        return cast(xr.DataArray, final_merged)
 
     def get_metadata(self) -> dict[str, Any]:
         """
@@ -211,7 +242,7 @@ class NoaaTopobathyProvider(Provider):
                         new_projects[pid] = folder_name
 
                 # 2. Find InPort Link
-                if current_folder:
+                if current_folder and "metadata" in line:
                     pid = current_folder[0]
                     # Check for metadata link in the SAME line
                     pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
@@ -266,15 +297,24 @@ class NoaaTopobathyProvider(Provider):
             return None
 
         # Ensure it's the XML endpoint
-        if not info_url.endswith("/xml"):
-            info_url = info_url.rstrip("/")
-            if not info_url.endswith("/xml"):
-                info_url = f"{info_url}/xml"
+        # We prefer the 'inport-xml' format (full metadata) over 'xml' (catalog item)
+        if not info_url.endswith("/inport-xml"):
+            # If it currently ends in /xml, strip it
+            if info_url.endswith("/xml"):
+                info_url = info_url[:-4]
+
+            info_url = f"{info_url}/inport-xml"
 
         # Extract InPort ID for cache filename
         try:
             parts = info_url.split("/")
-            inport_id = parts[parts.index("xml") - 1] if "xml" in parts else parts[-1]
+            # Handle /xml and /inport-xml
+            if "inport-xml" in parts:
+                inport_id = parts[parts.index("inport-xml") - 1]
+            elif "xml" in parts:
+                inport_id = parts[parts.index("xml") - 1]
+            else:
+                inport_id = parts[-1]
         except Exception:
             inport_id = f"pid_{project_id}"
 
@@ -309,33 +349,188 @@ class NoaaTopobathyProvider(Provider):
             tree = xml.etree.ElementTree.parse(xml_path)
             root = tree.getroot()
 
-            meta = {"vertical_datum": "Unknown", "start_date": None, "end_date": None, "sensor_name": None}
+            meta: dict[str, Any] = {
+                "vertical_datum": "Unknown",
+                "start_date": None,
+                "end_date": None,
+                "sensor_name": None,
+                "is_topobathy": False,
+            }
 
             # 1. Vertical Datum
-            for elem in root.iter():
-                if ("altdatum" in elem.tag or "vdatum" in elem.tag) and elem.text:
-                    txt = elem.text.lower()
-                    if "navd88" in txt or "88" in txt:
-                        meta["vertical_datum"] = "NAVD88"
-                    elif "geoid18" in txt:
-                        meta["vertical_datum"] = "NAVD88 (Geoid18)"
-                    elif "ellipsoid" in txt:
-                        meta["vertical_datum"] = "Ellipsoid"
+            # Strategy A: Structured <reference-system>
+            for elem in root.iter("reference-system"):
+                for crs in elem.iter("coordinate-reference-system"):
+                    # Check if it's Vertical
+                    is_vertical = False
+                    for child in crs:
+                        if "crs-type" in child.tag and child.text == "Vertical":
+                            is_vertical = True
+                            break
+
+                    if is_vertical:
+                        datum_name = None
+                        epsg_name = None
+
+                        for child in crs:
+                            if "datum-name" in child.tag:
+                                datum_name = child.text
+                            if "epsg-name" in child.tag:
+                                epsg_name = child.text
+
+                        if datum_name:
+                            meta["vertical_datum"] = datum_name
+                        elif epsg_name:
+                            meta["vertical_datum"] = epsg_name
+
+                        # Normalize common names
+                        if meta["vertical_datum"]:
+                            v = meta["vertical_datum"].lower()
+                            if "navd88" in v or "north american vertical datum 1988" in v:
+                                meta["vertical_datum"] = "NAVD88"
+                            elif "geoid18" in v and "navd88" in v:
+                                meta["vertical_datum"] = "NAVD88 (Geoid18)"
+
+            # Strategy B: Fallback to text search if still Unknown
+            if meta["vertical_datum"] == "Unknown":
+                for elem in root.iter():
+                    if ("altdatum" in elem.tag or "vdatum" in elem.tag) and elem.text:
+                        txt = elem.text.lower()
+                        if "navd88" in txt or "88" in txt:
+                            meta["vertical_datum"] = "NAVD88"
+                        elif "geoid18" in txt:
+                            meta["vertical_datum"] = "NAVD88 (Geoid18)"
+                        elif "ellipsoid" in txt:
+                            meta["vertical_datum"] = "Ellipsoid"
 
             # 2. Time Period
-            # <timeinfo> -> <rngdates> -> <begdate> / <enddate>
-            beg_dates = []
-            end_dates = []
-            for elem in root.iter():
-                if "begdate" in elem.tag and elem.text:
-                    beg_dates.append(elem.text)
-                if "enddate" in elem.tag and elem.text:
-                    end_dates.append(elem.text)
+            # Strategy:
+            # A) Check <extents> for detailed time frames (aggregate min/max)
+            # B) Check top-level <time-period> (less common/detailed)
+            # C) Fallback to Name Regex (handled in find_projects_by_box, but we could do it here too)
 
-            if beg_dates:
-                meta["start_date"] = sorted(beg_dates)[0]
-            if end_dates:
-                meta["end_date"] = sorted(end_dates)[-1]
+            starts = []
+            ends = []
+
+            # A) Check <extents>
+            # (Loop removed as it was empty/placeholder)
+
+            # Robust Iteration for Extents > TimeFrames
+            for extent in root.iter("extent"):
+                for tf in extent.iter("time-frame"):
+                    # find child regardless of NS
+                    for child in tf:
+                        if "start-date-time" in child.tag and child.text:
+                            starts.append(child.text[:10])
+                        if "end-date-time" in child.tag and child.text:
+                            ends.append(child.text[:10])
+
+            # B) Check top-level <time-period> if extents empty
+            if not starts:
+                for elem in root.iter():
+                    if "begdate" in elem.tag and elem.text:
+                        starts.append(elem.text)
+                    if "enddate" in elem.tag and elem.text:
+                        ends.append(elem.text)
+
+            if starts:
+                meta["start_date"] = min(starts)
+            if ends:
+                meta["end_date"] = max(ends)
+
+            # 3. Resolution (New)
+            # Strategy A: Structured Tag
+            res_val = None
+            res_unit = None
+            for elem in root.iter():
+                if "spatial-resolution" in elem.tag:
+                    for child in elem:
+                        if "horizontal-distance" in child.tag and child.text:
+                            with contextlib.suppress(ValueError):
+                                res_val = float(child.text)
+                        if "horizontal-distance-units" in child.tag and child.text:
+                            res_unit = child.text.lower()
+
+            if res_val is not None:
+                # Normalize to meters
+                if res_unit and "meter" in res_unit:
+                    meta["resolution_meters"] = res_val
+                elif res_unit and "foot" in res_unit:
+                    meta["resolution_meters"] = res_val * 0.3048
+                elif res_unit and "degree" in res_unit:
+                    # Rough conversion? 1 deg ~ 111km.
+                    # Usually these are small fractions like 0.00001
+                    meta["resolution_meters"] = res_val * 111320.0
+                else:
+                    # Assume meters if unit missing but value exists? check value range?
+                    # Safer to just assume meters for lidar DEMs.
+                    meta["resolution_meters"] = res_val
+
+            # Strategy B: Abstract Regex Fallback
+            if meta.get("resolution_meters") is None:
+                # Concatenate all text content to search (abstract, supplemental-info, lineage, etc.)
+                # Limiting to fields likely to contain resolution to avoid false positives (e.g. "500m tiles")
+                search_text = ""
+                for elem in root.iter():
+                    if (
+                        elem.tag
+                        in [
+                            "abstract",
+                            "supplemental-information",
+                            "lineage",
+                            "purpose",
+                            "description",
+                        ]
+                        and elem.text
+                    ):
+                        search_text += elem.text + " "
+
+                if search_text:
+                    import re
+
+                    # Patterns:
+                    # 1. "1m pixel resolution" / "0.5 meter resolution"
+                    # 2. "1m bare earth"
+                    # 3. "1m resolution"
+                    pattern = (
+                        r"(\d+(?:\.\d+)?)\s*(?:m|meter|meters)\s+(?:Pixel\s+)?"
+                        r"(?:Bare\s+Earth\s+)?(?:Grid\s+)?(?:Resolution)"
+                    )
+                    match = re.search(pattern, search_text, re.IGNORECASE)
+
+                    if not match:
+                        # Fallback for "1m bare earth grids"
+                        match = re.search(
+                            r"(\d+(?:\.\d+)?)\s*(?:m|meter|meters)\s+bare\s+earth", search_text, re.IGNORECASE
+                        )
+
+                    if match:
+                        with contextlib.suppress(ValueError):
+                            meta["resolution_meters"] = float(match.group(1))
+
+            # 3. Topobathy Classification
+            # Default to False unless we find positive evidence
+            # Keywords: "topobathy", "bathymetr", "submerged"
+            # Negative Keywords: "hydro flattened" (common in topo), but "hydro" might be too broad.
+            is_topobathy = False
+
+            # Check Title
+            title = root.find(".//title")
+            if title is not None and title.text:
+                t = title.text.lower()
+                if "topobathy" in t or "bathymetr" in t:
+                    is_topobathy = True
+
+            # If not in title, check abstract/keywords
+            if not is_topobathy:
+                for elem in root.iter():
+                    if elem.tag in ("abstract", "purpose", "keyword") and elem.text:
+                        txt = elem.text.lower()
+                        if "topobathy" in txt or "bathymetr" in txt or "submerged" in txt:
+                            is_topobathy = True
+                            break
+
+            meta["is_topobathy"] = is_topobathy
 
             return meta
 
@@ -393,13 +588,21 @@ class NoaaTopobathyProvider(Provider):
                 logger.error(f"Failed to load spatial index {index_path}: {e}")
                 self._spatial_index = None
 
-    def find_project_by_box(self, west: float, south: float, east: float, north: float) -> str | None:
+    def find_projects_by_box(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        filter_criteria: dict[str, Any] | None = None,
+    ) -> list[str]:
         """
-        Identifies the best project ID for the bounding box using the spatial index.
-        Prioritizes:
-        1. Spatial Overlap (intersects)
-        2. Recency (end_date)
-        3. Vertical Datum Quality (NAVD88/Geoid18 > Ellipsoid > Unknown)
+        Identifies ALL project IDs intersecting the bounding box using the spatial index.
+        Returns list sorted by priority (Highest Priority First).
+
+        Applies optional filters:
+        - min_year: Exclude projects older than this year.
+        - max_resolution: Exclude projects with resolution > this value (in meters).
         """
         self._ensure_project_list()
 
@@ -409,18 +612,111 @@ class NoaaTopobathyProvider(Provider):
         if self._spatial_index is not None and not self._spatial_index.empty:
             query_box = box(west, south, east, north)
 
-            # CRS check
-            search_geom = query_box
-            if self._spatial_index.crs and self._spatial_index.crs.to_string() != "EPSG:4326":
-                # Index should be 4326 per build script, but verify
-                pass
-
             # Filter by intersection
-            # Use spatial index if available, or brute force intersection
-            candidates = self._spatial_index[self._spatial_index.intersects(search_geom)].copy()
+            candidates = self._spatial_index[self._spatial_index.intersects(query_box)].copy()
 
             if not candidates.empty:
-                # Conflict Resolution
+                # Helper: Extract Year
+                def get_year(row: Any) -> int:
+                    # Try explicit date first
+                    if hasattr(row, "end_date") and row.end_date:
+                        try:
+                            val = str(row.end_date)
+                            # Handle YYYY-MM-DD or simple YYYY
+                            if "-" in val:
+                                return int(val.split("-")[0])
+                            return int(val[:4])
+                        except Exception:
+                            pass
+
+                    # Parse from name (e.g. ..._2023_...)
+                    match = re.search(r"_(\d{4})_", str(row.project_name))
+                    if match:
+                        return int(match.group(1))
+
+                    # Fallback to last 4 digits
+                    matches = re.findall(r"(\d{4})", str(row.project_name))
+                    if matches:
+                        for y in reversed(matches):
+                            iy = int(y)
+                            if 1950 <= iy <= 2030:
+                                return iy
+                    return 0
+
+                candidates["year_computed"] = candidates.apply(get_year, axis=1)
+
+                # --- APPLY FILTERS ---
+                if filter_criteria:
+                    # 1. Year Filter
+                    if "min_year" in filter_criteria:
+                        min_year = int(filter_criteria["min_year"])
+                        candidates = candidates[candidates["year_computed"] >= min_year]
+
+                    # 2. Resolution Filter
+                    if "max_resolution" in filter_criteria and "resolution_meters" in candidates.columns:
+                        max_res = float(filter_criteria["max_resolution"])
+                        # Keep if resolution is known and <= max_res, OR if unknown?
+                        # Strict: Exclude if > max_res. Keep if NaN?
+                        # Let's keep if <= max_res.
+                        # Handle NaNs: fill with 999 (coarse) or 0 (fine)?
+                        # If a user asks for fine data (<2m), and we don't know, maybe exclude?
+                        # For now, let's include unknowns to be safe, but log?
+                        # Or exclude if we are confident our index is good.
+                        # Let's simple check: (res <= max) | (res is null)
+                        candidates = candidates[
+                            (candidates["resolution_meters"] <= max_res)
+                            | (candidates["resolution_meters"].isna())
+                        ]
+
+                if candidates.empty:
+                    logger.info(
+                        f"No projects matched filters {filter_criteria} in bbox {west},{south},{east},{north}"
+                    )
+                # Filter by Project Type (Topobathy vs Topographic)
+                # Default: Return Topobathy projects only.
+                # If filter_criteria has 'project_type'='topographic', invert.
+                target_type = "topobathy"
+                if filter_criteria and filter_criteria.get("project_type") == "topographic":
+                    target_type = "topographic"
+
+                # If the index has 'is_topobathy' column
+                if "is_topobathy" in self._spatial_index.columns:
+                    if target_type == "topobathy":
+                        # Candidates must be True
+                        candidates = candidates[candidates["is_topobathy"]]
+                    else:
+                        # Candidates must be False or NaN (using ~ for inversion of True,
+                        # but handling NaNs carefully)
+                        # We treat NaN as False (Topographic)
+                        mask = ~candidates["is_topobathy"].fillna(False).astype(bool)
+                        candidates = candidates[mask]
+
+                if candidates.empty:
+                    # Resolve logging variables safely
+                    max_res_log: float | None = (
+                        float(filter_criteria["max_resolution"])
+                        if filter_criteria and "max_resolution" in filter_criteria
+                        else None
+                    )
+                    min_year_log: int | None = (
+                        int(filter_criteria["min_year"])
+                        if filter_criteria and "min_year" in filter_criteria
+                        else None
+                    )
+
+                    res_val = str(max_res_log) if max_res_log else "N/A"
+                    year_val = str(min_year_log) if min_year_log else "N/A"
+                    bbox = (west, south, east, north)
+
+                    logger.warning(
+                        f"No NOAA projects found in bbox {bbox} matching criteria "
+                        f"(Type={target_type}"
+                        f"{', Year>=' + year_val if min_year_log else ''}"
+                        f"{', Res<=' + res_val if max_res_log else ''})"
+                    )
+                    return []
+
+                # --- SCORING & SORTING ---
                 # 1. Datum Priority (Geoid18 > NAVD88 > Ellipsoid)
                 def datum_score(d: object) -> int:
                     d_str = str(d).lower()
@@ -429,20 +725,38 @@ class NoaaTopobathyProvider(Provider):
                     if "navd88" in d_str:
                         return 2
                     if "ellipsoid" in d_str:
-                        return 1
-                    return 0
+                        return 0
+                    return 1  # Unknown/Other -> Neutral
 
                 candidates["datum_score"] = candidates["vertical_datum"].apply(datum_score)
 
-                # 2. Sort by Datum Score (Desc), then End Date (Desc)
-                candidates = candidates.sort_values(by=["datum_score", "end_date"], ascending=[False, False])
+                # 2. Prioritize "Topobathy" in name (vs generic DEM)
+                def name_score(n: object) -> int:
+                    n_str = str(n).lower()
+                    if "topobathy" in n_str:
+                        return 1
+                    return 0
 
-                best_match = candidates.iloc[0]
-                logger.info(
-                    f"Auto-selected Project {best_match['project_id']} "
-                    f"({best_match['project_name']}) for bbox."
+                candidates["name_score"] = candidates["project_name"].apply(name_score)
+
+                # 3. Recency (Year)
+                # candidates["year_computed"] is already there
+
+                # 4. Sort by Name > Year > Datum
+                candidates = candidates.sort_values(
+                    by=["name_score", "year_computed", "datum_score"], ascending=[False, False, False]
                 )
-                return str(best_match["project_id"])
+
+                # Return list of IDs
+                projects = candidates["project_id"].astype(str).tolist()
+                if projects:
+                    best = candidates.iloc[0]
+                    filtered_msg = " (filtered from others)" if filter_criteria else ""
+                    logger.info(
+                        f"Selected Best{filtered_msg}: {best['project_id']} ({best['project_name']}) "
+                        f"[Year={best['year_computed']}, Res={best.get('resolution_meters', 'N/A')}]"
+                    )
+                    return cast(list[str], projects)
 
         # If spatial index is missing or empty, we fail loudly as requested
         if self._spatial_index is None or self._spatial_index.empty:
@@ -451,7 +765,14 @@ class NoaaTopobathyProvider(Provider):
                 "Please run 'python -m topobathysim.scripts.build_noaa_index' to generate it."
             )
 
-        return None
+        return []
+
+    def find_project_by_box(self, west: float, south: float, east: float, north: float) -> str | None:
+        """
+        Backward compatibility wrapper. Returns the best project ID.
+        """
+        projects = self.find_projects_by_box(west, south, east, north)
+        return projects[0] if projects else None
 
     def set_active_project(self, project_id: str) -> None:
         """
@@ -561,9 +882,18 @@ class NoaaTopobathyProvider(Provider):
 
         return list(set(results))
 
-    def fetch_tile(self, tile_filename: str) -> xr.DataArray | None:
+    def fetch_tile(
+        self, tile_filename: str, bbox: tuple[float, float, float, float] | None = None
+    ) -> xr.DataArray | None:
         """
         Fetches the specific COG, applies VDatum corrections, and caches as Zarr.
+
+        Optimization:
+        If 'bbox' is provided, we use "Clip-then-Cache":
+        1. Generate cache key based on Tile + BBox.
+        2. If miss, stream lazy COG -> Clip to BBox -> Download only that subset -> Cache Zarr.
+
+        This avoids downloading 2GB+ files for a small request.
         """
         if not self._active_project_id:
             return None
@@ -590,10 +920,22 @@ class NoaaTopobathyProvider(Provider):
             http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{folder_name}/{tile_filename}"
 
         local_filename = f"{self._active_project_id}_{tile_filename}"
-        local_cog_path = self.cache_dir / local_filename
 
-        # Zarr Cache Setup
-        zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + "_navd88.zarr"
+        # --- CACHE KEY GENERATION ---
+        # If bbox provided, include hash in filename
+        if bbox:
+            import hashlib
+
+            # Precision 4 decimals (~10m) to allow some fuzzy hit if slightly different?
+            # No, requests should be stable. Use raw bbox string.
+            # Rounding to avoids float drift issues.
+            rb = tuple(round(x, 6) for x in bbox)
+            bbox_hash = hashlib.md5(str(rb).encode()).hexdigest()[:8]
+            zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + f"_navd88_{bbox_hash}.zarr"
+        else:
+            # Legacy/Full file cache
+            zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + "_navd88.zarr"
+
         zarr_path = self.cache_dir / "zarr" / zarr_name
 
         # 1. Zarr Cache Hit (Fast Path)
@@ -613,9 +955,14 @@ class NoaaTopobathyProvider(Provider):
 
         lock_path = self.cache_dir / "zarr" / (zarr_name + ".lock")
 
+        # Ensure dir exists
+        zarr_path.parent.mkdir(parents=True, exist_ok=True)
+
         try:
+            print(f"DEBUG: Attempting to acquire lock {lock_path}", flush=True)
             with open(lock_path, "w") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
+                print(f"DEBUG: Acquired lock {lock_path}", flush=True)
 
                 # Double Check inside lock
                 if zarr_path.exists():
@@ -626,107 +973,171 @@ class NoaaTopobathyProvider(Provider):
                     except Exception:
                         pass
 
-                logger.info(f"Topobathy Zarr Cache Miss: Creating {zarr_name}")
+                logger.info(f"Topobathy Zarr Cache Miss: Creating {zarr_name} from {http_url}")
 
-                # 3. Ensure Raw COG is Downloaded
-                if not local_cog_path.exists():
-                    cog_lock = self.cache_dir / f"{local_filename}.lock"
-                    temp_cog = self.cache_dir / f".tmp_{local_filename}"
+                # 3. Stream from Remote (VSI)
+                open_source = http_url
+                da_raw = None
+
+                # 4. Open COG (Remote) and Apply Adjustments
+                # 4. Open COG (Remote) and Apply Adjustments
+                logger.info(f"Streaming NOAA Asset: {open_source}")
+                # Load lazily with chunks
+                da_raw = cast(
+                    xr.DataArray,
+                    rioxarray.open_rasterio(open_source, chunks={"x": 2048, "y": 2048}, masked=True),
+                )
+
+                # --- OPTIMIZATION: CLIP BEFORE METADATA/COMPUTE ---
+                if bbox:
                     try:
-                        with open(cog_lock, "w") as cl:
-                            fcntl.flock(cl, fcntl.LOCK_EX)
-                            if not local_cog_path.exists():
-                                logger.info(f"Downloading COG: {http_url}")
-                                with requests.get(http_url, stream=True, timeout=30) as r:
-                                    r.raise_for_status()
-                                    with open(temp_cog, "wb") as f:
-                                        for chunk in r.iter_content(chunk_size=32768):
-                                            f.write(chunk)
-                                Path(temp_cog).rename(local_cog_path)
+                        from rasterio.warp import transform_bounds
+
+                        source_crs = da_raw.rio.crs
+                        clip_bbox = bbox
+                        clip_crs = "EPSG:4326"
+
+                        # If source has a CRS and it's not 4326/NAD83-LatLon, reproject explicitly
+                        # This avoids rioxarray clip_box potential failures with on-the-fly reprojection
+                        if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
+                            try:
+                                clip_bbox = transform_bounds("EPSG:4326", source_crs, *bbox)
+                                clip_crs = source_crs
+                                # logger.debug(f"Reprojected Clip BBox to {source_crs}: {clip_bbox}")
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to reproject bbox to {source_crs}: {e}. Retrying with 4326."
+                                )
+
+                        da_raw = da_raw.rio.clip_box(
+                            minx=clip_bbox[0],
+                            miny=clip_bbox[1],
+                            maxx=clip_bbox[2],
+                            maxy=clip_bbox[3],
+                            crs=clip_crs,
+                        )
                     except Exception as e:
-                        logger.error(f"Failed to download COG {http_url}: {e}")
-                        if Path(temp_cog).exists():
-                            Path(temp_cog).unlink()
+                        logger.warning(f"Clip failed for {local_filename}: {e}. Skipping tile.")
                         return None
 
-                # 4. Open COG and Apply Adjustments
-                try:
-                    # Load lazily
-                    da_raw = cast(
-                        xr.DataArray,
-                        rioxarray.open_rasterio(local_cog_path, chunks={"x": 2048, "y": 2048}, masked=True),
-                    )
-
-                    # Metadata & VDatum Logic
-                    meta = self.fetch_inport_metadata(self._active_project_id) or {}
-
-                    # --- PROVENANCE METADATA ---
-                    import datetime
-
-                    # Core identity
-                    da_raw.attrs["survey_source"] = self._active_project_id
-                    da_raw.attrs["source_url"] = http_url
-
-                    # Time
-                    da_raw.attrs["date_created"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    da_raw.attrs["start_date"] = meta.get("start_date", "Unknown")
-                    da_raw.attrs["end_date"] = meta.get("end_date", "Unknown")
-
-                    # Vertical Reference
-                    vdatum = meta.get("vertical_datum", "Unknown").lower()
-                    da_raw.attrs["vertical_datum_original"] = vdatum
-                    da_raw.attrs["vertical_datum"] = vdatum  # Current state
-
-                    # Links
-                    info_url = self._projects_metadata_urls.get(self._active_project_id)
-                    if info_url:
-                        da_raw.attrs["metadata_url"] = info_url
-
-                    # Apply Correction if Ellipsoid
-                    if "ellipsoid" in vdatum:
-                        try:
-                            from pyproj import Transformer
-
-                            bounds = da_raw.rio.bounds()
-                            cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
-
-                            crs = da_raw.rio.crs
-                            if crs:
-                                t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-                                lon, lat = t.transform(cx, cy)
-
-                                offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
-                                logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
-                                da_raw = da_raw + offset
-
-                                # Update Attributes post-correction
-                                da_raw.attrs["vertical_datum"] = "NAVD88"
-                                da_raw.attrs["correction_method"] = "VDatum Geoid18"
-                                da_raw.attrs["vdatum_offset"] = offset
-                        except Exception as e:
-                            logger.warning(f"VDatum correction failed: {e}")
-
-                    # 5. Write to Zarr
-                    # Ensure good chunks for writing
-                    if "x" in da_raw.dims and "y" in da_raw.dims:
-                        da_raw = da_raw.chunk({"y": 1024, "x": 1024})
-
-                    da_raw.to_zarr(zarr_path, mode="w", consolidated=True)
-                    logger.info(f"Created Zarr Cache: {zarr_path.name}")
-
-                    # Return re-opened Zarr
-                    return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
-
-                except Exception as e:
-                    logger.error(f"Failed to process/write Zarr for {local_filename}: {e}")
+                if da_raw.size == 0:
+                    logger.debug(f"Empty tile after clip: {local_filename}")
                     return None
+
+                # Metadata & VDatum Logic
+                meta = self.fetch_inport_metadata(self._active_project_id) or {}
+
+                # --- PROVENANCE METADATA ---
+                import datetime
+
+                # Core identity
+                da_raw.attrs["survey_source"] = self._active_project_id
+                da_raw.attrs["source_url"] = http_url
+
+                # Time
+                da_raw.attrs["date_created"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                da_raw.attrs["start_date"] = meta.get("start_date", "Unknown")
+                da_raw.attrs["end_date"] = meta.get("end_date", "Unknown")
+
+                # Vertical Reference
+                vdatum = meta.get("vertical_datum", "Unknown").lower()
+                da_raw.attrs["vertical_datum_original"] = vdatum
+                da_raw.attrs["vertical_datum"] = vdatum  # Current state
+
+                # Links
+                info_url = self._projects_metadata_urls.get(self._active_project_id)
+                if info_url:
+                    da_raw.attrs["metadata_url"] = info_url
+
+                # Apply Correction if Ellipsoid
+                if "ellipsoid" in vdatum:
+                    try:
+                        from pyproj import Transformer
+
+                        bounds = da_raw.rio.bounds()
+                        cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
+
+                        crs = da_raw.rio.crs
+                        if crs:
+                            t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                            lon, lat = t.transform(cx, cy)
+
+                            offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
+                            logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
+                            da_raw = da_raw + offset
+
+                            # Update Attributes post-correction
+                            da_raw.attrs["vertical_datum"] = "NAVD88"
+                            da_raw.attrs["correction_method"] = "VDatum Geoid18"
+                            da_raw.attrs["vdatum_offset"] = offset
+                    except Exception as e:
+                        logger.warning(f"VDatum correction failed: {e}")
+
+                # 5. Write to Zarr
+                # Ensure good chunks for writing
+                if "x" in da_raw.dims and "y" in da_raw.dims:
+                    da_raw = da_raw.chunk({"y": 1024, "x": 1024})
+
+                da_raw.to_zarr(zarr_path, mode="w", consolidated=True)
+                logger.info(f"Created Zarr Cache: {zarr_path.name}")
+
+                # Return re-opened Zarr
+                return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
         except Exception as e:
             logger.error(f"Zarr lock/process failed: {e}")
             return None
         finally:
             if lock_path.exists():
-                lock_path.unlink()
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
+
+    def get_grid(
+        self, west: float, south: float, east: float, north: float, project_id: str | None = None
+    ) -> xr.DataArray | None:
+        """
+        High level interface to get merged grid from NOAA Topobathy.
+        Attempts to auto-detect project if not provided.
+        """
+        if project_id:
+            self.set_active_project(project_id)
+        elif self._active_project_id is None:
+            # Try to auto-detect
+            pid = self.find_project_by_box(west, south, east, north)
+            if pid:
+                self.set_active_project(pid)
+
+        if not self._active_project_id:
+            return None
+
+        tiles = self.resolve_tiles_in_bbox(west, south, east, north)
+        if not tiles:
+            return None
+
+        bbox = (west, south, east, north)
+        das = []
+        for t in tiles:
+            da = self.fetch_tile(t, bbox=bbox)
+            if da is not None:
+                das.append(da)
+
+        if not das:
+            return None
+
+        if len(das) == 1:
+            return das[0]
+
+        from rioxarray.merge import merge_arrays
+
+        # Regarding Fusion order:
+        # For NOAA DEMs within a single project, tiles are typically spatially disjoint (mosaic).
+        # Overlap is minimal. If overlap exists, we trust rioxarray default (last layer wins).
+        try:
+            merged = merge_arrays(das)
+            return cast(xr.DataArray, merged)
+        except Exception as e:
+            logger.error(f"Merge error: {e}")
+            return None
 
 
 # Register

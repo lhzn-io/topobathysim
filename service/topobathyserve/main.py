@@ -13,13 +13,13 @@ matplotlib.use("Agg")
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import numpy as np
 import xarray as xr
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from topobathysim.runtime import run
 
@@ -163,8 +163,8 @@ def get_policy_path() -> Path:
 
 
 # Visualization Constants
-GLOBAL_VMIN = -50.0
-GLOBAL_VMAX = 20.0
+GLOBAL_VMIN = -64.0
+GLOBAL_VMAX = 128.0
 
 # Feature Flags
 SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
@@ -174,15 +174,18 @@ SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
 )
 
 
+# So I can change the signature of render_png to accept an optional 'legend' dict.
+
+
 def render_png(
     da: xr.DataArray,
     style: str = "default",
     vmin: float | None = None,
     vmax: float | None = None,
     zoom: int = 13,
+    legend: dict[int, str] | None = None,  # NEW ARGUMENT
 ) -> bytes:
     """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
-    # (Implementation remains mostly same, just checking compatibility)
     import matplotlib.colors as mcolors
     import matplotlib.image as mpimg
     import matplotlib.pyplot as plt
@@ -191,53 +194,70 @@ def render_png(
     buf = BytesIO()
     vals = da.values.astype(np.float32)
 
+    # Handle 3D Arrays (e.g. (1, h, w) or (C, h, w))
+    # Handle 3D Arrays
+    if vals.ndim == 3:
+        if vals.shape[0] == 1:
+            # (1, h, w) -> (h, w)
+            vals = vals.squeeze(0)
+        elif vals.shape[-1] == 1:
+            # (h, w, 1) -> (h, w)
+            vals = vals.squeeze(-1)
+        else:
+            # Ambiguous (C, h, w) or (h, w, C).
+            # We assume (C, h, w) standard raster layout if not singleton.
+            logger.warning(f"render_png received 3D array {vals.shape}. Using first band.")
+            vals = vals[0, :, :]
+
+    # Last resort check
+    if vals.ndim != 2:
+        logger.error(f"render_png expected 2D array, got {vals.shape}")
+        # Try to flatten or reshape? No, just fail gracefully or let it crash with better log
+        # But we can try to force 2D if it's (h, w, 1) or similar
+        if vals.ndim == 3 and vals.shape[-1] == 1:
+            vals = vals.squeeze(-1)
+
     # Source Visualization Style
     if style == "source":
-        # Create unique colors for provider IDs (Sequential or Mapped)
-        # Using a fixed categorical palette
-        unique_ids = np.unique(vals)
-        # Basic hashing for colors?
-        # Or Just strict mapping if we knew them.
-        # Fallback: Just map unique values to colors
+        # Qualitative Palette (Set3 / Paired)
+        # https://matplotlib.org/stable/users/explain/colors/colormaps.html#qualitative
+        # Set3 has 12 colors. Paired has 12.
+        # We map Provider ID -> Color Index
 
-        # Colors dict (Basic Palette)
-        palette = [
-            (0, 0, 0, 1),  # 0: Black/Canvas
-            (1, 0, 0, 1),  # 1: Red
-            (0, 1, 0, 1),  # 2: Green
-            (0, 0, 1, 1),  # 3: Blue
-            (1, 1, 0, 1),  # 4: Yellow
-            (1, 0, 1, 1),  # 5: Magenta
-            (0, 1, 1, 1),  # 6: Cyan
-            (1, 0.5, 0, 1),  # 7: Orange
-            (0.5, 0, 1, 1),  # 8: Purple
-            (0.5, 0.5, 0.5, 1),  # 9: Gray
-        ]
+        # If no legend provided, fallback to random/hash
+        cmap_name = "Set3"  # Good for up to 12 categories
+        base_cmap = plt.get_cmap(cmap_name)
+
+        # Create a custom colormap where specific integer values map to specific colors
+        # We know IDs are 1..N
+        # We want ID 1 -> Color 0, ID 2 -> Color 1, etc.
+
+        # Helper to get color for an ID
+        def get_color(uid: int) -> tuple[float, float, float, float]:
+            if uid == 0:
+                return (0, 0, 0, 1)  # No Data / Background
+            if np.isnan(uid):
+                return (0, 0, 0, 0)  # Transparent
+
+            # Map ID to Index
+            # If we have a legend, we can be consistent about sorting?
+            # Using the ID directly is simplest if IDs are stable (1, 2, 3...)
+            # The IDs from generate_provider_legend are 1-based indices into sorted providers.
+            # So ID 1 = First Provider, ID 2 = Second Provider.
+
+            idx = (int(uid) - 1) % 12  # Cycle through 12 colors
+            return base_cmap(idx)
 
         h, w = vals.shape
         rgba = np.zeros((h, w, 4), dtype=np.float32)
 
-        for _i, uid in enumerate(unique_ids):
-            mask = np.isclose(vals, uid)
-            if np.isnan(uid):
+        unique_ids = np.unique(vals)
+        for uid in unique_ids:
+            if np.isnan(uid) or uid == 0:
                 continue
 
-            # If ID matches legacy, use legacy colors?
-            # 10=BAG, 20=Lidar...
-            color = None
-            uid_int = int(uid)
-
-            # Legacy Map
-            legacy_map = {
-                10: (1, 0, 0, 1),  # Red (BAG)
-                20: (0, 1, 0, 1),  # Green (Lidar)
-                30: (0, 0, 1, 1),  # Blue (CUDEM)
-                40: (0, 1, 1, 1),  # Cyan (BlueTopo)
-                60: (0.5, 0.5, 0.5, 1),  # Gray (GEBCO)
-            }
-            color = legacy_map[uid_int] if uid_int in legacy_map else palette[uid_int % len(palette)]
-
-            rgba[mask] = color
+            mask = np.isclose(vals, uid)
+            rgba[mask] = get_color(uid)
 
         mpimg.imsave(buf, rgba, format="png")
         buf.seek(0)
@@ -269,9 +289,13 @@ def render_png(
         if zoom >= 18:
             interval = 1.0
 
-        vmin_cnt = math.floor(np.nanmin(vals) / interval) * interval
-        vmax_cnt = math.ceil(np.nanmax(vals) / interval) * interval
-        levels = np.arange(vmin_cnt, vmax_cnt + interval, interval)
+        # Catch empty range
+        if np.nanmin(vals) == np.nanmax(vals):
+            levels = [np.nanmin(vals)]
+        else:
+            vmin_cnt = math.floor(np.nanmin(vals) / interval) * interval
+            vmax_cnt = math.ceil(np.nanmax(vals) / interval) * interval
+            levels = np.arange(vmin_cnt, vmax_cnt + interval, interval).tolist()
 
         cs = ax.contour(vals, levels=levels, colors="black", linewidths=0.5, alpha=0.7, origin="upper")
         ax.contour(vals, levels=[0], colors="red", linewidths=1.5, alpha=0.8, origin="upper")
@@ -362,7 +386,43 @@ def render_png(
     return buf.getvalue()
 
 
-@app.get("/elevation", response_model=ElevationResponse)
+@app.get("/legend")
+async def get_legend(policy_path: Annotated[Path, Depends(get_policy_path)]) -> dict[str, Any]:
+    """
+    Returns the legend mapping (Provider Name -> Color Hex) for the active policy.
+    Used by the frontend to render the dynamic legend.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    from topobathysim.policy.loader import generate_provider_legend, load_policy
+
+    # Reload policy to be safe (or assume it's loaded in runtime, but runtime doesn't expose object easily)
+    # We load it here to get the legend mapping
+    try:
+        policy = load_policy(str(policy_path))
+        legend_map = generate_provider_legend(policy)  # {1: "ProviderA", 2: "ProviderB"}
+
+        # Generate Colors matching render_png logic (Set3)
+        cmap = plt.get_cmap("Set3")
+
+        items = []
+        for pid, name in legend_map.items():
+            # ID to Color
+            idx = (pid - 1) % 12
+            rgba = cmap(idx)
+            hex_color = mcolors.to_hex(rgba)
+
+            items.append({"id": pid, "name": name, "color": hex_color})
+
+        return {"items": items}
+
+    except Exception as e:
+        logger.error(f"Failed to generate legend: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/elevation")
 async def get_elevation(
     lat: float, lon: float, policy_path: Annotated[Path, Depends(get_policy_path)]
 ) -> ElevationResponse:
@@ -584,6 +644,42 @@ def get_xyz_tile(
 
     logger.info(f"XYZ Request: z={z} x={x} y={y} | Format={format} | Style={style} | VMin={vmin} VMax={vmax}")
 
+    # --- Caching Logic ---
+    base_cache_dir = Path("~/.cache/topobathysim/tiles").expanduser()
+
+    # Determine Cache Subdirectory based on format/style (Parity with Legacy)
+    if format in ["png", "jpg", "jpeg"]:
+        # Visual Cache: tiles/visual/{style}/{z}/{x}/
+        safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
+        tile_dir = base_cache_dir / "visual" / safe_style / str(z) / str(x)
+        ext = format
+    elif format in ["npy", "npz"]:
+        # Data Cache: tiles/data/{z}/{x}/
+        tile_dir = base_cache_dir / "data" / str(z) / str(x)
+        ext = format
+    else:
+        # Raw/Other Cache (TIFF): tiles/raw/{z}/{x}/
+        tile_dir = base_cache_dir / "raw" / str(z) / str(x)
+        ext = "tif" if format == "tiff" else format
+
+    # Hash unique parameters (Policy, VMin/Max) to handle different renderings of same tile
+    params_str = f"{policy_path.name}|{vmin}|{vmax}"
+    import hashlib
+
+    param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
+
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    tile_path = tile_dir / f"{y}_{param_hash}.{ext}"
+
+    media_type = "image/tiff" if format == "tiff" else f"image/{format}"
+    if format in ["npy", "npz"]:
+        media_type = "application/octet-stream"
+
+    # 1. Check Cache
+    if tile_path.exists() and tile_path.stat().st_size > 0:
+        logger.debug(f"Cache Hit: {tile_path}")
+        return FileResponse(tile_path, media_type=media_type)
+
     start_time = time.time()
 
     # Calculate Resolution in Meters for this Zoom Level (Approx at center Lat)
@@ -599,13 +695,32 @@ def get_xyz_tile(
         logger.warning(f"Tile {z}/{x}/{y} out of bounds for policy: {e}")
         return Response(content=f"Policy/CRS Mismatch: {e}", status_code=400)
     except Exception as e:
-        logger.error(f"Runtime failed: {e}")
+        import traceback
+
+        logger.error(f"Runtime failed: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
         return Response(content=f"Error: {e}", status_code=500)
 
     # Render
     if format == "png":
         if style == "source":
-            data = render_png(ds["source_elevation"], style="source", vmin=vmin, vmax=vmax, zoom=z)
+            # Generate Legend Map for Dynamic Coloring
+            from topobathysim.policy.loader import generate_provider_legend, load_policy
+
+            # We have policy_path, but need the object.
+            # load_policy is cached? Let's hope it's fast enough or LRU cached.
+            # In production, we'd cache this at app level.
+            # Assuming load_policy is cheap enough for now (parsing YAML)
+            try:
+                pol = load_policy(str(policy_path))
+                legend_map = generate_provider_legend(pol)
+            except Exception as e:
+                logger.warning(f"Failed to load legend for source rendering: {e}")
+                legend_map = None
+
+            data = render_png(
+                ds["source_elevation"], style="source", vmin=vmin, vmax=vmax, zoom=z, legend=legend_map
+            )
         else:
             data = render_png(ds["elevation"], style=style, vmin=vmin, vmax=vmax, zoom=z)
         media_type = "image/png"
@@ -617,7 +732,9 @@ def get_xyz_tile(
         if format == "npy":
             np.save(buf, ds["elevation"].values)
         else:
-            np.savez_compressed(buf, elevation=ds["elevation"].values)
+            np.savez_compressed(
+                buf, elevation=ds["elevation"].values, source_elevation=ds["source_elevation"].values
+            )
         data = buf.getvalue()
         media_type = "application/octet-stream"
 
@@ -625,9 +742,25 @@ def get_xyz_tile(
         import io
 
         buf = io.BytesIO()
-        ds["elevation"].rio.to_raster(buf, driver="GTiff")
+        da_out = ds["elevation"]
+
+        # Ensure proper dimension order (Band, Y, X) for GDAL
+        if da_out.ndim == 3 and da_out.shape[-1] == 1:
+            # If shape is (H, W, 1), move band to front
+            da_out = da_out.transpose("band", "y", "x")
+            # If shape is (1, H, W) it's already fine
+
+        # Write to Raster
+        da_out.rio.to_raster(buf, driver="GTiff")
         data = buf.getvalue()
         media_type = "image/tiff"
+
+    # 2. Write to Cache
+    try:
+        with open(tile_path, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        logger.warning(f"Failed to write cache file {tile_path}: {e}")
 
     logger.info(f"Tile {z}/{x}/{y} generated in {time.time() - start_time:.2f}s")
     return Response(content=data, media_type=media_type)

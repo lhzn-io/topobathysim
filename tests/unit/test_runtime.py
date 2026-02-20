@@ -26,6 +26,7 @@ class MockProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Simulate fetching a layer by creating a synthetic grid.

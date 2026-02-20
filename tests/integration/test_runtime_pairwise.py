@@ -29,6 +29,7 @@ class MockParamsProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         # Create grid matching the test scenario (100x100)
         # We assume a fixed grid for this test, but honor the input bounds for alignment.

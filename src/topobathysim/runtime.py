@@ -4,7 +4,11 @@ Core Runtime for TopoBathySim.
 This module executes fusion policies to generate topobathymetric datasets.
 """
 
+import hashlib
+import json
+import logging
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import rioxarray  # noqa: F401
@@ -17,12 +21,15 @@ from topobathysim.policy.loader import generate_provider_legend, hash_policy, lo
 from topobathysim.policy.schema import OperatorType
 from topobathysim.providers.registry import registry
 
+logger = logging.getLogger(__name__)
+
 
 def run(
     policy_path: str,
     bbox: tuple[float, float, float, float],
     resolution: float | None = None,
     time: datetime | None = None,
+    use_cache: bool = True,
 ) -> xr.Dataset:
     """
     Execute a fusion policy to generate a topobathymetric dataset.
@@ -34,6 +41,7 @@ def run(
                     - Projected CRS: Meters
                     - Geographic CRS: Meters (will be auto-converted to degrees)
         time: Optional timestamp for time-dependent queries (Sprint v2).
+        use_cache: If True, look for/save reuse fused Zarr datasets.
 
     Returns:
         xr.Dataset: The generated dataset containing 'elevation' and 'source_elevation'.
@@ -109,6 +117,44 @@ def run(
         res_x = input_resolution_meters
         res_y = input_resolution_meters
 
+    # --- Caching Check ---
+    cache_path = None
+    if use_cache:
+        try:
+            cache_dir = Path("~/.cache/topobathysim/fused_zarr").expanduser()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Hash Key: Policy Content + BBox + Resolution + CRS
+            # Round floats to 6 decimals to avoid micro-mismatches (parity with legacy)
+            key_dict = {
+                "policy": policy.model_dump(),  # type: ignore
+                "bbox": [round(x, 6) for x in [min_x, min_y, max_x, max_y]],
+                "res": [round(x, 6) for x in [res_x, res_y]],
+                "crs": target_crs,
+            }
+            # Use json.dumps with sort_keys for stability
+            key_str = json.dumps(key_dict, sort_keys=True, default=str)
+            key_hash = hashlib.md5(key_str.encode()).hexdigest()
+
+            cache_path = cache_dir / f"{key_hash}.zarr"
+
+            if cache_path.exists():
+                logger.info(f"Fused Zarr Cache Hit: {cache_path}")
+                # Use FileLock if available, otherwise just try open
+                try:
+                    from filelock import FileLock
+
+                    with FileLock(cache_path.with_suffix(".lock")):
+                        ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+                        return ds
+                except ImportError:
+                    ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+                    return ds
+                except Exception as e:
+                    logger.warning(f"Failed to load cache {cache_path}: {e}")
+        except Exception as e:
+            logger.warning(f"Cache check failed: {e}")
+
     # 3. Initialize Canvas
     width = int((max_x - min_x) / res_x)
     height = int((max_y - min_y) / res_y)
@@ -160,6 +206,7 @@ def run(
                     bbox,
                     resolution=input_resolution_meters,
                     crs=target_crs,
+                    filter=step.filter,
                 )
             except (KeyError, ValueError, RuntimeError):
                 # Skip provider if data is missing or fetch fails (common for sparse datasets)
@@ -167,6 +214,31 @@ def run(
 
             if fetched_data is None:
                 continue
+
+            # --- Enforce 2D Array Shape ---
+            # Providers might return (Band, Y, X) or (Y, X, Band)
+            if fetched_data.ndim == 3:
+                if fetched_data.shape[0] == 1:
+                    # (1, y, x) -> (y, x)
+                    fetched_data = fetched_data.squeeze(axis=0)
+                elif fetched_data.shape[-1] == 1:
+                    # (y, x, 1) -> (y, x)
+                    fetched_data = fetched_data.squeeze(axis=-1)
+                else:
+                    # Multi-band (C, y, x) -> Take first band
+                    logger.warning(
+                        f"Provider {step.provider} returned multi-band data {fetched_data.shape}. "
+                        "Using first band only."
+                    )
+                    fetched_data = fetched_data[0, :, :]
+
+            # Final check to ensure we are 2D
+            if fetched_data.ndim != 2:
+                logger.warning(
+                    f"Provider {step.provider} returned unexpected shape {fetched_data.shape}. Skipping."
+                )
+                continue
+            # ------------------------------
 
             # Align to Canvas
             aligned_data = fetched_data.rio.reproject_match(elevation)
@@ -228,10 +300,53 @@ def run(
     ds = xr.Dataset(
         {"elevation": elevation, "source_elevation": source_elevation},
         attrs={
-            "policy_hash": hash_policy(policy.model_dump()),
+            "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
             "policy_legend": str(legend),
             "crs": target_crs,
         },
     )
+
+    # 7. Write to Cache
+    if cache_path:
+        try:
+            logger.info(f"Writing Fused Zarr to {cache_path}")
+
+            # Metadata Attributes
+            ds.attrs["created_at"] = datetime.utcnow().isoformat()
+            ds.attrs["policy_hash"] = key_hash
+            ds.attrs["crs"] = target_crs
+
+            # Chunking is important for Zarr performance
+            ds_chunked = ds.chunk({"y": 2048, "x": 2048})
+
+            # Atomic Write Pattern
+            tmp_path = cache_path.with_suffix(f".tmp.{key_hash}.zarr")
+
+            try:
+                # 1. Write to temp directory
+                if tmp_path.exists():
+                    import shutil
+
+                    shutil.rmtree(tmp_path)
+
+                ds_chunked.to_zarr(tmp_path, mode="w", consolidated=True)
+
+                # 2. Rename to final path (Atomic)
+                if cache_path.exists():
+                    import shutil
+
+                    shutil.rmtree(cache_path)
+
+                tmp_path.rename(cache_path)
+
+            except Exception as e:
+                logger.warning(f"Failed to write atomic cache {cache_path}: {e}")
+                if tmp_path.exists():
+                    import shutil
+
+                    shutil.rmtree(tmp_path)
+
+        except Exception as e:
+            logger.warning(f"Failed to write cache {cache_path}: {e}")
 
     return ds

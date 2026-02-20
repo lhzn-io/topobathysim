@@ -103,6 +103,7 @@ class UsgsLidarProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetch USGS Lidar data for the given bounding box.
@@ -119,8 +120,25 @@ class UsgsLidarProvider(Provider):
         )
 
         if da is None:
-            raise KeyError(f"No USGS Lidar found for bbox {bbox}")
+            # Fallback: Check NOAA for "Topographic" Lidar (non-topobathy)
+            # Many coastal areas have "Vanilla" Lidar in the NOAA PDS that isn't in 3DEP STAC yet.
+            logger.info("3DEP Lidar not found. Checking NOAA Topographic Lidar fallback...")
+            try:
+                from .noaa_topobathy import NoaaTopobathyProvider
 
+                noaa = NoaaTopobathyProvider(cache_dir=str(self.cache_dir.parent))
+                # Request "topographic" specifically
+                da = noaa.fetch_layer(bbox, resolution, crs, filter={"project_type": "topographic"})
+                if da is not None:
+                    logger.info("Fallback to NOAA Topographic Lidar successful")
+                    logger.debug("Found USGS Lidar (via fallback) Coverage")
+                    return da
+            except Exception as e:
+                logger.warning(f"NOAA Topographic fallback failed: {e}")
+
+            raise KeyError(f"No USGS Lidar found for bbox {bbox} (and fallback failed)")
+
+        logger.debug("Found USGS Lidar Coverage")
         return da
 
     def get_metadata(self) -> dict[str, Any]:
@@ -437,9 +455,37 @@ class UsgsLidarProvider(Provider):
 
             # Case A: Already Cached -> Use Local File (Fast/Offline)
             if local_path.exists():
-                logger.info(f"Lidar Cache Hit: {local_path}")
+                logger.info(f"Lidar Cache Hit (Source File): {local_path}")
                 native_crs_str = f"EPSG:{native_epsg}" if native_epsg else None
                 return self._read_laz_file(local_path, bounds, resolution, target_crs, native_crs_str)
+
+            # Case A.2: Check for Partial/Streamed Zarr Cache
+            # Even if source file isn't here, we might have cached the raster result from a previous stream
+            # We need a stable hash for the Zarr based on HREF + Params
+            import hashlib
+
+            res_str = f"{resolution:.2f}".replace(".", "p")
+            href_hash = hashlib.md5(href.encode()).hexdigest()
+            # Note: We include bounds/resolution in hash or filename because this is a partial slice
+            # Actually, `fetch_lidar_from_stac` might be called with different bounds for the same asset.
+            # So the cache key must ideally be (Asset ID + Resolution + BBox).
+            # But BBox varies.
+            # Simplified approach: We cache the *specific requested slice* using a hash of all params.
+            slice_key = f"{href}_{bounds}_{resolution}_{target_crs}"
+            slice_hash = hashlib.md5(slice_key.encode()).hexdigest()
+            slice_zarr_path = self.cache_dir / "zarr" / f"stream_{slice_hash}.zarr"
+
+            if slice_zarr_path.exists():
+                try:
+                    logger.info(f"Lidar Cache Hit (Streamed Zarr): {slice_zarr_path.name}")
+                    return xr.open_dataarray(
+                        slice_zarr_path, engine="zarr", chunks="auto", decode_coords="all"
+                    )
+                except Exception as e:
+                    logger.warning(f"Corrupt Streamed Zarr {slice_zarr_path}: {e}")
+                    import shutil
+
+                    shutil.rmtree(slice_zarr_path, ignore_errors=True)
 
             # Case B: Offline Mode + Not Cached -> Fail
             if self.offline_mode:
@@ -574,6 +620,16 @@ class UsgsLidarProvider(Provider):
 
                 Path(output_filename).unlink()
                 # from typing import cast (already imported)
+
+                # --- WRITE TO STREAM ZARR CACHE ---
+                try:
+                    if "slice_zarr_path" in locals() and not slice_zarr_path.exists():
+                        # Chunk for Zarr
+                        da_to_cache = da.chunk({"y": 1024, "x": 1024})
+                        da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=True)
+                        logger.info(f"Cached Streamed Lidar to Zarr: {slice_zarr_path.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to cache Streamed Lidar Zarr: {e}")
 
                 return cast(xr.DataArray, da)
 

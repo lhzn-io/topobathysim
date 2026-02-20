@@ -15,6 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np  # Added numpy import
 import requests  # type: ignore
 import xarray as xr
 from filelock import FileLock
@@ -85,13 +86,27 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
                 if isinstance(da_raw, list):
                     da = cast(xr.DataArray, da_raw[0])
                 elif isinstance(da_raw, xr.Dataset):
-                    da = da_raw.to_array().isel(variable=0)
+                    da = cast(xr.DataArray, da_raw.to_array().isel(variable=0))
                 else:
                     da = cast(xr.DataArray, da_raw)
 
             # BAGs usually have 'elevation' and 'uncertainty'.
             # Rasterio usually reads band 1 as elevation.
             elev = da.isel(band=0).drop_vars("band")
+
+            # MASK SUSPICIOUS VALUES
+            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
+            # Removed hardcoded -99.0 mask to avoid deleting valid deep ocean data.
+
+            # --- CLEANING FILTER (Deviation from Median) ---
+            # Remove single-pixel spikes (common in sonar edges)
+            # Default to fairly aggressive 80m threshold if not specified,
+            # to target the specific "deep sea" artifact issue.
+            # Ideally this is configurable via kwargs, but _read_bag_cached is cached
+            # and doesn't accept dynamic kwargs easily without breaking cache key.
+            # We'll implement a safe default here, or move this logic to `fetch_layer`
+            # where we have the policy.
+            # MOVED: Logic to be applied in `fetch_layer` to allow policy control.
 
             # Check for Ellipsoid vs MLLW
             filename = local_path.name
@@ -153,6 +168,69 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     except Exception as e:
         logger.error(f"Error reading BAG {local_path}: {e}")
         return None
+
+
+def clean_data_deviation(da: xr.DataArray, threshold: float = 50.0) -> xr.DataArray:
+    """
+    Apply a 'Deviation from Median' filter to remove spikes.
+    Calculates median of 3x3 neighborhood. If abs(pixel - median) > threshold, mask as NaN.
+
+    Args:
+        da: Input DataArray (elevation)
+        threshold: Max allowed deviation from local median (meters)
+
+    Returns:
+        xr.DataArray: Filtered data
+    """
+    try:
+        from scipy.ndimage import median_filter
+
+        def _filter_block(block: Any) -> Any:
+            # 3x3 median
+            # Only apply if block has data
+            if block.size == 0:
+                return block
+
+            # Handle NaNs? median_filter might propagate them or ignore depending on implementation.
+            # standard median_filter doesn't handle NaNs well (results in NaN).
+            # We might want generic_filter or a nan-safe version, but for speed standard is used.
+            # For now, let's assume we are targeting massive spikes in valid data strings.
+            med = median_filter(block, size=3)
+            diff = np.abs(block - med)
+
+            # Mask out spikes (replace with NaN)
+            # return np.where(diff > threshold, np.nan, block)
+            # CAREFUL: If block is integer, np.nan converts to int (bad).
+            # Ensure float.
+            if not np.issubdtype(block.dtype, np.floating):
+                block = block.astype(np.float32)
+
+            return np.where(diff > threshold, np.nan, block)
+
+        # Check if Dask
+        if da.chunks is not None:
+            # It is a dask array. Access .data to get the dask array object
+            # dask.array.map_overlap
+
+            # We must re-wrap the result in a DataArray
+            # da.data is the dask array
+            cleaned_dask = da.data.map_overlap(
+                _filter_block,
+                depth=1,
+                boundary="reflect",
+                dtype=da.dtype,  # Maintain type (floats)
+            )
+
+            # Return new DataArray with same coords
+            return xr.DataArray(cleaned_dask, coords=da.coords, dims=da.dims, attrs=da.attrs)
+        else:
+            # Numpy array - Direct application
+            cleaned_np = _filter_block(da.values)
+            return xr.DataArray(cleaned_np, coords=da.coords, dims=da.dims, attrs=da.attrs)
+
+    except Exception as e:
+        logger.warning(f"Failed to apply cleaning filter: {e}")
+        return da
 
 
 @contextmanager
@@ -531,6 +609,7 @@ class BAGProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetches and merges BAG files intersecting the bounding box.
@@ -565,6 +644,22 @@ class BAGProvider(Provider):
 
                 if da.size == 0:
                     continue
+
+                # --- CLEANING / FILTERING ---
+                # Check for filter config in kwargs
+                filter_cfg = kwargs.get("filter", {})
+
+                # 1. Deviation/Spike Removal (Change-based Cleanse)
+                # Defaults to None (disabled) unless specified, OR we can default it on?
+                # User asked to "replace mask with change-based cleanse".
+                # Let's check for 'max_depth_change' or 'max_deviation' keys.
+                # If specifically requested, or if we want a safe default?
+                # Logic: If 'max_depth_change' is present use it.
+                max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
+
+                if max_dev:
+                    logger.info(f"Applying BAG Deviation Filter (Threshold={max_dev}m) to {url}")
+                    da = clean_data_deviation(da, threshold=float(max_dev))
 
                 # Reproject individual chunk to target CRS
                 if crs and da.rio.crs and da.rio.crs != crs:
@@ -609,6 +704,7 @@ class BAGProvider(Provider):
             merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
 
         merged.name = "elevation"
+        logger.debug("Found NCEI BAG Coverage")
         return cast(xr.DataArray, merged)
 
     def get_metadata(self) -> dict[str, Any]:

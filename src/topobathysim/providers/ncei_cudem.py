@@ -60,6 +60,7 @@ class CUDEMProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetch CUDEM data for the given bounding box.
@@ -96,21 +97,29 @@ class CUDEMProvider(Provider):
                 logger.error(f"Failed to merge CUDEM tiles: {e}")
                 merged = das[0]
 
+        # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds) to avoid reprojecting full tile
+        try:
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+        except Exception as e:
+            logger.warning(f"Clip failed (no overlap?): {e}")
+            if not das:  # If this was a single tile flow
+                raise KeyError(f"CUDEM tile clipped out: {bbox}") from e
+
         # Reproject if needed
         if crs and merged.rio.crs and merged.rio.crs != crs:
             try:
-                logger.info(f"Reprojecting CUDEM from {merged.rio.crs} to {crs}")
+                # logger.info(f"Reprojecting CUDEM from {merged.rio.crs} to {crs}")
                 merged = merged.rio.reproject(crs)
             except Exception as e:
                 logger.warning(f"Reprojection failed: {e}")
 
-        # Final Exact Clip
-        try:
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
-        except Exception as e:
-            logger.warning(f"Final clip failed: {e}")
+        # Final Exact Clip (to target bbox in target CRS)
+        # This ensures pixel alignment with the requested window
+        with contextlib.suppress(Exception):
+            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
 
         merged.name = "elevation"
+        logger.debug("Found CUDEM Coverage")
         return cast(xr.DataArray, merged)
 
     def get_metadata(self) -> dict[str, Any]:
@@ -241,26 +250,33 @@ class CUDEMProvider(Provider):
             return None
 
     def load_tile(self, row: Any, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
-        """Load single tile."""
+        """Load single tile and harmonize datum."""
         url = self._get_tile_url(row)
         if not url:
             return None
 
+        # Ensure raw file is present
         path = self._ensure_tile_cached(url)
         if not path:
             return None
 
-        # Zarr Cache
-        zarr_path = path.parent / "zarr" / path.with_suffix(".zarr").name
+        # --- Zarr Cache Layer ---
+        # If we have already converted this tile to Zarr (optimized & VDatum adjusted), use it.
+        zarr_dir = path.parent / "zarr"
+        zarr_path = zarr_dir / path.with_suffix(".zarr").name  # e.g. tile.tif -> tile.zarr
 
         if zarr_path.exists():
             try:
+                # Use chunks="auto" for Dask lazy loading
                 da_cached = xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
                 logger.info(f"CUDEM Zarr Cache Hit: {zarr_path.name}")
                 return da_cached
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Corrupt CUDEM Zarr cache {zarr_path}: {e}")
+                import shutil
 
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
         # Load Raw
         try:
             da = rioxarray.open_rasterio(path, chunks={"x": 2048, "y": 2048})

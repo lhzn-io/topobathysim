@@ -99,6 +99,7 @@ class GBR100Provider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetches GBR100 data for the given bounding box.

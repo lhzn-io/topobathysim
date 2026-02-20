@@ -19,7 +19,11 @@ from topobathysim.providers.registry import registry
 # Mock Provider
 class MockProvider(Provider):
     def fetch_layer(
-        self, bbox: tuple[float, float, float, float], resolution: float | None = None, crs: str = "EPSG:4326"
+        self,
+        bbox: tuple[float, float, float, float],
+        resolution: float | None = None,
+        crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         # Return dummy data to satisfy interface
         return xr.DataArray(np.zeros((2, 2)), dims=("y", "x"), coords={"y": [0, 1], "x": [0, 1]})

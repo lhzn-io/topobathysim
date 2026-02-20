@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -47,6 +47,7 @@ class CompositionStep(BaseModel):
     blend_distance: float | None = None  # In meters
     zone: ZoneRule | None = None
     transitions: list[TransitionRule] = []
+    filter: dict[str, Any] | None = None
 
     @field_validator("provider")
     @classmethod

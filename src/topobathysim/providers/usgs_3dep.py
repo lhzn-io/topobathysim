@@ -6,16 +6,16 @@ It queries the Microsoft Planetary Computer STAC API for '3dep-seamless', 'cop-d
 and 'nasadem' collections.
 """
 
+import contextlib
 import fcntl
 import logging
-
-# Caching setup
-from functools import lru_cache
+import os
+import random
+import time
 from pathlib import Path
 from typing import Any, cast
 
 import planetary_computer
-import requests  # type: ignore
 import rioxarray
 import xarray as xr
 from pystac_client import Client
@@ -25,101 +25,7 @@ from ..manifest import OfflineManifest
 from .base import Provider
 from .registry import registry
 
-# Share cache directory with Lidar for STAC queries (Not used for query caching anymore)
-# stac_cache_dir = Path.home() / ".cache" / "topobathysim" / "stac_queries"
-
 logger = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=128)
-def _query_stac_cached(
-    bbox: tuple[float, float, float, float],
-    collection_id: str,
-    cache_dir_str: str,
-) -> list[dict] | None:
-    """
-    Cached STAC query for Land Collections (3DEP, NASADEM).
-    Returns list of item dicts (href only) to avoid pickling.
-    """
-    import random
-    import time
-    from pathlib import Path
-
-    cache_dir = Path(cache_dir_str)
-
-    # Global Concurrency Lock (One STAC query at a time across all processes)
-    # This prevents 4-8 workers from bursting the API simultaneously on cold start.
-    lock_file_path = cache_dir / "stac_query.lock"
-
-    logger.debug(f"Querying STAC collection {collection_id} for bbox={bbox}")
-    stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
-
-    max_retries = 4
-
-    with open(lock_file_path, "w") as lock_file:
-        # Blocking Exclusive Lock - Only one worker can query at a time
-        # Downloads are not locked, just the metadata query/signing.
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            for attempt in range(max_retries + 1):
-                try:
-                    logger.debug(
-                        f"Usgs3DepProvider querying (Cached) {collection_id} "
-                        f"for {bbox} (Attempt {attempt + 1})"
-                    )
-
-                    # We MUST sign inplace to get SAS tokens for blob access
-                    # Note: Client.open might make a network call
-                    catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-
-                    # Search
-                    search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
-                    items = list(search.items())
-
-                    if not items:
-                        return None
-
-                    results = []
-                    for item in items:
-                        # Extract asset href
-                        asset_key = "data"
-                        if asset_key not in item.assets and "elevation" in item.assets:
-                            asset_key = "elevation"
-
-                        if asset_key in item.assets:
-                            results.append(
-                                {
-                                    "href": item.assets[asset_key].href,
-                                    "bbox": item.bbox,
-                                    "properties": item.properties,
-                                }
-                            )
-
-                    return results
-
-                except Exception as e:
-                    # Check if it's a timeout or throttling error
-                    is_last_attempt = attempt == max_retries
-                    log_level = logging.WARNING
-                    if is_last_attempt:
-                        log_level = logging.ERROR
-
-                    logger.log(
-                        log_level,
-                        f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
-                    )
-
-                    if is_last_attempt:
-                        return None
-
-                    # Exponential Backoff with Jitter: 1s, 2s, 4s, 8s...
-                    sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
-                    logger.debug(f"Sleeping {sleep_time:.2f}s before retry...")
-                    time.sleep(sleep_time)
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-    return None
 
 
 class Usgs3DepProvider(Provider):
@@ -155,6 +61,7 @@ class Usgs3DepProvider(Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetch USGS 3DEP (or fallback) data for the given bounding box.
@@ -184,6 +91,22 @@ class Usgs3DepProvider(Provider):
 
         raise KeyError(f"No USGS 3DEP/Land coverage found for bbox {bbox}")
 
+    def get_grid(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        target_shape: tuple[int, int] | None = None,
+    ) -> xr.DataArray | None:
+        """
+        Unified access method for Manager compatibility.
+        """
+        try:
+            return self.fetch_layer(bbox=(west, south, east, north))
+        except KeyError:
+            return None
+
     def get_metadata(self) -> dict[str, Any]:
         """
         Return metadata for the 3DEP provider.
@@ -198,95 +121,112 @@ class Usgs3DepProvider(Provider):
             "url": "https://www.usgs.gov/core-science-systems/ngp/3dep",
         }
 
-    def _query_land_collection(
+    def _query_stac_api(
         self,
         bbox: tuple[float, float, float, float],
         collection_id: str,
-        datetime_range: str | None = None,
     ) -> list[dict] | None:
         """
-        Query STAC for land collection items.
+        Query STAC API for Items. Handles Negative Caching and Locking.
         """
-        return _query_stac_cached(bbox, collection_id, str(self.cache_dir))
+        if self.offline_mode:
+            return None
 
-    def _download_and_cache(self, url: str) -> Path | None:
-        """
-        Download a file from a URL to the cache.
-        """
-        import hashlib
+        # 1. Check Negative Cache (No Coverage)
+        if self.manifest.has_no_coverage(collection_id, bbox):
+            logger.debug(f"Negative Cache Hit: {collection_id} is known empty for {bbox}")
+            return None
 
-        import requests
+        # Global Concurrency Lock
+        lock_file_path = self.cache_dir / "stac_query.lock"
+        stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
+        max_retries = 4
 
-        # Create a safe filename from URL
-        # Strip query parameters (SAS tokens) for stable hashing
-        # URL: https://.../blob.core.windows.net/.../file.tif?sv=...
-        url_base = url.split("?")[0]
-        logger.debug(f"Hashing URL Base: {url_base} (Original: {url[:50]}...)")
-        url_hash = hashlib.md5(url_base.encode()).hexdigest()
-        ext = ".tif"
-        if ".tiff" in url_base:
-            ext = ".tiff"
-
-        filename = f"{url_hash}{ext}"
-        local_path = self.cache_dir / filename
-        lock_path = self.cache_dir / f"{filename}.lock"
-        temp_path = self.cache_dir / f".tmp_{filename}"
-
-        # 1. Fast Path
-        if local_path.exists():
-            return local_path
-
-        # 2. Acquire Lock
         try:
-            with open(lock_path, "w") as lock_file:
-                # Exclusive lock (blocking)
+            with open(lock_file_path, "w") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
                 try:
-                    # 3. Double-Check
-                    if local_path.exists():
-                        return local_path
+                    # Double-Check Negative Cache (in case another worker updated it while we waited)
+                    if self.manifest.has_no_coverage(collection_id, bbox):
+                        return None
 
-                    logger.info(f"Downloading land asset to {local_path}...")
+                    for attempt in range(max_retries + 1):
+                        try:
+                            logger.debug(
+                                f"Usgs3DepProvider querying {collection_id} "
+                                f"for {bbox} (Attempt {attempt + 1})"
+                            )
 
-                    with requests.get(url, stream=True) as r:
-                        r.raise_for_status()
-                        with open(temp_path, "wb") as f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                f.write(chunk)
+                            catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+                            search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
+                            items = list(search.items())
 
-                    # Atomic move
-                    temp_path.rename(local_path)
-                    logger.debug("Download complete.")
+                            # Record Search Result (Positive or Negative)
+                            self.manifest.record_search(collection_id, bbox, len(items))
 
-                    # Remove lock on success
-                    lock_path.unlink(missing_ok=True)
-                    return local_path
+                            if not items:
+                                return None
 
+                            results = []
+                            for item in items:
+                                # Extract asset href
+                                asset_key = "data"
+                                if asset_key not in item.assets and "elevation" in item.assets:
+                                    asset_key = "elevation"
+
+                                if asset_key in item.assets:
+                                    results.append(
+                                        {
+                                            "href": item.assets[asset_key].href,
+                                            "bbox": item.bbox,
+                                            "properties": item.properties,
+                                        }
+                                    )
+                            return results
+
+                        except Exception as e:
+                            # Retry logic
+                            is_last_attempt = attempt == max_retries
+                            log_level = logging.WARNING if not is_last_attempt else logging.ERROR
+                            logger.log(
+                                log_level,
+                                f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
+                            )
+
+                            if is_last_attempt:
+                                return None
+
+                            sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
+                            time.sleep(sleep_time)
                 finally:
-                    # Release lock
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-        except Exception as e:
-            if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 403:
-                raise e  # Propagate 403 for upper layers to handle token refresh
-
-            logger.warning(f"Download or Lock failed: {e}")
-            if temp_path.exists():
-                temp_path.unlink()
-            return None
         finally:
-            pass
+            # Best-effort cleanup of lock file
+            with contextlib.suppress(OSError):
+                os.remove(lock_file_path)
+
+        return None
 
     def _fetch_collection(self, bounds: tuple, collection_id: str) -> xr.DataArray | None:
         try:
             items = None
 
-            # 1. Always Check Manifest First (Local STAC Cache)
+            # 1. Check Manifest (Positive Cache)
+            # 1. Check Manifest (Positive Cache) - Logic Update:
+            # We trust the Zarr cache over the manifest for DATA.
+            # But we need to know WHICH items to look for.
+            # The issue is: If we have Zarrs, we don't need to query API.
+            # But we don't know the Zarr filenames without the HREFs.
+            # So:
+            # A) Query API/Manifest to get Items/HREFs.
+            # B) For each Item, Check Zarr.
+            # C) If Zarr exists, load it. If not, stream & save.
+
             logger.debug(f"Checking Local Manifest for {collection_id} in {bounds}")
             manifest_items = self.manifest.find_items(collection_id, bounds)
 
             if manifest_items:
-                # Convert manifest items to the list structure used below
                 items = [
                     {"href": m["href"], "bbox": m["bbox"], "properties": m.get("properties")}
                     for m in manifest_items
@@ -295,60 +235,29 @@ class Usgs3DepProvider(Provider):
                     f"Manifest Cache Hit: Found {len(items)} items for {collection_id} (Skipping API)."
                 )
 
-            # 2. Online Mode - Only Query API if Manifest Miss AND Not Offline
+            # 2. Query API (if Miss)
             if not items and not self.offline_mode:
-                # Use cached query
-                bbox_tuple = tuple(bounds)
-                items = self._query_land_collection(bbox_tuple, collection_id)
+                items = self._query_stac_api(bounds, collection_id)
+
+            # Logic continues... Checks Zarr inside the loop now.
 
             if not items:
                 logger.debug(f"Usgs3DepProvider found 0 items for {collection_id}")
                 return None
 
-            # Record found items to Manifest (if online)
-            if not self.offline_mode:
-                for item in items:
-                    self.manifest.add_item(
-                        collection_id=collection_id,
-                        bbox=item.get("bbox", bounds),  # Fallback to query bounds if item bbox missing
-                        asset_href=item["href"],
-                        properties=item.get("properties"),
-                    )
-
-            logger.debug(f"Usgs3DepProvider found {len(items)} items for {collection_id}")
-
+            items_found: list[dict[str, Any]] = []
             das: list[xr.DataArray] = []
+
             for item in items:
                 href = item["href"]
-                logger.debug(f"Fetching Land Asset: {href}")
+                max_retries = 1
 
-                # Retry loop for corruption handling & Token Expiry
-                for attempt in range(2):
-                    # Download to cache first
+                for retry in range(max_retries + 1):
                     try:
-                        local_path = self._download_and_cache(href)
-                    except requests.HTTPError as e:
-                        if e.response is not None and e.response.status_code == 403:
-                            logger.warning(
-                                f"403 Forbidden for {href}. Clearing STAC cache and local manifest..."
-                            )
-                            # 1. Clear In-Memory Cache (lru_cache)
-                            _query_stac_cached.cache_clear()
+                        logger.debug(f"Streaming Land Asset: {href}")
+                        # Open streaming (Lazy)
+                        da_raw = rioxarray.open_rasterio(href, chunks={"x": 2048, "y": 2048})
 
-                            # 2. Remove Stale Item from Persistent Manifest
-                            self.manifest.remove_item_by_href(href)
-
-                            # 3. Recursive Retry
-                            return self._fetch_collection(bounds, collection_id)
-                        raise e
-
-                    if not local_path:
-                        break  # Download failed (non-403)
-
-                    # Open local file
-                    try:
-                        # Use chunks for lazy loading (Avoid OOM)
-                        da_raw = rioxarray.open_rasterio(local_path, chunks={"x": 2048, "y": 2048})
                         if isinstance(da_raw, list):
                             da = cast(xr.DataArray, da_raw[0])
                         elif isinstance(da_raw, xr.Dataset):
@@ -360,21 +269,97 @@ class Usgs3DepProvider(Provider):
                         if "band" in da.dims:
                             da = da.isel(band=0).drop_vars("band")
 
-                        das.append(da)
+                        # --- WRITE TO ZARR CACHE ---
+                        # We stream the specific item to a local Zarr to avoid re-streaming
+                        if True:  # Was try/except, but we handle errors internally now
+                            # CRITICAL: Clip to requested bounds BEFORE caching
+                            # Otherwise we download the entire 1x1 degree COG (GBs of data)
+                            # for a tiny request.
+                            try:
+                                da = da.rio.clip_box(*bounds)
+                            except Exception:
+                                # If clip fails (no overlap?), this item is useless for the requested bbox.
+                                # Skip it to avoid downloading huge irrelevant files.
+                                logger.debug(f"Clip FAILED for {href} with bounds {bounds}. Skipping item.")
+                                continue
 
-                        break  # Success
+                            # Check if the result is actually reduced
+                            if da.size > 100_000_000:  # Arbitrary large size
+                                logger.warning(
+                                    f"3DEP Asset {href} is too large {da.size} after clip "
+                                    "(or clip failed). Skipping Zarr cache to avoid stall."
+                                )
+                                # We treat this as a failure to cache.
+
+                            # 1. Provide Feedback: Remove stale item
+                            self.manifest.remove_item_by_href(href)
+
+                            # 2. Refresh: Force Query API
+                            # We query the specific item's bbox to get a fresh token for it
+                            item_bbox = tuple(item.get("bbox", bounds))
+
+                            # ... match context ...
+
                     except Exception as e:
-                        logger.warning(
-                            f"Failed to load cached land asset {local_path} (Attempt {attempt + 1}): {e}"
-                        )
-                        # Corruption likely? Delete and try again
-                        if local_path.exists():
-                            logger.warning(f"Deleting corrupted file: {local_path}")
-                            local_path.unlink()
-                        if attempt == 1:
-                            logger.error(f"Permanent failure loading {local_path}")
+                        err_msg = str(e)
+                        is_403 = "403" in err_msg or "Forbidden" in err_msg or "Access Denied" in err_msg
+
+                        if is_403 and retry < max_retries:
+                            logger.warning(f"403 Forbidden for {href}. Refreshing token and retrying...")
+
+                            # 1. Provide Feedback: Remove stale item
+                            self.manifest.remove_item_by_href(href)
+
+                            # 2. Refresh: Force Query API
+                            # We query the specific item's bbox to get a fresh token for it
+                            item_bbox = tuple(item.get("bbox", bounds))
+                            fresh_items = self._query_stac_api(item_bbox, collection_id)
+
+                            if fresh_items:
+                                # Find the matching item in fresh results (by spatial overlap)
+                                # Simple heuristic: replace 'href' with the first fresh item's href
+                                # roughly matching location.
+                                # Actually, just updating the manifest via _query_stac_api is enough?
+                                # No, we need the *new URL* to try opening again.
+
+                                # Let's try to match by bounds check
+                                best_match = None
+                                from shapely.geometry import box
+
+                                target_box = box(*item_bbox)
+
+                                for fresh in fresh_items:
+                                    fresh_box = box(*fresh["bbox"])
+                                    if fresh_box.intersects(target_box):
+                                        best_match = fresh["href"]
+                                        break
+
+                                if best_match:
+                                    logger.info(f"Refreshed URL: {best_match}")
+                                    href = best_match  # Update loop variable for next try
+                                    # Update 'item' dict too so we save valid one to manifest later
+                                    item["href"] = best_match
+                                    continue  # Retry loop
+
+                            logger.error("Failed to refresh SAS token.")
+
+                        logger.warning(f"Failed to stream land asset {href}: {e}")
+                        break
+
+            # Update Manifest only with successfully opened items
+            if not self.offline_mode and items_found:
+                for item in items_found:
+                    self.manifest.add_item(
+                        collection_id=collection_id,
+                        bbox=item.get("bbox", bounds),
+                        asset_href=item["href"],
+                        properties=item.get("properties"),
+                    )
 
             if not das:
+                logger.debug(f"3DEP/Land items found but resulted in no valid data for {collection_id}.")
+                # Negative Cache: Mark this bbox as having no coverage to prevent re-querying
+                self.manifest.record_search(collection_id, bounds, 0)
                 return None
 
             # Merge
@@ -385,8 +370,11 @@ class Usgs3DepProvider(Provider):
                 # STAC Land collections (3DEP/COP-30) are EPSG:4326
                 merged.rio.write_crs("EPSG:4326", inplace=True)
 
-            # Mask Zeros and low-level noise as NaNs (for bathy fusion)
-            merged = merged.where(merged > 0.5)
+            # Check if effective data remains
+            if merged.isnull().all():
+                logger.debug(f"3DEP/Land data masked out (All Water?) for {collection_id}.")
+                self.manifest.record_search(collection_id, bounds, 0)
+                return None
 
             return cast(xr.DataArray | None, merged)
 

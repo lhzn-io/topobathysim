@@ -18,6 +18,7 @@ class Provider(ABC):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Fetch a data layer for the given bounding box.
@@ -26,6 +27,7 @@ class Provider(ABC):
             bbox: Tuple of (min_lon, min_lat, max_lon, max_lat).
             resolution: Desired resolution in meters (approximate).
             crs: Coordinate Reference System string (default: EPSG:4326).
+            **kwargs: Additional provider-specific arguments (e.g., filters).
 
         Returns:
             xr.DataArray: The fetched elevation data, strictly typed.

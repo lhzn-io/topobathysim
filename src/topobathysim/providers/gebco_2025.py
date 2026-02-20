@@ -80,6 +80,7 @@ class GEBCO2025Provider(Topography, Provider):
         bbox: tuple[float, float, float, float],
         resolution: float | None = None,
         crs: str = "EPSG:4326",
+        **kwargs: Any,
     ) -> xr.DataArray:
         """
         Implements Provider.fetch_layer
@@ -283,8 +284,9 @@ class GEBCO2025Provider(Topography, Provider):
             self._da = self._da.sel(lat=slice(s, n), lon=slice(w, e))
 
         if self._da is None:
-            raise KeyError("Failed to load elevation data")
+            raise KeyError(f"Failed to fetch GEBCO data for {self.layer_name}")
 
+        logger.debug("Found GEBCO 2025 Coverage")
         # Ensure consistent naming
         self._da.name = "elevation"
 

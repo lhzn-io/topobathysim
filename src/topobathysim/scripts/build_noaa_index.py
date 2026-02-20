@@ -130,6 +130,19 @@ def process_project(
             # Metadata
             meta = provider.fetch_inport_metadata(project_id) or {}
 
+            # Extract Resolution from Meta
+            # resolution_meters = None # Unused
+
+            # Strategy 1: Structured Tag (e.g. <spatial-resolution><horizontal-distance>
+            # 1</horizontal-distance><horizontal-distance-units>Meter</horizontal-distance-units>
+            # </spatial-resolution>)
+            # Note: The `meta` dict handles parsing.
+            # We need to update `_parse_inport_xml` in `noaa_topobathy.py` to extract resolution FIRST,
+            # OR we can do it here if we had the raw XML, but `fetch_inport_metadata` handles parsing.
+            # actually, `process_project` calls `provider.fetch_inport_metadata` which returns a dict.
+            # So I must update `NoaaTopobathyProvider._parse_inport_xml` to return resolution!
+            # Let's pivot: check `noaa_topobathy.py` first.
+
             return {
                 "project_id": str(project_id),
                 "project_name": project_name,
@@ -140,6 +153,10 @@ def process_project(
                 "end_date": meta.get("end_date"),
                 "vertical_datum": meta.get("vertical_datum"),
                 "sensor_name": meta.get("sensor_name"),
+                "resolution_meters": meta.get("resolution_meters"),
+                "is_topobathy": meta.get("is_topobathy", False)
+                or "topobathy" in project_name.lower()
+                or "bathymetr" in project_name.lower(),
                 "metadata_url": provider._projects_metadata_urls.get(project_id),
             }
 
