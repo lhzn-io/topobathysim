@@ -11,18 +11,33 @@ Unlike traditional pipelines that hardcode logic (e.g., "Always put Lidar over G
 .. mermaid::
 
     graph TD
-        Policy[Policy YAML] --> Loader[Policy Loader]
-        Loader --> Schema[Pydantic Models]
-        Schema --> Runtime[Runtime Engine]
+        subgraph Policy Loading
+            Policy[Policy YAML] -->|Load & Validate| Schema[Pydantic Models]
+            Schema --> Runtime[Runtime Engine]
+        end
 
-        Runtime -- 1. Initialize Canvas --> Canvas[Xarray Dataset]
-        Runtime -- 2. Loop Steps --> P[Provider Registry]
+        subgraph Runtime Execution
+            Runtime -->|1. Initialize| Canvas[Canvas: Elevation + Provenance]
 
-        P -- Fetch Tile (Lazy) --> Cache[Zarr Cache]
-        Cache -- Return Data --> Runtime
+            Runtime -->|2. Loop Steps| Registry[Provider Registry]
+            Registry -->|Get Provider| Match
 
-        Runtime -- 3. Reproject --> Match[Aligned Layer]
-        Match -- 4. Blend --> Canvas
+            Runtime -->|3. Fetch & Align| Match[Fetch Layer (Lazy/Cached) + Reproject]
+
+            Match -->|4. Check Rules| Rules{Transition Rules?}
+
+            Rules -- Yes --> TransOp[Apply Specific Operator (e.g. Feather)]
+            Rules -- No --> DefOp[Apply Default Operator (e.g. Overwrite)]
+
+            TransOp --> Blend[Blend into Canvas]
+            DefOp --> Blend
+
+            Blend -->|Update| Provenance[Update Source Mask]
+        end
+
+        subgraph Output
+            Provenance -->|Finalize| Dataset[Xarray Dataset]
+            Dataset -->|Save| Zarr[Output Zarr Cache]
 
 Components
 ----------

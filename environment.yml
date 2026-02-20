@@ -40,3 +40,8 @@ dependencies:
   - pandas-stubs
   - types-PyYAML
   - ipykernel
+  # Documentation
+  - sphinx
+  - sphinx-rtd-theme
+  - myst-parser
+  - sphinxcontrib-mermaid

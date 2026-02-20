@@ -1,9 +1,9 @@
-.. TopoBathySim documentation master file.
+.. TopoBathySim documentation main file.
 
 TopoBathySim
 ============
 
-**TopoBathySim** is a BMI-compliant Python library for seamless topobathymetric fusion. It integrates global bathymetry (GEBCO 2025) with high-resolution coastal Lidar (NOAA BlueTopo) and Land Topography (USGS 3DEP) to create continuous elevation models for marine simulation.
+**TopoBathySim** is a policy-driven fusion runtime for seamless topobathymetric data products.
 
 .. image:: _static/topobathyscreenshot.png
    :alt: TopoBathySim Screenshot
@@ -13,6 +13,7 @@ TopoBathySim
    :maxdepth: 2
    :caption: Contents:
 
+   vision
    policy_dsl
    policy_walkthrough
    runtime_architecture

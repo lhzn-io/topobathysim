@@ -37,7 +37,7 @@ class FusionEngine:
         # 1. Align Grids
         # Assuming lidar_da has been reprojected/regridded to match bathy_da externally
         # or we do simple alignment here.
-        # For MVP, we assume they are spatially aligned or we use bathy as master.
+        # For MVP, we assume they are spatially aligned or we use bathy as the primary.
 
         lidar_interp = lidar_da.interp_like(bathy_da, method="linear")
 

@@ -223,14 +223,14 @@ def main() -> None:
         logger.error("No valid project indices found. Aborting save.")
         return
 
-    # Create Master GeoDataFrame
-    gdf_master = gpd.GeoDataFrame(results, crs="EPSG:4326")
+    # Create Main GeoDataFrame
+    gdf_main = gpd.GeoDataFrame(results, crs="EPSG:4326")
 
     # Save
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving index to {INDEX_PATH}...")
     try:
-        gdf_master.to_file(INDEX_PATH, driver="GeoJSON")
+        gdf_main.to_file(INDEX_PATH, driver="GeoJSON")
         logger.info("Done.")
     except Exception as e:
         logger.error(f"Failed to save GeoJSON: {e}")

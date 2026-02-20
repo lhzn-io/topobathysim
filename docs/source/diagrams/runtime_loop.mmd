@@ -1,0 +1,29 @@
+graph TD
+    subgraph Policy Loading
+        Policy[Policy YAML] -->|Load & Validate| Schema[Pydantic Models]
+        Schema --> Runtime[Runtime Engine]
+    end
+
+    subgraph Runtime Execution
+        Runtime -->|1. Initialize| Canvas[Canvas: Elevation + Provenance]
+
+        Runtime -->|2. Loop Steps| Registry[Provider Registry]
+        Registry -->|Get Provider| Match
+
+        Runtime -->|3. Fetch & Align| Match["Fetch Layer (Lazy/Cached) + Reproject"]
+
+        Match -->|4. Check Rules| Rules{Transition Rules?}
+
+        Rules -- Yes --> TransOp["Apply Specific Operator (e.g. Feather)"]
+        Rules -- No --> DefOp["Apply Default Operator (e.g. Overwrite)"]
+
+        TransOp --> Blend[Blend into Canvas]
+        DefOp --> Blend
+
+        Blend -->|Update| Provenance[Update Source Mask]
+    end
+
+    subgraph Output
+        Provenance -->|Finalize| Dataset[Xarray Dataset]
+        Dataset -->|Save| Zarr[Output Zarr Cache]
+    end
