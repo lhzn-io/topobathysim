@@ -1,5 +1,10 @@
 # TopoBathySim
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+![TopoBathySim Screenshot](docs/source/_static/topobathyscreenshot.png)
+
 **Policy-driven topobathymetric fusion runtime for data-first digital worlds.**
 
 TopoBathySim fuses heterogeneous elevation sources (global bathymetry, global land DEMs, and optional high‑resolution regional datasets) into seamless, analysis- and simulation-ready grids. It produces **data-first outputs** (`xarray.Dataset`) with **per-pixel provenance** (source masks), and optionally serves the same products over HTTP for real-time clients.
