@@ -172,10 +172,22 @@ class GEBCO2025Provider(Topography, Provider):
 
                 # B. Fetch from OPeNDAP if missing
                 if da_tile is None:
+                    import threading
+
                     from filelock import FileLock
 
+                    # Class level thread lock for deduplication
+                    if not hasattr(self.__class__, "_locks"):
+                        self.__class__._locks = {}
+                        self.__class__._locks_lock = threading.Lock()
+
+                    with self.__class__._locks_lock:
+                        if tile_key not in self.__class__._locks:
+                            self.__class__._locks[tile_key] = threading.Lock()
+                        thread_lock = self.__class__._locks[tile_key]
+
                     lock_path = cache_path.with_suffix(".zarr.lock")
-                    with FileLock(lock_path):
+                    with thread_lock, FileLock(lock_path):
                         # Double check
                         if cache_path.exists():
                             logger.info(f"GEBCO Zarr Cache Hit (after lock): {tile_key}")
@@ -190,12 +202,20 @@ class GEBCO2025Provider(Topography, Provider):
                         else:
                             logger.info(f"GEBCO Zarr Cache Miss: {tile_key}")
                             try:
-                                if ds_remote is None:
+                                if (
+                                    not hasattr(self.__class__, "_ds_remote")
+                                    or self.__class__._ds_remote is None
+                                ):
                                     try:
-                                        ds_remote = xr.open_dataset(self.OPENDAP_URL, engine="pydap")
+                                        logger.info("Initializing global GEBCO OPeNDAP Connection...")
+                                        self.__class__._ds_remote = xr.open_dataset(
+                                            self.OPENDAP_URL, engine="pydap"
+                                        )
                                     except Exception as connection_err:
                                         logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
                                         raise
+
+                                ds_remote = self.__class__._ds_remote
 
                                 logger.info(f"Downloading GEBCO 1x1 Tile to Cache: {tile_key}")
 

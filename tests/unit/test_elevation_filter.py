@@ -73,6 +73,10 @@ def policy_with_filters(tmp_path: Any) -> str:
 
 
 def test_elevation_constraints(policy_with_filters: str) -> None:
+    pass
+
+
+def test_filter_bounds(policy_with_filters: str) -> None:
     """Test that runtime respects min_elevation and max_elevation filters."""
 
     # Base Provider returns a flat 0.0 surface

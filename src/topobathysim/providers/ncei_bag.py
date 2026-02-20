@@ -11,7 +11,6 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +20,7 @@ import xarray as xr
 from filelock import FileLock
 from rioxarray.merge import merge_arrays
 
+from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumResolver
 from .base import Provider
 from .registry import registry
@@ -32,10 +32,11 @@ USER_AGENT = (
 )
 
 
-@lru_cache(maxsize=16)
+@concurrent_lru_cache()
 def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     """
-    Reads BAG using h5py (or rasterio) and converts to xarray with NAVD88 correction.
+    Cached, standalone function to read a single BAG file.
+    This avoids keeping large dataset references inside class definitions.
     Cached to avoid re-opening/parsing headers for every tile.
     """
     # Define a pathway for the cached Zarr version (directory)
@@ -254,7 +255,7 @@ class BAGDiscovery:
         Reads BAG using h5py (or rasterio) and converts to xarray with NAVD88 correction.
         Cached to avoid re-opening/parsing headers for every tile.
         """
-        return _read_bag_cached(local_path)
+        return cast("xr.DataArray | None", _read_bag_cached(local_path))
 
     @classmethod
     def _get_redirect_from_cache(cls, download_url: str) -> list[str] | None:
@@ -366,7 +367,7 @@ class BAGDiscovery:
         return []
 
     @classmethod
-    @lru_cache(maxsize=128)
+    @concurrent_lru_cache()
     def find_bag_by_survey_id(cls, survey_id: str) -> list[str]:
         """
         Query NCEI API for a specific Survey ID (e.g., 'H13385') to get the BAG download URL(s).
@@ -420,7 +421,7 @@ class BAGDiscovery:
             return []
 
     @classmethod
-    @lru_cache(maxsize=128)
+    @concurrent_lru_cache()
     def find_bag_by_location(cls, lat: float, lon: float) -> list[str]:
         """
         Query NCEI API by location (spatial intersection).
@@ -473,7 +474,7 @@ class BAGDiscovery:
         return []
 
     @classmethod
-    @lru_cache(maxsize=128)
+    @concurrent_lru_cache()
     def find_bags_by_bbox(cls, west: float, south: float, east: float, north: float) -> list[str]:
         """
         Queries NCEI for BAGs intersecting the bounding box.
@@ -791,7 +792,7 @@ class BAGProvider(Provider):
     def _read_bag(self, local_path: Path) -> xr.DataArray | None:
         """wrapper to call standalone cached function."""
         # Use standalone function to leverage python LRU cache safely outside class methods.
-        return _read_bag_cached(local_path)
+        return cast("xr.DataArray | None", _read_bag_cached(local_path))
 
 
 # Register the provider
