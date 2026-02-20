@@ -252,8 +252,8 @@ class BathyManager:
                     #   -idx: -10 < -1 (Higher idx comes first)
                     #   res: 1.0 < 2.0 (Smaller res comes first for same idx)
 
-                    # NOTE: 'idx' comes from bag_urls which was sorted Old->New.
-                    # So higher idx is newer.
+                    # The index 'idx' derives from bag_urls, which is sorted chronologically.
+                    # Higher index equals newer survey.
 
                     augmented_results.sort(key=lambda x: (-x[0], x[1]))
 
@@ -408,10 +408,7 @@ class BathyManager:
 
         if not valid_layers:
             if return_source_mask:
-                # Must satisfy Tuple[DataArray, DataArray | None] per annotation logic?
-                # No, annotation says: "xr.DataArray | tuple[xr.DataArray, xr.DataArray | None]"
-                # Checking None return is cleaner if we modify signature or cast.
-                # Let's verify the signature.
+                # Return generic empty tuple based on signature.
                 return cast(tuple[xr.DataArray, xr.DataArray | None], (None, None))
 
             return cast(xr.DataArray, None)

@@ -1,3 +1,11 @@
+"""
+NOAA Index Builder Script.
+
+This script scans NOAA's data repositories (S3 and InPort) to construct a localized
+GeoJSON index of available Topobathymetric surveys, including their bounding boxes,
+CRS, and resolution metadata for faster runtime querying.
+"""
+
 import concurrent.futures
 import logging
 from pathlib import Path
@@ -133,15 +141,8 @@ def process_project(
             # Extract Resolution from Meta
             # resolution_meters = None # Unused
 
-            # Strategy 1: Structured Tag (e.g. <spatial-resolution><horizontal-distance>
-            # 1</horizontal-distance><horizontal-distance-units>Meter</horizontal-distance-units>
-            # </spatial-resolution>)
-            # Note: The `meta` dict handles parsing.
-            # We need to update `_parse_inport_xml` in `noaa_topobathy.py` to extract resolution FIRST,
-            # OR we can do it here if we had the raw XML, but `fetch_inport_metadata` handles parsing.
-            # actually, `process_project` calls `provider.fetch_inport_metadata` which returns a dict.
-            # So I must update `NoaaTopobathyProvider._parse_inport_xml` to return resolution!
-            # Let's pivot: check `noaa_topobathy.py` first.
+            # Note: The `meta` dict handles parsing the XML tags such as <spatial-resolution>
+            # The resolution extraction logic is implemented in `NoaaTopobathyProvider._parse_inport_xml`.
 
             return {
                 "project_id": str(project_id),
@@ -170,6 +171,10 @@ def process_project(
 
 
 def main() -> None:
+    """
+    Main entry point for building the NOAA spatial index.
+    Orchestrates the discovery and parallel processing of projects.
+    """
     logger.info("Starting NOAA Spatial Index Builder...")
 
     provider = NoaaTopobathyProvider()

@@ -42,6 +42,9 @@ class NoaaTopobathyProvider(Provider):
     BUCKET_BASE = "noaa-nos-coastal-lidar-pds"
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
+        """
+        Initializes the Topobathy provider, creating necessary cache directories.
+        """
         self.base_cache_dir = Path(cache_dir).expanduser()
         self.cache_dir = self.base_cache_dir / "noaa_topobathy"
         self.metadata_dir = self.base_cache_dir / "metadata"
@@ -404,10 +407,8 @@ class NoaaTopobathyProvider(Provider):
                             meta["vertical_datum"] = "Ellipsoid"
 
             # 2. Time Period
-            # Strategy:
-            # A) Check <extents> for detailed time frames (aggregate min/max)
-            # B) Check top-level <time-period> (less common/detailed)
-            # C) Fallback to Name Regex (handled in find_projects_by_box, but we could do it here too)
+            # Parsing strategy: Check <extents> for detailed time frames,
+            # check top-level <time-period>, then fallback to name analysis.
 
             starts = []
             ends = []
@@ -553,13 +554,10 @@ class NoaaTopobathyProvider(Provider):
                 "Spatial index missing. Building NOAA Project Index (this may take several minutes)..."
             )
             try:
-                # Run the builder script logic
-                # To avoid circular imports, we import the function here
                 # Note: `scripts` must be a package for this to work relative within `topobathysim` context
                 from ..scripts.build_noaa_index import main as build_index
 
-                # If running purely as script, build_index execution context might differ,
-                # but since we are in `topobathysim` package, it should work.
+                # Run the builder script logic
                 build_index()
             except ImportError:
                 # Fallback if scripts isn't importable as package
@@ -618,6 +616,10 @@ class NoaaTopobathyProvider(Provider):
             if not candidates.empty:
                 # Helper: Extract Year
                 def get_year(row: Any) -> int:
+                    """
+                    Extracts the survey year from a project row.
+                    Prefers explicit end_date, then regex on project_name, then fallback.
+                    """
                     # Try explicit date first
                     if hasattr(row, "end_date") and row.end_date:
                         try:
@@ -655,14 +657,7 @@ class NoaaTopobathyProvider(Provider):
                     # 2. Resolution Filter
                     if "max_resolution" in filter_criteria and "resolution_meters" in candidates.columns:
                         max_res = float(filter_criteria["max_resolution"])
-                        # Keep if resolution is known and <= max_res, OR if unknown?
-                        # Strict: Exclude if > max_res. Keep if NaN?
-                        # Let's keep if <= max_res.
-                        # Handle NaNs: fill with 999 (coarse) or 0 (fine)?
-                        # If a user asks for fine data (<2m), and we don't know, maybe exclude?
-                        # For now, let's include unknowns to be safe, but log?
-                        # Or exclude if we are confident our index is good.
-                        # Let's simple check: (res <= max) | (res is null)
+                        # Keep items where resolution is less than max_res or unknown
                         candidates = candidates[
                             (candidates["resolution_meters"] <= max_res)
                             | (candidates["resolution_meters"].isna())
@@ -719,6 +714,10 @@ class NoaaTopobathyProvider(Provider):
                 # --- SCORING & SORTING ---
                 # 1. Datum Priority (Geoid18 > NAVD88 > Ellipsoid)
                 def datum_score(d: object) -> int:
+                    """
+                    Scores the vertical datum for prioritization.
+                    NAVD88 > NAVD88 (Geoid18) > Ellipsoid > Unknown.
+                    """
                     d_str = str(d).lower()
                     if "geoid18" in d_str:
                         return 3
@@ -732,6 +731,10 @@ class NoaaTopobathyProvider(Provider):
 
                 # 2. Prioritize "Topobathy" in name (vs generic DEM)
                 def name_score(n: object) -> int:
+                    """
+                    Scores the project name for topobathymetric relevance.
+                    Prioritizes explicit topobathy/bathymetry keywords.
+                    """
                     n_str = str(n).lower()
                     if "topobathy" in n_str:
                         return 1

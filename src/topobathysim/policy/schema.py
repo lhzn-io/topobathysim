@@ -5,6 +5,12 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from topobathysim.providers.registry import registry
 
+"""
+Policy Schema Definitions.
+
+This module provides the Pydantic models used to validate and load YAML fusion policies.
+"""
+
 
 class ZoneRule(BaseModel):
     """
@@ -17,6 +23,10 @@ class ZoneRule(BaseModel):
 
 
 class OperatorType(str, Enum):
+    """
+    Types of spatial fusion operators available.
+    """
+
     metric_feather = "metric_feather"
     overwrite = "overwrite"
     linear_blend = "linear_blend"
@@ -52,6 +62,9 @@ class CompositionStep(BaseModel):
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, v: str) -> str:
+        """
+        Validates that the specified provider name corresponds to a registered Provider implementation.
+        """
         # Runtime check to ensure provider is registered
         # Note: This requires providers to be loaded before policy validation
         import contextlib
@@ -83,6 +96,9 @@ class FusionPolicy(BaseModel):
 
     @model_validator(mode="after")
     def check_at_least_one_variable(self) -> "FusionPolicy":
+        """
+        Validates that the policy contains at least one variable strategy.
+        """
         if not self.variables:
             raise ValueError("Policy must contain at least one variable strategy.")
         return self

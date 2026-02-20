@@ -651,9 +651,7 @@ class BAGProvider(Provider):
 
                 # 1. Deviation/Spike Removal (Change-based Cleanse)
                 # Defaults to None (disabled) unless specified, OR we can default it on?
-                # User asked to "replace mask with change-based cleanse".
-                # Let's check for 'max_depth_change' or 'max_deviation' keys.
-                # If specifically requested, or if we want a safe default?
+                # Check for 'max_depth_change' or 'max_deviation' keys for uncertainty.
                 # Logic: If 'max_depth_change' is present use it.
                 max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
 
@@ -765,8 +763,7 @@ class BAGProvider(Provider):
             return cast(xr.DataArray, merged)
         except Exception as e:
             logger.error(f"Failed to merge BAGs for {survey_id}: {e}")
-            # Fallback: return the largest one? or just the first?
-            # Let's return the first one as best effort
+            # Return the first one as best effort
             return loaded_arrays[0]
 
     def _ensure_downloaded(self, url: str) -> Path | None:
@@ -817,8 +814,7 @@ class BAGProvider(Provider):
 
     def _read_bag(self, local_path: Path) -> xr.DataArray | None:
         """wrapper to call standalone cached function."""
-        # Note: B019 warns about lru_cache on method.
-        # We rely on the standalone function's cache.
+        # Use standalone function to leverage python LRU cache safely outside class methods.
         return _read_bag_cached(local_path)
 
 
