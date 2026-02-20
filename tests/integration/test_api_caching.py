@@ -2,9 +2,9 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from topobathyserve.main import app, get_manager
+from topobathyserve.main import app, get_policy_path
 
-from topobathysim.manager import BathyManager
+from topobathysim.policy.schema import CompositionStep, FusionPolicy, VariableStrategy
 
 
 @pytest.fixture
@@ -16,16 +16,38 @@ def clean_cache(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def test_manager(clean_cache: Path) -> BathyManager:
-    """Returns a BathyManager configured to use the temp cache."""
-    return BathyManager(cache_dir=str(clean_cache))
+def test_policy_path(clean_cache: Path) -> Path:
+    """Creates a basic policy pointing its cache to the clean tmp_path."""
+    policy = FusionPolicy(
+        name="Test Caching Policy",
+        version="1.0.0",
+        variables=[
+            VariableStrategy(
+                name="elevation",
+                steps=[
+                    CompositionStep(provider="UsgsLidarProvider"),
+                    CompositionStep(provider="Usgs3DepProvider"),
+                ],
+            )
+        ],
+    )
+
+    policy_path = clean_cache / "policy.yaml"
+    with open(policy_path, "w") as f:
+        # Patch the environment cache to point here during test explicitly
+        import os
+
+        os.environ["TOPOBATHYSIM_CACHE_DIR"] = str(clean_cache)
+        f.write(policy.model_dump_json())
+    return policy_path
 
 
 @pytest.fixture
-def client(test_manager: BathyManager) -> TestClient:
-    """Returns a TestClient with the manager dependency overridden."""
-    app.dependency_overrides[get_manager] = lambda: test_manager
-    return TestClient(app)
+def client(test_policy_path: Path) -> TestClient:
+    """Returns a TestClient with the policy path dependency overridden."""
+    app.dependency_overrides[get_policy_path] = lambda: test_policy_path
+    with TestClient(app) as client:
+        yield client
 
 
 @pytest.mark.integration

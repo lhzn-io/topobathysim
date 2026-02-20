@@ -121,13 +121,25 @@ def run(
     cache_path = None
     if use_cache:
         try:
-            cache_dir = Path("~/.cache/topobathysim/fused_zarr").expanduser()
+            import os
+
+            default_cache = "~/.cache/topobathysim/fused_zarr"
+            cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
+
+            # If the user overrode the global cache dir, append fused_zarr
+            # so it doesn't dump straight into the root
+            default_fused_zarr = "~/.cache/topobathysim/fused_zarr"
+            if cache_dir_str != default_fused_zarr and not cache_dir_str.endswith("fused_zarr"):
+                cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
+            else:
+                cache_dir = Path(cache_dir_str).expanduser()
+
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             # Hash Key: Policy Content + BBox + Resolution + CRS
             # Round floats to 6 decimals to avoid micro-mismatches (parity with legacy)
             key_dict = {
-                "policy": policy.model_dump(),  # type: ignore
+                "policy": policy.model_dump_json(),  # type: ignore
                 "bbox": [round(x, 6) for x in [min_x, min_y, max_x, max_y]],
                 "res": [round(x, 6) for x in [res_x, res_y]],
                 "crs": target_crs,
@@ -344,16 +356,19 @@ def run(
 
                     shutil.rmtree(cache_path)
 
-                tmp_path.rename(cache_path)
+                import shutil
+
+                shutil.move(str(tmp_path), str(cache_path))
+                logger.debug(f"Successfully cached Fused Zarr: {cache_path}")
 
             except Exception as e:
-                logger.warning(f"Failed to write atomic cache {cache_path}: {e}")
+                logger.error(f"Failed to write atomic cache {cache_path}: {e}")
                 if tmp_path.exists():
                     import shutil
 
                     shutil.rmtree(tmp_path)
 
         except Exception as e:
-            logger.warning(f"Failed to write cache {cache_path}: {e}")
+            logger.error(f"Failed to write cache {cache_path}: {e}")
 
     return ds

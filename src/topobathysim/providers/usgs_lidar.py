@@ -8,7 +8,6 @@ rasterizes the point clouds to a target resolution/CRS.
 
 import json
 import logging
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,13 +20,14 @@ import xarray as xr
 from affine import Affine
 
 from ..manifest import OfflineManifest
+from ..utils.cache import concurrent_lru_cache
 from .base import Provider
 from .registry import registry
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=128)
+@concurrent_lru_cache()
 def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
     """
     Cached STAC query for 3DEP Lidar (In-Memory Only).
@@ -266,7 +266,13 @@ class UsgsLidarProvider(Provider):
 
                 # Filter bounds if requested
                 if bounds:
-                    da = da.rio.clip_box(*bounds)
+                    try:
+                        da = da.rio.clip_box(*bounds)
+                    except Exception as clip_err:
+                        logger.debug(
+                            f"Lidar Zarr {zarr_path.name} does not intersect requested bounds: {clip_err}"
+                        )
+                        return None
 
                 logger.info(f"Lidar Zarr Cache Hit: {zarr_path.name}")
                 return da

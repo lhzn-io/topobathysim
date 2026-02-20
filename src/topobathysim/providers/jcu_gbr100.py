@@ -49,33 +49,39 @@ class GBR100Provider(Provider):
         Ensures data is downloaded and extracted.
         Returns path to the main grid file (nc/grd/tif).
         """
-        # 1. Download if missing
-        if not self.zip_path.exists():
-            logger.info(f"Downloading GBR100 from {self.DOWNLOAD_URL}...")
-            try:
-                with requests.get(self.DOWNLOAD_URL, stream=True, timeout=120) as r:
-                    r.raise_for_status()
-                    with open(self.zip_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                logger.info("GBR100 download complete.")
-            except Exception as e:
-                # Clean up partial download
-                if self.zip_path.exists():
-                    self.zip_path.unlink()
-                raise RuntimeError(f"Failed to download GBR100: {e}") from e
+        from filelock import FileLock
 
-        if not self.extracted_dir.exists() or not any(self.extracted_dir.iterdir()):
-            logger.info(f"Extracting GBR100 to {self.extracted_dir}...")
-            self.extracted_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                with zipfile.ZipFile(self.zip_path, "r") as z:
-                    z.extractall(self.extracted_dir)
-            except Exception as e:
-                import shutil
+        lock_path = self.zip_path.with_suffix(".lock")
 
-                shutil.rmtree(self.extracted_dir, ignore_errors=True)
-                raise RuntimeError(f"Failed to unzip GBR100: {e}") from e
+        with FileLock(lock_path):
+            # 1. Download if missing
+            if not self.zip_path.exists():
+                logger.info(f"Downloading GBR100 from {self.DOWNLOAD_URL}...")
+                try:
+                    with requests.get(self.DOWNLOAD_URL, stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        with open(self.zip_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                    logger.info("GBR100 download complete.")
+                except Exception as e:
+                    # Clean up partial download
+                    if self.zip_path.exists():
+                        self.zip_path.unlink()
+                    raise RuntimeError(f"Failed to download GBR100: {e}") from e
+
+            # 2. Extract
+            if not self.extracted_dir.exists() or not any(self.extracted_dir.iterdir()):
+                logger.info(f"Extracting GBR100 to {self.extracted_dir}...")
+                self.extracted_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(self.zip_path, "r") as z:
+                        z.extractall(self.extracted_dir)
+                except Exception as e:
+                    import shutil
+
+                    shutil.rmtree(self.extracted_dir, ignore_errors=True)
+                    raise RuntimeError(f"Failed to unzip GBR100: {e}") from e
 
         # 3. Find Data File (.nc, .grd, .tif)
         candidates = (

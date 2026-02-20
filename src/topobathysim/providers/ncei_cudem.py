@@ -141,28 +141,33 @@ class CUDEMProvider(Provider):
         if self._gdf is not None:
             return
 
-        # 1. Download Index Zip
-        if not self.index_path.exists():
-            url = f"{self.BASE_S3_URL}/{self.TILE_INDEX_ZIP}"
-            logger.info(f"Downloading CUDEM Tile Index from {url}...")
-            try:
-                r = requests.get(url, stream=True, timeout=60)
-                r.raise_for_status()
-                with open(self.index_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            except Exception as e:
-                logger.error(f"Failed to download CUDEM Index: {e}")
-                return
+        from filelock import FileLock
 
-        # 2. Extract Shapefile
-        if not self.index_shp_dir.exists():
-            try:
-                with zipfile.ZipFile(self.index_path, "r") as z:
-                    z.extractall(self.index_shp_dir)
-            except Exception as e:
-                logger.error(f"Failed to unzip CUDEM Index: {e}")
-                return
+        lock_path = self.index_path.with_suffix(".lock")
+
+        with FileLock(lock_path):
+            # 1. Download Index Zip
+            if not self.index_path.exists():
+                url = f"{self.BASE_S3_URL}/{self.TILE_INDEX_ZIP}"
+                logger.info(f"Downloading CUDEM Tile Index from {url}...")
+                try:
+                    r = requests.get(url, stream=True, timeout=60)
+                    r.raise_for_status()
+                    with open(self.index_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                except Exception as e:
+                    logger.error(f"Failed to download CUDEM Index: {e}")
+                    return
+
+            # 2. Extract Shapefile
+            if not self.index_shp_dir.exists():
+                try:
+                    with zipfile.ZipFile(self.index_path, "r") as z:
+                        z.extractall(self.index_shp_dir)
+                except Exception as e:
+                    logger.error(f"Failed to unzip CUDEM Index: {e}")
+                    return
 
         # 3. Load GDF
         try:

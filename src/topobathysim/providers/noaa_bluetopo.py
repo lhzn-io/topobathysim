@@ -174,22 +174,28 @@ class NoaaBlueTopoProvider(Provider):
         if self._gdf is not None:
             return
 
-        if not self.scheme_path.exists():
-            try:
-                # Ensure directory exists (it might have been cleared runtime)
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
+        from filelock import FileLock
 
-                # Dynamic Resolution
-                download_url = self._resolve_scheme_url()
+        lock_path = self.scheme_path.with_suffix(".lock")
 
-                response = requests.get(download_url, stream=True)
-                response.raise_for_status()
-                with open(self.scheme_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            except Exception as e:
-                logger.warning(f"Failed to download BlueTopo Tile Scheme: {e}")
-                return
+        with FileLock(lock_path):
+            if not self.scheme_path.exists():
+                try:
+                    # Ensure directory exists (it might have been cleared runtime)
+                    self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Dynamic Resolution
+                    download_url = self._resolve_scheme_url()
+
+                    logger.info(f"Downloading BlueTopo Tile Scheme to {self.scheme_path}...")
+                    response = requests.get(download_url, stream=True)
+                    response.raise_for_status()
+                    with open(self.scheme_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                except Exception as e:
+                    logger.warning(f"Failed to download BlueTopo Tile Scheme: {e}")
+                    return
 
         try:
             self._gdf = gpd.read_file(self.scheme_path)

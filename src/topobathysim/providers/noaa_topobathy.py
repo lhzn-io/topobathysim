@@ -915,8 +915,6 @@ class NoaaTopobathyProvider(Provider):
             logger.error(f"Cannot resolve folder for Project ID {self._active_project_id}")
             return None
 
-        folder_name = self._projects[self._active_project_id]
-
         # Construct Remote and Local paths
         if "https://" in tile_filename or "http://" in tile_filename:
             # If tile_filename comes in as a full URL (from 'URL' column in index)
@@ -926,11 +924,20 @@ class NoaaTopobathyProvider(Provider):
             tile_filename = tile_filename.split("/")[-1]
         else:
             # Construct standard URL
-            http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{folder_name}/{tile_filename}"
+            # The tile_filename from the spatial index often contains the subdirectories
+            # already, e.g. "SLR_viewer_DEM_6230/NY/NY_Metro_GCS_3m_NAVDm.tif".
+            # Clean up leading slashes that cause double slashes in S3 URL string
+            clean_tile_filename = tile_filename.lstrip("/")
+
+            http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{clean_tile_filename}"
 
         local_filename = f"{self._active_project_id}_{tile_filename}"
 
         # --- CACHE KEY GENERATION ---
+        # Legacy/Full file cache name (without bbox slice)
+        full_zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + "_navd88.zarr"
+        full_zarr_path = self.cache_dir / "zarr" / full_zarr_name
+
         # If bbox provided, include hash in filename
         if bbox:
             import hashlib
@@ -942,10 +949,21 @@ class NoaaTopobathyProvider(Provider):
             bbox_hash = hashlib.md5(str(rb).encode()).hexdigest()[:8]
             zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + f"_navd88_{bbox_hash}.zarr"
         else:
-            # Legacy/Full file cache
-            zarr_name = local_filename.replace(".tif", "").replace(".tiff", "") + "_navd88.zarr"
+            zarr_name = full_zarr_name
 
         zarr_path = self.cache_dir / "zarr" / zarr_name
+
+        # 0. Check if FULL Tile is already cached (Avoids streaming from S3 if we already have the parent)
+        if bbox and full_zarr_path.exists():
+            try:
+                da = xr.open_dataarray(full_zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                logger.debug(f"Topobathy Zarr Cache Hit (Full Tile Proxy for BBox): {full_zarr_name}")
+                # Clip it in memory and return immediately (no need to write a micro-zarr to disk)
+                da = da.rio.clip_box(*bbox)
+                return da
+            except Exception as e:
+                logger.debug(f"Full Zarr proxy cache load failed or clip failed: {e}")
+                pass  # Fall back to normal flow
 
         # 1. Zarr Cache Hit (Fast Path)
         if zarr_path.exists():
