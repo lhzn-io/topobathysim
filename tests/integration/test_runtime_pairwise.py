@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -31,14 +31,12 @@ class MockParamsProvider(Provider):
         crs: str = "EPSG:4326",
         **kwargs: Any,
     ) -> xr.DataArray:
-        # Create grid matching the test scenario (100x100)
-        # We assume a fixed grid for this test, but honor the input bounds for alignment.
-
-        # Test Scenario: 1x1 degree box at (0,0)
         min_lon, min_lat, max_lon, max_lat = bbox
 
-        # Force a small grid for testing (100x100)
-        width, height = 100, 100
+        # Dynamic high-resolution grid (approx 10m in degrees)
+        res_deg = 0.0001
+        width = max(int((max_lon - min_lon) / res_deg), 10)
+        height = max(int((max_lat - min_lat) / res_deg), 10)
         res_x = (max_lon - min_lon) / width
         res_y = (max_lat - min_lat) / height
 
@@ -52,9 +50,8 @@ class MockParamsProvider(Provider):
         }
 
         da = xr.DataArray(data, coords=coords, dims=("y", "x"))
-        # Force 4326 because we used the bbox (which is 4326) to generate coords
-        # Ignoring the requested 'crs' argument which is just a hint
         da.rio.write_crs("EPSG:4326", inplace=True)
+        da.rio.write_nodata(np.nan, inplace=True)
         da.rio.write_transform(transform, inplace=True)
 
         return da
@@ -72,8 +69,9 @@ class LidarProvider(MockParamsProvider):
 
     def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
         da = super().fetch_layer(*args, **kwargs)
-        # Occupy LEFT half
-        da.values[:, 50:] = np.nan
+        # Occupy ORIGINAL LEFT half of the (-74.01 to -74.00) test box
+        da = cast(xr.DataArray, da.where(da.x < -74.005, np.nan))
+        print("Lidar raw vals:", np.unique(da.values))
         return da
 
 
@@ -83,10 +81,9 @@ class StructureProvider(MockParamsProvider):
 
     def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
         da = super().fetch_layer(*args, **kwargs)
-        # Occupy CENTER (overlapping both left and right of canvas)
-        # x indices 25 to 75
-        da.values[:, :25] = np.nan
-        da.values[:, 75:] = np.nan
+        # Occupy ORIGINAL CENTER (-74.0075 to -74.0025)
+        mask = (da.x >= -74.0075) & (da.x <= -74.0025)
+        da = cast(xr.DataArray, da.where(mask, np.nan))
         return da
 
 
@@ -145,7 +142,7 @@ def test_pairwise_fusion_logic(pairwise_policy_file: str) -> None:
     # NYC is approx 74W, 40.7N.
     bbox = (-74.01, 40.70, -74.00, 40.71)
 
-    ds = run(pairwise_policy_file, bbox, resolution=10.0)
+    ds = run(pairwise_policy_file, bbox, resolution=10.0, use_cache=False)
 
     assert isinstance(ds, xr.Dataset)
     assert ds.attrs["crs"] == "EPSG:32618"
@@ -195,6 +192,8 @@ def test_pairwise_fusion_logic(pairwise_policy_file: str) -> None:
     # query with expected tolerance
     # Point A: Pure Lidar
     val_a = elev.sel(x=xs[0], y=ys[0], method="nearest").item()
+    val_b = elev.sel(x=xs[1], y=ys[1], method="nearest").item()
+    val_c = elev.sel(x=xs[2], y=ys[2], method="nearest").item()
     assert val_a == 10.0, f"Expected Pure Lidar (10.0), got {val_a}"
 
     # Point B: Overwrite Zone (Structure on Lidar)

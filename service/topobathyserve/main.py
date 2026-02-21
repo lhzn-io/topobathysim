@@ -219,6 +219,10 @@ def render_png(
 
     # Source Visualization Style
     if style == "source":
+        if vals.shape == (258, 258):
+            vals = vals[1:-1, 1:-1]
+        h, w = vals.shape
+
         # Qualitative Palette (Set3 / Paired)
         # https://matplotlib.org/stable/users/explain/colors/colormaps.html#qualitative
         # Set3 has 12 colors. Paired has 12.
@@ -245,8 +249,10 @@ def render_png(
             # The IDs from generate_provider_legend are 1-based indices into sorted providers.
             # So ID 1 = First Provider, ID 2 = Second Provider.
 
+            from typing import cast
+
             idx = (int(uid) - 1) % 12  # Cycle through 12 colors
-            return base_cmap(idx)
+            return cast(tuple[float, float, float, float], base_cmap(idx))
 
         h, w = vals.shape
         rgba = np.zeros((h, w, 4), dtype=np.float32)
@@ -265,6 +271,8 @@ def render_png(
 
     # Contours Style
     if style == "contours":
+        if vals.shape == (258, 258):
+            vals = vals[1:-1, 1:-1]
         h, w = vals.shape
 
         # Safety Check for NaN
@@ -313,6 +321,8 @@ def render_png(
 
     if style == "hillshade":
         hillshade = ls.hillshade(vals, vert_exag=10, dx=1.0, dy=1.0)
+        if hillshade.shape == (258, 258):
+            hillshade = hillshade[1:-1, 1:-1]
         mpimg.imsave(buf, hillshade, cmap="gray", format="png")
         buf.seek(0)
         return buf.getvalue()
@@ -376,10 +386,15 @@ def render_png(
             dy=1.0,
             blend_mode="overlay",
         )
+        if rgb.shape[:2] == (258, 258):
+            rgb = rgb[1:-1, 1:-1]
+
         mpimg.imsave(buf, rgb, format="png")
 
     except Exception as e:
         logger.warning(f"Shade failed: {e}")
+        if vals.shape == (258, 258):
+            vals = vals[1:-1, 1:-1]
         mpimg.imsave(buf, vals, cmap="terrain", format="png")
 
     buf.seek(0)
@@ -645,7 +660,7 @@ def get_xyz_tile(
     logger.info(f"XYZ Request: z={z} x={x} y={y} | Format={format} | Style={style} | VMin={vmin} VMax={vmax}")
 
     # --- Caching Logic ---
-    base_cache_dir = Path("~/.cache/topobathysim/tiles").expanduser()
+    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
 
     # Determine Cache Subdirectory based on format/style (Parity with Legacy)
     if format in ["png", "jpg", "jpeg"]:
@@ -687,9 +702,25 @@ def get_xyz_tile(
     # Web Mercator resolution equation
     res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
 
+    # Pad requested bbox to supply surrounding context for PNG Hillshade rendering
+    # Ensures Matplotlib 3x3 surface normal calculation interpolates accurately
+    pad_px = 2 if format == "png" else 0
+    dx_deg = (east - west) / 256
+    dy_deg = (north - south) / 256
+
+    req_west = west - dx_deg * pad_px
+    req_east = east + dx_deg * pad_px
+    req_south = south - dy_deg * pad_px
+    req_north = north + dy_deg * pad_px
+
     # Run Fusion
     try:
-        ds = run(str(policy_path), (west, south, east, north), resolution=res_meters)
+        ds = run(
+            str(policy_path),
+            (req_west, req_south, req_east, req_north),
+            resolution=res_meters,
+            use_cache=True,
+        )
     except ValueError as e:
         # CRS Validation Error
         logger.warning(f"Tile {z}/{x}/{y} out of bounds for policy: {e}")
@@ -700,6 +731,46 @@ def get_xyz_tile(
         logger.error(f"Runtime failed: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         return Response(content=f"Error: {e}", status_code=500)
+
+    # Force alignment to explicitly bounded 256x256 grid for Leaflet rendering
+    # Mathematically resample exact Web Mercator bounds to eliminate visual overlap seams
+    try:
+        if ds.rio.crs is not None and ds.rio.crs.to_string() == "EPSG:3857":
+            # Compute exact EPSG:3857 meter bounds for this XYZ tile
+            n_tiles = 2.0**z
+
+            # WGS 84 Semimajor axis
+            r_earth = 6378137.0
+
+            # Spherical Mercator math
+            min_x_m = x / n_tiles * (2 * math.pi * r_earth) - (math.pi * r_earth)
+            max_x_m = (x + 1) / n_tiles * (2 * math.pi * r_earth) - (math.pi * r_earth)
+
+            lat_rad_south = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n_tiles)))
+            min_y_m = r_earth * math.log(math.tan(math.pi / 4 + lat_rad_south / 2))
+
+            lat_rad_north = math.atan(math.sinh(math.pi * (1 - 2 * y / n_tiles)))
+            max_y_m = r_earth * math.log(math.tan(math.pi / 4 + lat_rad_north / 2))
+
+            dx_m = (max_x_m - min_x_m) / 256
+            dy_m = (max_y_m - min_y_m) / 256
+
+            # Add 1x pixel padding specifically for PNG Hillshade rendering to avoid 3x3 kernel edge artifacts
+            pad = 1 if format == "png" else 0
+            n_dim = 256 + 2 * pad
+            target_x = np.linspace(min_x_m - dx_m * (pad - 0.5), max_x_m + dx_m * (pad - 0.5), n_dim)
+            target_y = np.linspace(
+                max_y_m + dy_m * (pad - 0.5), min_y_m - dy_m * (pad - 0.5), n_dim
+            )  # North up
+
+            ds_elev = ds["elevation"].interp(x=target_x, y=target_y, method="linear")
+            if "source_elevation" in ds:
+                ds_src = ds["source_elevation"].interp(x=target_x, y=target_y, method="nearest")
+                ds = xr.Dataset({"elevation": ds_elev, "source_elevation": ds_src})
+            else:
+                ds = xr.Dataset({"elevation": ds_elev})
+    except Exception as e:
+        logger.warning(f"Failed to cleanly interpolate 256x256 EPSG:3857 bounds: {e}")
 
     # Render
     if format == "png":
@@ -771,7 +842,7 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
     import shutil
 
     # Default cache location
-    cache_root = Path("~/.cache/topobathysim").expanduser()
+    cache_root = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
     deleted = []
 
     try:

@@ -9,12 +9,13 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import rioxarray  # noqa: F401
 import xarray as xr
 from affine import Affine
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 
 from topobathysim.operators.blend import metric_feather, overwrite
 from topobathysim.policy.loader import generate_provider_legend, hash_policy, load_policy
@@ -24,78 +25,76 @@ from topobathysim.providers.registry import registry
 logger = logging.getLogger(__name__)
 
 
-def run(
-    policy_path: str,
-    bbox: tuple[float, float, float, float],
-    resolution: float | None = None,
-    time: datetime | None = None,
-    use_cache: bool = True,
-) -> xr.Dataset:
-    """
-    Execute a fusion policy to generate a topobathymetric dataset.
-
-    Args:
-        policy_path: Path to the fusion policy YAML file.
-        bbox: Input Bounding box in EPSG:4326 (min_lon, min_lat, max_lon, max_lat).
-        resolution: Grid resolution. Units depend on Policy CRS:
-                    - Projected CRS: Meters
-                    - Geographic CRS: Meters (will be auto-converted to degrees)
-        time: Optional timestamp for time-dependent queries (Sprint v2).
-        use_cache: If True, look for/save reuse fused Zarr datasets.
-
-    Returns:
-        xr.Dataset: The generated dataset containing 'elevation' and 'source_elevation'.
-
-    Note:
-        **Edge Case**: If a policy rule specifies `operator: metric_feather` but omits `blend_distance`
-        (i.e., it is None), the runtime falls back to `overwrite` (Hard Cut) behavior.
-    """
-    # 1. Load Policy
-    policy = load_policy(policy_path)
-    target_crs = policy.crs
-
+def _get_grid_cells(
+    bbox: tuple[float, float, float, float], target_crs: str
+) -> tuple[list[tuple[float, float, float, float]], float]:
+    """Calculate the discrete standard grid cells covering the requested bounding box."""
     start_lon, start_lat, end_lon, end_lat = bbox
 
-    # Validate CRS Area of Use
-    try:
-        from pyproj import CRS
+    # Either EPSG:4326 or default to 0.05 anyways for standard cells
+    grid_size = 0.05
 
-        crs_obj = CRS(target_crs)
-        if crs_obj.area_of_use:
-            # Area of Use bounds are (west, south, east, north)
-            aou_w, aou_s, aou_e, aou_n = crs_obj.area_of_use.bounds
+    # Snap to grid
+    min_x_idx = np.floor(start_lon / grid_size)
+    max_x_idx = np.floor(end_lon / grid_size)
+    min_y_idx = np.floor(start_lat / grid_size)
+    max_y_idx = np.floor(end_lat / grid_size)
 
-            # Simple intersection check (1D overlap in both X and Y)
-            # Fail if completely disjoint
-            if start_lon > aou_e or end_lon < aou_w or start_lat > aou_n or end_lat < aou_s:
-                error_msg = (
-                    f"Requested bounds {bbox} are outside the validity area for policy CRS {target_crs}. "
-                    f"Area of Use: {crs_obj.area_of_use.name} ({aou_w}, {aou_s}, {aou_e}, {aou_n})"
-                )
-                # User asked for loud failure
-                raise ValueError(error_msg)
-    except ImportError:
-        pass  # pyproj not installed? Unlikely given usage
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise e
-        # Don't block execution if validation itself fails weirdly (e.g. CRS lookup fail)
-        # But maybe we should?
-        pass
+    cells = []
+    # +1 to include the max index
+    for x in range(int(min_x_idx), int(max_x_idx) + 1):
+        for y in range(int(min_y_idx), int(max_y_idx) + 1):
+            cell_min_lon = x * grid_size
+            cell_min_lat = y * grid_size
+            cell_max_lon = (x + 1) * grid_size
+            cell_max_lat = (y + 1) * grid_size
+            cells.append((cell_min_lon, cell_min_lat, cell_max_lon, cell_max_lat))
 
-    # 2. Setup Canvas Extents & Resolution
-    min_lon, min_lat, max_lon, max_lat = bbox
+    return cells, grid_size
+
+
+def _run_cell(
+    policy: Any,
+    cell_bbox: tuple[float, float, float, float],
+    resolution: float | None,
+    time: datetime | None,
+    target_crs: str,
+    halo_pct: float = 0.10,
+) -> xr.Dataset:
+    """Execute fusion on a standard grid cell with a small context halo."""
+    # 1. Expand bbox by halo percentage to fetch context for seamless blending
+    min_lon, min_lat, max_lon, max_lat = cell_bbox
+    lon_halo = (max_lon - min_lon) * halo_pct
+    lat_halo = (max_lat - min_lat) * halo_pct
+
+    fetch_bbox = (
+        min_lon - lon_halo,
+        min_lat - lat_halo,
+        max_lon + lon_halo,
+        max_lat + lat_halo,
+    )
+
+    # We calculate explicit Reprojection bounds for Target CRS canvases.
+    # The Halo padding ensures seamless pixel transitions across edges.
 
     # Reproject BBox if Target CRS is not EPSG:4326
     if target_crs != "EPSG:4326":
         transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
-        min_x, min_y = transformer.transform(min_lon, min_lat)
-        max_x, max_y = transformer.transform(max_lon, max_lat)
-        # Ensure min/max are correct orientation
-        min_x, max_x = min(min_x, max_x), max(min_x, max_x)
-        min_y, max_y = min(min_y, max_y), max(min_y, max_y)
+        # Fetch canvas bounds using the HALO bbox
+        f_min_x, f_min_y = transformer.transform(fetch_bbox[0], fetch_bbox[1])
+        f_max_x, f_max_y = transformer.transform(fetch_bbox[2], fetch_bbox[3])
+        fetch_min_x, fetch_max_x = min(f_min_x, f_max_x), max(f_min_x, f_max_x)
+        fetch_min_y, fetch_max_y = min(f_min_y, f_max_y), max(f_min_y, f_max_y)
+
+        # We also need the EXACT cell bounds in the target CRS to clip the halo away later
+        c_min_x, c_min_y = transformer.transform(min_lon, min_lat)
+        c_max_x, c_max_y = transformer.transform(max_lon, max_lat)
+        clip_min_x, clip_max_x = min(c_min_x, c_max_x), max(c_min_x, c_max_x)
+        clip_min_y, clip_max_y = min(c_min_y, c_max_y), max(c_min_y, c_max_y)
+
     else:
-        min_x, min_y, max_x, max_y = min_lon, min_lat, max_lon, max_lat
+        fetch_min_x, fetch_min_y, fetch_max_x, fetch_max_y = fetch_bbox
+        clip_min_x, clip_min_y, clip_max_x, clip_max_y = cell_bbox
 
     # Resolve Resolution
     # Default to 30.0 meters if not provided
@@ -103,79 +102,39 @@ def run(
 
     # Smart Resolution Logic
     if target_crs == "EPSG:4326":
-        # Convert Meters -> Degrees
-        # 1 deg lat ~= 111,320m
-        meters_per_deg_lat = 111320.0
-        center_lat = (min_lat + max_lat) / 2
-        meters_per_deg_lon = 111320.0 * np.cos(np.deg2rad(center_lat))
-
-        res_x = input_resolution_meters / meters_per_deg_lon
-        # Use aspect-corrected square pixels (res_lat approx same as res_lon in meters)
-        res_y = input_resolution_meters / meters_per_deg_lat
+        # Global isotropic alignment to guarantee flawless xarray mosaicing
+        # 1 degree at equator is approx 111320.0 meters
+        res_x = input_resolution_meters / 111320.0
+        res_y = input_resolution_meters / 111320.0
     else:
-        # Projected CRS uses meters directly
         res_x = input_resolution_meters
         res_y = input_resolution_meters
 
-    # --- Caching Check ---
-    cache_path = None
-    if use_cache:
-        try:
-            import os
+    # 3. Snap Canvas to Global Resolution Grid
+    # This guarantees that regardless of the requested cell or halo,
+    # the pixel centers align perfectly globally, avoiding
+    # interpolation/interleaving artifacts when mosaicing.
+    x_idx_start = int(np.floor(fetch_min_x / res_x))
+    x_idx_end = int(np.ceil(fetch_max_x / res_x))
+    width = max(1, x_idx_end - x_idx_start)
 
-            default_cache = "~/.cache/topobathysim/fused_zarr"
-            cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
+    y_idx_start = int(np.floor(fetch_min_y / res_y))
+    y_idx_end = int(np.ceil(fetch_max_y / res_y))
+    height = max(1, y_idx_end - y_idx_start)
 
-            # If the user overrode the global cache dir, append fused_zarr
-            # so it doesn't dump straight into the root
-            default_fused_zarr = "~/.cache/topobathysim/fused_zarr"
-            if cache_dir_str != default_fused_zarr and not cache_dir_str.endswith("fused_zarr"):
-                cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
-            else:
-                cache_dir = Path(cache_dir_str).expanduser()
+    # Actual snapped bounds
+    snapped_min_x = x_idx_start * res_x
+    snapped_max_y = y_idx_end * res_y
 
-            cache_dir.mkdir(parents=True, exist_ok=True)
+    transform = Affine.translation(snapped_min_x, snapped_max_y) * Affine.scale(res_x, -res_y)
 
-            # Hash Key: Policy Content + BBox + Resolution + CRS
-            # Round floats to 6 decimals to avoid micro-mismatches (parity with legacy)
-            key_dict = {
-                "policy": policy.model_dump_json(),  # type: ignore
-                "bbox": [round(x, 6) for x in [min_x, min_y, max_x, max_y]],
-                "res": [round(x, 6) for x in [res_x, res_y]],
-                "crs": target_crs,
-            }
-            # Use json.dumps with sort_keys for stability
-            key_str = json.dumps(key_dict, sort_keys=True, default=str)
-            key_hash = hashlib.md5(key_str.encode()).hexdigest()
+    # Calculate pixel centers globally
+    xs = (np.arange(x_idx_start, x_idx_start + width) + 0.5) * res_x
+    ys = (np.arange(y_idx_end - 1, y_idx_end - 1 - height, -1) + 0.5) * res_y
 
-            cache_path = cache_dir / f"{key_hash}.zarr"
-
-            if cache_path.exists():
-                logger.info(f"Fused Zarr Cache Hit: {cache_path}")
-                # Use FileLock if available, otherwise just try open
-                try:
-                    from filelock import FileLock
-
-                    with FileLock(cache_path.with_suffix(".lock")):
-                        ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
-                        return ds
-                except ImportError:
-                    ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
-                    return ds
-                except Exception as e:
-                    logger.warning(f"Failed to load cache {cache_path}: {e}")
-        except Exception as e:
-            logger.warning(f"Cache check failed: {e}")
-
-    # 3. Initialize Canvas
-    width = int((max_x - min_x) / res_x)
-    height = int((max_y - min_y) / res_y)
-
-    # Affine Transform (Standard: North-Up, so y scale is negative)
-    transform = Affine.translation(min_x, max_y) * Affine.scale(res_x, -res_y)
-
-    xs = np.linspace(min_x + res_x / 2, max_x - res_x / 2, width)
-    ys = np.linspace(max_y - res_y / 2, min_y + res_y / 2, height)
+    # Optional: round coordinates to 8 decimal places for floating-point stability
+    xs = np.round(xs, 8)
+    ys = np.round(ys, 8)
 
     elevation = xr.DataArray(
         data=np.full((height, width), np.nan, dtype=np.float32),
@@ -195,16 +154,12 @@ def run(
     source_elevation.rio.write_crs(target_crs, inplace=True)
     source_elevation.rio.write_transform(transform, inplace=True)
 
-    # 4. Generate Provider Legend & IDs
-    legend = generate_provider_legend(policy)
-    provider_to_id = {v: k for k, v in legend.items()}
-
     # 5. Execution Loop
     for variable in policy.variables:
         if variable.name != "elevation":
             continue
 
-        if not np.isnan(variable.background):
+        if variable.background is not None:
             elevation = elevation.fillna(variable.background)
 
         for step in variable.steps:
@@ -212,10 +167,9 @@ def run(
             provider_instance = provider_cls()
 
             try:
-                # Fetch using the original EPSG:4326 bbox.
-                # The provider handles reprojection if necessary or optimized.
+                # Fetch using the expanded halo bbox to ensure we grab edge data
                 fetched_data = provider_instance.fetch_layer(
-                    bbox,
+                    fetch_bbox,
                     resolution=input_resolution_meters,
                     crs=target_crs,
                     filter=step.filter.model_dump() if step.filter else {},
@@ -266,6 +220,10 @@ def run(
             if not new_data_mask.any():
                 continue
 
+            # 4. Generate Provider Legend & IDs
+            legend = generate_provider_legend(policy)
+            provider_to_id = {v: k for k, v in legend.items()}
+
             provider_id = provider_to_id.get(step.provider, 0)
 
             # --- Pairwise Logic ---
@@ -315,60 +273,218 @@ def run(
             # Update Provenance (Global update for all valid pixels)
             source_elevation = xr.where(new_data_mask, provider_id, source_elevation)  # type: ignore
 
-    # 6. Finalize Dataset
-    ds = xr.Dataset(
-        {"elevation": elevation, "source_elevation": source_elevation},
-        attrs={
-            "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
-            "policy_legend": str(legend),
+    # 6. Clip Halo Away! We only want the exact cell bounds
+    # The cell bounds are clip_min_x, clip_min_y, clip_max_x, clip_max_y
+    # We clip cleanly before saving to cache. Because we are projecting/translating,
+    # pixel alignment might mean we should slice cleanly.
+
+    # We slice based on 'x' and 'y' coordinates of the dataset.
+    # Note: ys are usually decreasing (max_y to min_y) in raster.
+
+    # Careful of float precision when slicing, use a tiny buffer inside the clip bounds.
+    epsilon = res_x * 0.1
+    ds = xr.Dataset({"elevation": elevation, "source_elevation": source_elevation})
+
+    # Slice X
+    ds = ds.sel(x=slice(clip_min_x - epsilon, clip_max_x + epsilon))
+
+    # Slice Y (Handle both Ascending and Descending Y coordinates)
+    if len(ds.y) > 0 and ds.y[0] > ds.y[-1]:
+        # Descending (North Up)
+        ds = ds.sel(y=slice(clip_max_y + epsilon, clip_min_y - epsilon))
+    else:
+        # Ascending (South Up)
+        ds = ds.sel(y=slice(clip_min_y - epsilon, clip_max_y + epsilon))
+
+    # Ensure valid dimensions
+    if ds.x.size == 0 or ds.y.size == 0:
+        logger.warning(f"Clip resulted in empty dimensions for cell {cell_bbox}")
+
+    return cast(xr.Dataset, ds)
+
+
+def run(
+    policy_path: str,
+    bbox: tuple[float, float, float, float],
+    resolution: float | None = None,
+    time: datetime | None = None,
+    use_cache: bool = True,
+) -> xr.Dataset:
+    """
+    Execute a fusion policy to generate a topobathymetric dataset.
+    This public entrypoint chunks arbitrary bboxes into standard grid cells for caching.
+    """
+    policy = load_policy(policy_path)
+    target_crs = policy.crs
+
+    start_lon, start_lat, end_lon, end_lat = bbox
+
+    # Validate CRS Area of Use
+    try:
+        crs_obj = CRS(target_crs)
+        if crs_obj.area_of_use:
+            # Area of Use bounds are (west, south, east, north)
+            aou_w, aou_s, aou_e, aou_n = crs_obj.area_of_use.bounds
+
+            # Simple intersection check
+            if start_lon > aou_e or end_lon < aou_w or start_lat > aou_n or end_lat < aou_s:
+                error_msg = (
+                    f"Requested bounds {bbox} are outside the validity area for policy CRS {target_crs}. "
+                    f"Area of Use: {crs_obj.area_of_use.name} ({aou_w}, {aou_s}, {aou_e}, {aou_n})"
+                )
+                raise ValueError(error_msg)
+    except ImportError:
+        pass
+    except ValueError as e:
+        raise e
+    except Exception:
+        pass
+
+    # Determine Grid Cells
+    cells, _grid_size = _get_grid_cells(bbox, target_crs)
+
+    # For caching
+    import os
+
+    default_cache = "~/.cache/topobathysim/fused_zarr"
+    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
+    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
+        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
+    else:
+        cache_dir = Path(cache_dir_str).expanduser()
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    legend = generate_provider_legend(policy)
+
+    # Process all cells
+    cell_datasets = []
+
+    for cell_bbox in cells:
+        # Generate stable cache key for the cell
+        key_dict = {
+            "policy": policy.model_dump_json(),  # type: ignore
+            "cell": [round(x, 6) for x in cell_bbox],
+            "res": resolution if resolution else 30.0,
             "crs": target_crs,
-        },
-    )
+        }
+        key_str = json.dumps(key_dict, sort_keys=True, default=str)
+        key_hash = hashlib.md5(key_str.encode()).hexdigest()
 
-    # 7. Write to Cache
-    if cache_path:
-        try:
-            logger.info(f"Writing Fused Zarr to {cache_path}")
+        cache_path = cache_dir / f"{key_hash}.zarr"
 
-            # Metadata Attributes
-            ds.attrs["created_at"] = datetime.utcnow().isoformat()
-            ds.attrs["policy_hash"] = key_hash
-            ds.attrs["crs"] = target_crs
-
-            # Chunking is important for Zarr performance
-            ds_chunked = ds.chunk({"y": 2048, "x": 2048})
-
-            # Atomic Write Pattern
-            tmp_path = cache_path.with_suffix(f".tmp.{key_hash}.zarr")
-
+        ds_cell = None
+        if use_cache and cache_path.exists():
             try:
-                # 1. Write to temp directory
-                if tmp_path.exists():
-                    import shutil
+                try:
+                    from filelock import FileLock
 
-                    shutil.rmtree(tmp_path)
-
-                ds_chunked.to_zarr(tmp_path, mode="w", consolidated=True)
-
-                # 2. Rename to final path (Atomic)
-                if cache_path.exists():
-                    import shutil
-
-                    shutil.rmtree(cache_path)
-
-                import shutil
-
-                shutil.move(str(tmp_path), str(cache_path))
-                logger.debug(f"Successfully cached Fused Zarr: {cache_path}")
-
+                    with FileLock(cache_path.with_suffix(".lock")):
+                        ds_cell = xr.open_dataset(
+                            cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                        )
+                        # Load into memory fully so we can close the zarr store if needed
+                        ds_cell = ds_cell.load()
+                except ImportError:
+                    ds_cell = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+                    ds_cell = ds_cell.load()
             except Exception as e:
-                logger.error(f"Failed to write atomic cache {cache_path}: {e}")
-                if tmp_path.exists():
+                logger.warning(f"Failed to load cache {cache_path}: {e}")
+
+        if ds_cell is None:
+            # Cache miss! Execute the cell
+            ds_cell = _run_cell(
+                policy=policy,
+                cell_bbox=cell_bbox,
+                resolution=resolution,
+                time=time,
+                target_crs=target_crs,
+                halo_pct=0.10,
+            )
+
+            # Attributes
+            ds_cell.attrs = {
+                "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
+                "policy_legend": str(legend),
+                "crs": target_crs,
+                "created_at": datetime.utcnow().isoformat(),
+                "cell_bbox": list(cell_bbox),
+            }
+
+            # Attempt to save to cache
+            if use_cache:
+                try:
+                    logger.info(f"Writing Fused Grid Cell Zarr to {cache_path}")
+                    ds_chunked = ds_cell.chunk({"y": 2048, "x": 2048})
+                    tmp_path = cache_path.with_suffix(f".tmp.{key_hash}.zarr")
+
+                    if tmp_path.exists():
+                        import shutil
+
+                        shutil.rmtree(tmp_path)
+
+                    ds_chunked.to_zarr(tmp_path, mode="w", consolidated=True)
+
+                    if cache_path.exists():
+                        import shutil
+
+                        shutil.rmtree(cache_path)
+
                     import shutil
 
-                    shutil.rmtree(tmp_path)
+                    shutil.move(str(tmp_path), str(cache_path))
+                except Exception as e:
+                    logger.error(f"Failed to cache cell {cache_path}: {e}")
 
-        except Exception as e:
-            logger.error(f"Failed to write cache {cache_path}: {e}")
+        cell_datasets.append(ds_cell)
 
-    return ds
+    # Mosaic the cells together
+    if len(cell_datasets) == 1:
+        merged_ds = cell_datasets[0]
+    else:
+        # Sort each cell's coordinates to ensure monotonic indexes before combining
+        # Sort each cell's coordinates to ensure monotonic indexes before combining.
+        sorted_cells = [ds.sortby("y", ascending=False).sortby("x", ascending=True) for ds in cell_datasets]
+        # Use merge or combine_by_coords, telling xarray it's okay to overwrite mismatched attributes
+        # like created_at and cell_bbox. We re-apply final attributes anyway.
+        try:
+            merged_ds = cast(xr.Dataset, xr.combine_by_coords(sorted_cells, combine_attrs="override"))
+        except ValueError:
+            # Fallback to merge if non-monotonic indexes still complain
+            merged_ds = cast(xr.Dataset, xr.merge(sorted_cells, compat="override", combine_attrs="override"))
+
+        # CRITICAL FIX: combine_by_coords inherently sorts all coordinates ascending!
+        # We must restore mathematical top-to-bottom spatial coherence.
+        merged_ds = merged_ds.sortby("y", ascending=False).sortby("x", ascending=True)
+
+    # Finally, clip to the Exact Arbitrary Bounding Box requested!
+    # Have to project the requested EPSG:4326 bbox to Target CRS first
+    if target_crs != "EPSG:4326":
+        transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+        r_min_x, r_min_y = transformer.transform(start_lon, start_lat)
+        r_max_x, r_max_y = transformer.transform(end_lon, end_lat)
+        req_min_x, req_max_x = min(r_min_x, r_max_x), max(r_min_x, r_max_x)
+        req_min_y, req_max_y = min(r_min_y, r_max_y), max(r_min_y, r_max_y)
+    else:
+        req_min_x, req_min_y = start_lon, start_lat
+        req_max_x, req_max_y = end_lon, end_lat
+
+    epsilon = (merged_ds.x[1] - merged_ds.x[0]).values * 0.1
+    if epsilon < 0:
+        epsilon = -epsilon
+
+    merged_ds = merged_ds.sel(x=slice(req_min_x - epsilon, req_max_x + epsilon))
+    if len(merged_ds.y) > 0 and merged_ds.y[0] > merged_ds.y[-1]:
+        merged_ds = merged_ds.sel(y=slice(req_max_y + epsilon, req_min_y - epsilon))
+    else:
+        merged_ds = merged_ds.sel(y=slice(req_min_y - epsilon, req_max_y + epsilon))
+
+    # Add combined attributes
+    merged_ds.attrs = {
+        "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
+        "policy_legend": str(legend),
+        "crs": target_crs,
+        "mosaiced_from_cells": len(cells),
+    }
+
+    return cast(xr.Dataset, merged_ds)

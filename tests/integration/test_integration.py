@@ -65,12 +65,12 @@ def test_bluetopo_real_integration(tmp_path: Path) -> None:
     assert -100.0 < depth < 100.0
 
     # 4. Verify Cache
-    # We expect a .tiff file in the cache directory (specifically in the 'noaa_bluetopo' subdir)
+    # We expect the Tile Scheme GPKG to be cached (we lazily stream TIFFs from S3)
     bluetopo_cache = cache_dir / "noaa_bluetopo"
     # Recursive glob in case of structure changes, or direct glob in subdir
-    downloaded_files = list(bluetopo_cache.rglob("*.tiff"))
+    downloaded_files = list(bluetopo_cache.rglob("*.gpkg"))
     print(f"[Integration] Cached files: {[f.name for f in downloaded_files]}")
-    assert len(downloaded_files) > 0, f"No TIFF files found in cache {bluetopo_cache} after fetch."
+    assert len(downloaded_files) > 0, f"No GPKG scheme files found in cache {bluetopo_cache} after fetch."
 
     # 5. Compare with GEBCO
     print("\n[Integration] Fetching GEBCO 2025 value for comparison...")

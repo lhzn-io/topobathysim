@@ -29,7 +29,7 @@ def test_wlis_fusion_policy() -> None:
     # 1. Check Output Structure
     assert "elevation" in ds
     assert "source_elevation" in ds
-    assert ds.rio.crs.to_string() == "EPSG:32618"
+    assert ds.rio.crs.to_string() == "EPSG:3857"
 
     # 2. Check Data Validity
     elev = ds.elevation.values

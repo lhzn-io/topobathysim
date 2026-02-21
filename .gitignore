@@ -141,6 +141,11 @@ cython_debug/
 *.swp
 *.swo
 
+# AI Agents
+.claude/
+.gemini/
+memory
+
 # Project Specific
 data/
 logs/

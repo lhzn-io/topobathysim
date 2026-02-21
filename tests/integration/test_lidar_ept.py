@@ -23,12 +23,12 @@ def test_fetch_lidar_from_ept(persistent_cache_dir: Path) -> None:
     print(f"Bounds (EPSG:3857): {BOUNDS}")
 
     # 20m resolution (Meters)
-    da = provider.fetch_lidar_from_ept(EPT_URL, BOUNDS, resolution=20.0, target_crs="EPSG:4326")
+    da = provider.fetch_lidar_from_ept(EPT_URL, BOUNDS, resolution=20.0, target_crs="EPSG:3857")
 
     assert da is not None
     assert isinstance(da, xr.DataArray)
-    # Result should be reprojected to 4326
-    assert da.rio.crs.to_epsg() == 4326
+    # Result should be returned in 3857
+    assert da.rio.crs.to_epsg() == 3857
 
     # Check data content
     print(f"Shape: {da.shape}")

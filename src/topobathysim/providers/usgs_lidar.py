@@ -88,6 +88,11 @@ class UsgsLidarProvider(Provider):
             cache_dir: Directory to store cached data files.
             offline_mode: If True, only use locally cached data/manifests.
         """
+        import os
+
+        if cache_dir == "~/.cache/topobathysim":
+            cache_dir = os.environ.get("TOPOBATHYSIM_CACHE_DIR", cache_dir)
+
         self.cache_dir = Path(cache_dir).expanduser() / "usgs_lidar"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir

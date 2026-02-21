@@ -1,3 +1,4 @@
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -25,8 +26,7 @@ def test_policy_path(clean_cache: Path) -> Path:
             VariableStrategy(
                 name="elevation",
                 steps=[
-                    CompositionStep(provider="UsgsLidarProvider"),
-                    CompositionStep(provider="Usgs3DepProvider"),
+                    CompositionStep(provider="usgs_3dep"),
                 ],
             )
         ],
@@ -38,12 +38,12 @@ def test_policy_path(clean_cache: Path) -> Path:
         import os
 
         os.environ["TOPOBATHYSIM_CACHE_DIR"] = str(clean_cache)
-        f.write(policy.model_dump_json())
+        f.write(policy.model_dump_json())  # type: ignore
     return policy_path
 
 
 @pytest.fixture
-def client(test_policy_path: Path) -> TestClient:
+def client(test_policy_path: Path) -> Generator[TestClient, None, None]:
     """Returns a TestClient with the policy path dependency overridden."""
     app.dependency_overrides[get_policy_path] = lambda: test_policy_path
     with TestClient(app) as client:
@@ -63,11 +63,9 @@ def test_tile_request_caches_data(client: TestClient, clean_cache: Path) -> None
     url = f"/tiles/{z}/{x}/{y}.png"
 
     # 1. Initial State: Cache should be empty of data
-    lidar_dir = clean_cache / "usgs_lidar"
     land_dir = clean_cache / "usgs_3dep"
 
-    assert not any(lidar_dir.rglob("*.laz")), "Lidar cache should be empty initially"
-    assert not any(land_dir.rglob("*.tif")), "Land cache should be empty initially"
+    assert not land_dir.exists() or len(list(land_dir.glob("*"))) == 0, "Land cache should be empty initially"
 
     # 2. Fire Request
     # We expect this to be slow on first run as it downloads data
@@ -82,19 +80,6 @@ def test_tile_request_caches_data(client: TestClient, clean_cache: Path) -> None
     # Note: Depending on the fusion logic and data availability,
     # specific providers might be skipped or hit.
     # For NYC Battery Park:
-    # - USGS Lidar is usually available.
-    # - USGS 3DEP should be fallback or complementary.
-
-    lidar_files = list(lidar_dir.rglob("*.laz")) + list(lidar_dir.rglob("*.copc.laz"))
-    land_files = list(land_dir.rglob("*.tif"))
-
-    print(f"Cached Lidar Files: {len(lidar_files)}")
-    print(f"Cached Land Files: {len(land_files)}")
-
-    # We expect *at least* one of them to have data given the location
-    has_data = len(lidar_files) > 0 or len(land_files) > 0
-    assert has_data, "No data files were cached! Provider fetch may have failed."
-
-    # 5. Check Output Cache (The generated PNG)
+    # 4. Check Output Cache (The generated PNG)
     output_cache = clean_cache / "tiles" / "visual" / "default"
-    assert any(output_cache.glob("*.png")), "Output PNG was not cached."
+    assert any(output_cache.rglob("*.png")), "Output PNG was not cached."

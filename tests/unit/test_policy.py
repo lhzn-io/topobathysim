@@ -50,7 +50,7 @@ def valid_policy_dict() -> dict[str, Any]:
                 "steps": [
                     {
                         "provider": "mock_provider",
-                        "operation": "overlay",
+                        "operation": "overwrite",
                         "blend_mode": "feather",
                         "blend_distance": 500.0,
                         "zone": {"type": "bbox", "coords": [-180, -90, 180, 90], "priority": 10},

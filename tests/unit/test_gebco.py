@@ -81,7 +81,7 @@ def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Data
 
     # Use tmp_path for cache to avoid polluting user cache and ensure isolation
     cache_dir = tmp_path / "gebco_cache"
-    gebco = Gebco2025(north=5, south=-5, west=-5, east=5, cache_dir=str(cache_dir))
+    gebco = Gebco2025(north=1, south=0, west=0, east=1, cache_dir=str(cache_dir))
 
     # Tiny mock datasets cause Dask to warn about huge chunk overhead relative to data size
     with warnings.catch_warnings():
@@ -121,7 +121,7 @@ def test_sample_elevation(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Datase
     mock_open_ds.return_value = mock_gebco_dataset
 
     cache_dir = tmp_path / "gebco_cache_sample"
-    gebco = Gebco2025(north=5, south=-5, west=-5, east=5, cache_dir=str(cache_dir))
+    gebco = Gebco2025(north=1, south=0, west=0, east=1, cache_dir=str(cache_dir))
 
     # Tiny mock datasets cause Dask to warn about huge chunk overhead relative to data size
     with warnings.catch_warnings():

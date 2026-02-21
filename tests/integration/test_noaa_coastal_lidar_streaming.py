@@ -49,12 +49,14 @@ def test_noaa_streaming_nyc(persistent_cache_dir: object) -> None:
     assert len(tiles) > 0, "No tiles resolved for valid NYC bbox"
 
     # 3. Streaming Access
-    # Use the first tile found (likely be_NYC_026.tif based on manual verification)
-    tile_id = tiles[0]
-    logger.info(f"Testing streaming for tile: {tile_id}")
+    da = None
+    for tid in tiles:
+        logger.info(f"Testing streaming for tile: {tid}")
+        da = provider.fetch_tile(tid)
+        if da is not None:
+            break
 
-    da = provider.fetch_tile(tile_id)
-    assert da is not None, "fetch_tile returned None"
+    assert da is not None, "All tiles returned None (404s)"
     assert isinstance(da, xr.DataArray)
 
     # Check dimensions (lazy)

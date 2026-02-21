@@ -952,6 +952,12 @@ class NoaaTopobathyProvider(Provider):
             zarr_name = full_zarr_name
 
         zarr_path = self.cache_dir / "zarr" / zarr_name
+        missing_marker_path = self.cache_dir / "zarr" / (zarr_name + ".404")
+
+        # 0. Check Negative Cache
+        if missing_marker_path.exists():
+            # logger.debug(f"Topobathy 404 Cache Hit (Skipping): {zarr_name}")
+            return None
 
         # 0. Check if FULL Tile is already cached (Avoids streaming from S3 if we already have the parent)
         if bbox and full_zarr_path.exists():
@@ -960,7 +966,8 @@ class NoaaTopobathyProvider(Provider):
                 logger.debug(f"Topobathy Zarr Cache Hit (Full Tile Proxy for BBox): {full_zarr_name}")
                 # Clip it in memory and return immediately (no need to write a micro-zarr to disk)
                 da = da.rio.clip_box(*bbox)
-                return da
+
+                return cast(xr.DataArray, da)
             except Exception as e:
                 logger.debug(f"Full Zarr proxy cache load failed or clip failed: {e}")
                 pass  # Fall back to normal flow
@@ -986,10 +993,8 @@ class NoaaTopobathyProvider(Provider):
         zarr_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            print(f"DEBUG: Attempting to acquire lock {lock_path}", flush=True)
             with open(lock_path, "w") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
-                print(f"DEBUG: Acquired lock {lock_path}", flush=True)
 
                 # Double Check inside lock
                 if zarr_path.exists():
@@ -1112,7 +1117,14 @@ class NoaaTopobathyProvider(Provider):
                 return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
         except Exception as e:
-            logger.error(f"Zarr lock/process failed: {e}")
+            if "404" in str(e):
+                logger.warning(
+                    f"File not found remotely (404), marking as missing: {missing_marker_path.name}"
+                )
+                with open(missing_marker_path, "w") as f:
+                    f.write("404 Not Found")
+            else:
+                logger.error(f"Zarr lock/process failed: {e}")
             return None
         finally:
             if lock_path.exists():
@@ -1126,45 +1138,50 @@ class NoaaTopobathyProvider(Provider):
         High level interface to get merged grid from NOAA Topobathy.
         Attempts to auto-detect project if not provided.
         """
+        project_ids_to_try = []
         if project_id:
-            self.set_active_project(project_id)
-        elif self._active_project_id is None:
-            # Try to auto-detect
-            pid = self.find_project_by_box(west, south, east, north)
-            if pid:
-                self.set_active_project(pid)
+            project_ids_to_try = [project_id]
+        else:
+            project_ids_to_try = self.find_projects_by_box(west, south, east, north)
 
-        if not self._active_project_id:
-            return None
+        for pid in project_ids_to_try:
+            self.set_active_project(pid)
 
-        tiles = self.resolve_tiles_in_bbox(west, south, east, north)
-        if not tiles:
-            return None
+            tiles = self.resolve_tiles_in_bbox(west, south, east, north)
+            if not tiles:
+                continue
 
-        bbox = (west, south, east, north)
-        das = []
-        for t in tiles:
-            da = self.fetch_tile(t, bbox=bbox)
-            if da is not None:
-                das.append(da)
+            bbox = (west, south, east, north)
+            das = []
+            for t in tiles:
+                da = self.fetch_tile(t, bbox=bbox)
+                if da is not None:
+                    das.append(da)
 
-        if not das:
-            return None
+            if not das:
+                continue
 
-        if len(das) == 1:
-            return das[0]
+            if len(das) == 1:
+                return das[0]
 
-        from rioxarray.merge import merge_arrays
+            from rioxarray.merge import merge_arrays
 
-        # Regarding Fusion order:
-        # For NOAA DEMs within a single project, tiles are typically spatially disjoint (mosaic).
-        # Overlap is minimal. If overlap exists, we trust rioxarray default (last layer wins).
-        try:
-            merged = merge_arrays(das)
-            return cast(xr.DataArray, merged)
-        except Exception as e:
-            logger.error(f"Merge error: {e}")
-            return None
+            # Regarding Fusion order:
+            # For NOAA DEMs within a single project, tiles are typically spatially disjoint (mosaic).
+            # Overlap is minimal. If overlap exists, we trust rioxarray default (last layer wins).
+            try:
+                merged = merge_arrays(das)
+                return cast(xr.DataArray, merged)
+            except Exception as e:
+                logger.error(f"Merge error: {e}")
+                continue
+
+        # If we exhausted all projects and found nothing:
+        logger.warning(
+            f"No valid data returned from {len(project_ids_to_try)} intersecting projects "
+            f"for bbox {(west, south, east, north)}"
+        )
+        return None
 
 
 # Register

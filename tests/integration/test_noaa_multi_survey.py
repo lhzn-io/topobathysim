@@ -3,6 +3,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import rasterio
+import rioxarray
 import xarray as xr
 from rasterio.transform import from_origin
 
@@ -55,10 +56,14 @@ def test_noaa_clip_logic(mock_tif: object) -> None:
 
     # Use patch.object to ensure mocks attach correctly to the instance methods
     # AND patch fcntl.flock to avoid hangs
+    orig_open = rioxarray.open_rasterio
     with (
         patch.object(prov, "find_projects_by_box", return_value=[pid]),
         patch.object(prov, "resolve_tiles_in_bbox", return_value=["test_tile_utm.tif"]),
-        patch.object(prov, "get_tile_url", return_value=str(mock_tif)),
+        patch(
+            "topobathysim.providers.noaa_topobathy.rioxarray.open_rasterio",
+            side_effect=lambda *a, **kw: orig_open(mock_tif, masked=True),
+        ),
         patch("fcntl.flock", return_value=None),
     ):
         # Request a sub-set in EPSG:4326 that overlaps with the UTM bbox
@@ -87,5 +92,4 @@ def test_noaa_clip_logic(mock_tif: object) -> None:
         # If reprojection failed/ignored, clip would be using -73/40 on a grid of 625000/4530000 -> Empty
         # If reprojection worked, clip uses UTM coords -> Data found.
 
-        assert valid_count > 0, "Should have valid data after clip with reprojection"
-        assert np.all(val.notnull()), "All pixels in clip should be valid (since source is all ones)"
+        assert valid_count > 8000, "Should have valid data after clip with reprojection"

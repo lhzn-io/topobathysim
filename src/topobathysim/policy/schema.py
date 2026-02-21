@@ -95,7 +95,7 @@ class VariableStrategy(BaseModel):
 
     name: str = "elevation"
     steps: list[CompositionStep]
-    background: float = float("nan")
+    background: float | None = None
 
 
 class FusionPolicy(BaseModel):

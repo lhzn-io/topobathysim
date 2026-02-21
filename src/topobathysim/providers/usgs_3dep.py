@@ -43,6 +43,11 @@ class Usgs3DepProvider(Provider):
             cache_dir: Directory to store cached data files.
             offline_mode: If True, only use locally cached data/manifests.
         """
+        import os
+
+        if cache_dir == "~/.cache/topobathysim":
+            cache_dir = os.environ.get("TOPOBATHYSIM_CACHE_DIR", cache_dir)
+
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "usgs_3dep"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -276,11 +281,29 @@ class Usgs3DepProvider(Provider):
                             # Otherwise we download the entire 1x1 degree COG (GBs of data)
                             # for a tiny request.
                             try:
-                                da = da.rio.clip_box(*bounds)
-                            except Exception:
+                                from rasterio.warp import transform_bounds
+
+                                source_crs = da.rio.crs
+                                clip_bbox = bounds
+                                clip_crs = "EPSG:4326"
+
+                                if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
+                                    try:
+                                        clip_bbox = transform_bounds("EPSG:4326", source_crs, *bounds)
+                                        clip_crs = source_crs
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Failed to reproject bbox to {source_crs}: {e}. "
+                                            f"Retrying with EPSG:4326."
+                                        )
+
+                                da = da.rio.clip_box(*clip_bbox, crs=clip_crs)
+                            except Exception as e:
                                 # If clip fails (no overlap?), this item is useless for the requested bbox.
                                 # Skip it to avoid downloading huge irrelevant files.
-                                logger.debug(f"Clip FAILED for {href} with bounds {bounds}. Skipping item.")
+                                logger.debug(
+                                    f"Clip FAILED for {href} with bounds {bounds}: {e}. Skipping item."
+                                )
                                 continue
 
                             # Check if the result is actually reduced

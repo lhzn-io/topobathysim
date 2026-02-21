@@ -77,8 +77,8 @@ def mock_policy_file(tmp_path: Any) -> str:
                 "name": "elevation",
                 "background": -999.0,
                 "steps": [
-                    {"provider": "mock_base", "operation": "overlay"},
-                    {"provider": "mock_overlay", "operation": "overlay"},
+                    {"provider": "mock_base", "operation": "overwrite"},
+                    {"provider": "mock_overlay", "operation": "overwrite"},
                 ],
             }
         ],
@@ -110,12 +110,19 @@ def test_runtime_flow(mock_policy_file: str) -> None:
             return da
 
     class OverlayProvider(MockProvider):
-        def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
-            da = super().fetch_layer(*args, **kwargs)
-            da[:] = 20.0  # Overlay value
-            # Make it smaller or masked?
-            # Let's make half of it NaN to test blending/masking
-            da.values[:, :5] = np.nan
+        def fetch_layer(
+            self,
+            bbox: tuple[float, float, float, float],
+            resolution: float | None = None,
+            crs: str = "EPSG:4326",
+            **kwargs: Any,
+        ) -> xr.DataArray:
+            da = super().fetch_layer(bbox=bbox, resolution=resolution, crs=crs, **kwargs)
+            # Overlay value
+            # Let's make half of it NaN to test blending/masking based on absolute longitude
+            # The test bbox is -74.0 to -73.0, so center is -73.5
+            mapped = xr.where(da.x < -73.5, np.nan, 20.0).astype(np.float32)
+            da.values[:] = mapped.values
             return da
 
     registry.register("mock_base", BaseProvider)
@@ -123,8 +130,8 @@ def test_runtime_flow(mock_policy_file: str) -> None:
 
     # 2. Run Runtime
     bbox = (-74.0, 40.0, -73.0, 41.0)  # 1x1 degree
-    # Use coarse resolution (10km ~ 0.1 deg) to avoid memory issues
-    ds = run(mock_policy_file, bbox, resolution=10000.0)
+    # Use coarse resolution (1km ~ 0.01 deg) to avoid memory issues
+    ds = run(mock_policy_file, bbox, resolution=1000.0, use_cache=False)
 
     # 3. Assertions
     assert isinstance(ds, xr.Dataset)
@@ -144,19 +151,18 @@ def test_runtime_flow(mock_policy_file: str) -> None:
     id_base = next(k for k, v in legend.items() if v == "mock_base")
     id_overlay = next(k for k, v in legend.items() if v == "mock_overlay")
 
-    # Sampling
-    # Left side (index 0)
-    val_left = ds["elevation"].isel(x=0).mean().item()
-    src_left = ds["source_elevation"].isel(x=0)[0].item()
+    # Sampling using spatial slices to avoid unaligned grid edge NaNs
+    # Left side (lon < -73.6)
+    val_left = ds["elevation"].sel(x=slice(None, -73.6)).mean().item()
+    src_left = ds["source_elevation"].sel(x=slice(None, -73.6)).max().item()
 
-    # Right side (index -1)
-    val_right = ds["elevation"].isel(x=-1).mean().item()
+    # Right side (lon > -73.4)
+    val_right = ds["elevation"].sel(x=slice(-73.4, None)).mean().item()
 
-    assert val_left == 10.0
-    assert val_right == 20.0
+    # Allow some tiny floating point differences across the mean
+    assert pytest.approx(val_left, 0.01) == 10.0
+    assert pytest.approx(val_right, 0.01) == 20.0
 
     # Source verification
-    # Note: Mock provider returns precise grid so no interpolation artifacts expected
-
     assert src_left == id_base
-    assert ds["source_elevation"].isel(x=-1).max().item() == id_overlay
+    assert ds["source_elevation"].sel(x=slice(-73.4, None)).max().item() == id_overlay

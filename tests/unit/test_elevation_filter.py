@@ -23,16 +23,41 @@ class MockProvider(Provider):
         **kwargs: Any,
     ) -> xr.DataArray:
         min_lon, min_lat, max_lon, max_lat = bbox
-        width, height = 10, 10
-        res_x = (max_lon - min_lon) / width
-        res_y = (max_lat - min_lat) / height
-        transform = Affine.translation(min_lon, max_lat) * Affine.scale(res_x, -res_y)
+
+        if resolution is not None:
+            res_x = resolution / 111320.0 if crs == "EPSG:4326" else resolution
+            res_y = res_x
+
+            x_idx_start = int(np.floor(min_lon / res_x))
+            x_idx_end = int(np.ceil(max_lon / res_x))
+            width = max(1, x_idx_end - x_idx_start)
+
+            y_idx_start = int(np.floor(min_lat / res_y))
+            y_idx_end = int(np.ceil(max_lat / res_y))
+            height = max(1, y_idx_end - y_idx_start)
+
+            snapped_min_x = x_idx_start * res_x
+            snapped_max_y = y_idx_end * res_y
+            transform = Affine.translation(snapped_min_x, snapped_max_y) * Affine.scale(res_x, -res_y)
+
+            xs = (np.arange(x_idx_start, x_idx_start + width) + 0.5) * res_x
+            ys = (np.arange(y_idx_end - 1, y_idx_end - 1 - height, -1) + 0.5) * res_y
+
+            xs = np.round(xs, 8)
+            ys = np.round(ys, 8)
+        else:
+            width, height = 10, 10
+            res_x = (max_lon - min_lon) / width
+            res_y = (max_lat - min_lat) / height
+            transform = Affine.translation(min_lon, max_lat) * Affine.scale(res_x, -res_y)
+            xs = np.linspace(min_lon + res_x / 2, max_lon - res_x / 2, width)
+            ys = np.linspace(max_lat - res_y / 2, min_lat + res_y / 2, height)
 
         data = np.full((height, width), self.value, dtype=np.float32)
 
         coords = {
-            "y": np.linspace(max_lat - res_y / 2, min_lat + res_y / 2, height),
-            "x": np.linspace(min_lon + res_x / 2, max_lon - res_x / 2, width),
+            "y": ys,
+            "x": xs,
         }
 
         da = xr.DataArray(data, coords=coords, dims=("y", "x"))
@@ -86,13 +111,19 @@ def test_filter_bounds(policy_with_filters: str) -> None:
             da[:] = 0.0
             return da
 
-    # Filtered Provider returns a gradient from -20 to 20
+    # Filtered Provider returns a gradient from -20 to 20 mapped exactly from -74.0 to -73.0 longitude
     class FilteredProvider(MockProvider):
-        def fetch_layer(self, *args: Any, **kwargs: Any) -> xr.DataArray:
-            da = super().fetch_layer(*args, **kwargs)
-            # Create a 1D gradient and broadcast to 2D
-            gradient = np.linspace(-20, 20, 10).astype(np.float32)
-            da.values[:] = gradient.reshape(1, 10)  # Row broadcasting
+        def fetch_layer(
+            self,
+            bbox: tuple[float, float, float, float],
+            resolution: float | None = None,
+            crs: str = "EPSG:4326",
+            **kwargs: Any,
+        ) -> xr.DataArray:
+            da = super().fetch_layer(bbox=bbox, resolution=resolution, crs=crs, **kwargs)
+            # Elev = (lon - (-74)) / 1.0 * 40 - 20
+            da_vals = (da.x - (-74.0)) * 40.0 - 20.0
+            da.values[:] = np.broadcast_to(da_vals.values, da.shape).astype(np.float32)
             return da
 
     registry.register("mock_base", BaseProvider)
@@ -101,7 +132,7 @@ def test_filter_bounds(policy_with_filters: str) -> None:
     bbox = (-74.0, 40.0, -73.0, 41.0)
 
     # Run the fusion engine without cache to force fetch
-    ds = run(policy_with_filters, bbox, resolution=10000.0, use_cache=False)
+    ds = run(policy_with_filters, bbox, resolution=1000.0, use_cache=False)
 
     # Analyze the result
     elev = ds["elevation"].values
