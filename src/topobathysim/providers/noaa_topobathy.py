@@ -164,7 +164,9 @@ class NoaaTopobathyProvider(Provider):
 
         # 4. Final Clip
         with contextlib.suppress(Exception):
-            final_merged = final_merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs=crs)
+            final_merged = final_merged.rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
 
         final_merged.name = "elevation"
         logger.debug("Found NOAA Topobathy Coverage")
@@ -885,6 +887,20 @@ class NoaaTopobathyProvider(Provider):
                 # If we picked up a full URL, strip it to just the filename
                 if fname.startswith("http"):
                     fname = Path(fname).name
+
+                # Cleanup internal absolute paths like /san1/raster/.../Project_Folder/block/tile.tif
+                if self._active_project_id:
+                    folder_name = self._projects.get(self._active_project_id)
+                    if folder_name and folder_name in fname:
+                        fname = fname.split(folder_name + "/")[-1]
+                    else:
+                        # Just in case it's an absolute path without the folder name
+                        if "/" in fname and not fname.startswith(folder_name or "dummy"):
+                            fname = Path(fname).name
+                else:
+                    if "/" in fname:
+                        fname = Path(fname).name
+
                 if not fname.endswith(".tif"):
                     fname += ".tif"  # Append extension if missing
                 results.append(fname)
@@ -924,10 +940,12 @@ class NoaaTopobathyProvider(Provider):
             tile_filename = tile_filename.split("/")[-1]
         else:
             # Construct standard URL
-            # The tile_filename from the spatial index often contains the subdirectories
-            # already, e.g. "SLR_viewer_DEM_6230/NY/NY_Metro_GCS_3m_NAVDm.tif".
             # Clean up leading slashes that cause double slashes in S3 URL string
             clean_tile_filename = tile_filename.lstrip("/")
+
+            folder_name = self._projects.get(self._active_project_id)
+            if folder_name and not clean_tile_filename.startswith(folder_name):
+                clean_tile_filename = f"{folder_name}/{clean_tile_filename}"
 
             http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{clean_tile_filename}"
 
@@ -1121,6 +1139,7 @@ class NoaaTopobathyProvider(Provider):
                 logger.warning(
                     f"File not found remotely (404), marking as missing: {missing_marker_path.name}"
                 )
+                missing_marker_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(missing_marker_path, "w") as f:
                     f.write("404 Not Found")
             else:

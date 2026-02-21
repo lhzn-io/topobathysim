@@ -389,7 +389,7 @@ class UsgsLidarProvider(Provider):
 
             # Return filtered
             if bounds:
-                da = da.rio.clip_box(*bounds)
+                da = da.rio.clip_box(*bounds, crs="EPSG:4326")
 
             return da
 
