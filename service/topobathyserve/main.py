@@ -592,10 +592,17 @@ def get_tile_metadata(
     lidar_url: str | None = None,
     ept_url: str | None = None,
     use_seam_blending: bool = True,
+    style: str = Query("default", description="Visualization style"),
+    vmin: float | None = Query(None, description="Explicit Min Elevation"),
+    vmax: float | None = Query(None, description="Explicit Max Elevation"),
+    tile_size: int = Query(512, description="Output pixel dimension for standard square XYZ tiles"),
 ) -> TileMetadataResponse:
     """
     Returns metadata for a specific fused tile (XYZ).
     """
+    import datetime
+    import hashlib
+
     n = 2.0**z
     west = x / n * 360.0 - 180.0
     east = (x + 1) / n * 360.0 - 180.0
@@ -604,17 +611,39 @@ def get_tile_metadata(
     lat_rad_south = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
     south = math.degrees(lat_rad_south)
 
-    # Cache key based on Policy + Geometry
-    # data_sig_str = f"n={north:.6f}_s={south:.6f}_w={west:.6f}_e={east:.6f}_z={z}_policy={policy_path.name}"
-    # data_hash = hashlib.md5(data_sig_str.encode("utf-8")).hexdigest()
-
-    # We don't really have a metadata cache in the same way anymore,
-    # but we could check if the tile output exists.
-    # For now, return a generic status
     bounds = {"north": north, "south": south, "west": west, "east": east}
 
+    # Check Cache existence
+    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
+    params_str = f"{policy_path.name}|{vmin}|{vmax}|{tile_size}"
+    param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
+
+    # Check NPY (data) first
+    npy_path = base_cache_dir / "data" / str(z) / str(x) / f"{y}_{param_hash}.npy"
+    # Then try Visual
+    safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
+    png_path = base_cache_dir / "visual" / safe_style / str(z) / str(x) / f"{y}_{param_hash}.png"
+
+    created_at = None
+    cache_status = "miss"
+
+    for path_to_check in [npy_path, png_path]:
+        if path_to_check.exists() and path_to_check.stat().st_size > 0:
+            mtime = path_to_check.stat().st_mtime
+            dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+            created_at = dt.strftime("%Y%m%d-%H:%M:%S UTC")
+            cache_status = "hit"
+            break
+
     return TileMetadataResponse(
-        z=z, x=x, y=y, bounds=bounds, cache_status="unknown", fusion_sources=policy_path.name
+        z=z,
+        x=x,
+        y=y,
+        bounds=bounds,
+        created_at=created_at,
+        cache_status=cache_status,
+        fusion_sources=policy_path.name,
+        request_params=params_str,
     )
 
 

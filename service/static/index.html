@@ -373,16 +373,16 @@
             // Construct URLs
             var tileUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=npy&style=${currentStyle}`;
             var viewUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=png&style=${currentStyle}`;
-            var metaUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}/metadata`;
+            var metaUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}/metadata?style=${currentStyle}`;
 
             var popupContent = `
-                <div style="font-family: monospace; font-size: 13px;">
+                <div style="font-family: monospace; font-size: 13px; min-width: 240px;">
                     <b>Location Info</b><br/>
                     <div style="margin-top:5px">
                         Lat: <input type="text" value="${lat.toFixed(6)}" style="width: 100px;" onclick="this.select()"><br/>
                         Lon: <input type="text" value="${lng.toFixed(6)}" style="width: 100px;" onclick="this.select()">
                     </div>
-                    <div id="click-elevation-${tile.x}-${tile.y}" style="margin-top:5px; font-weight:bold; color:#0066cc;">
+                    <div id="click-elevation-${tile.x}-${tile.y}" style="margin-top:5px; font-weight:bold; color:#0066cc; white-space: nowrap;">
                         <i>Loading Elevation...</i>
                     </div>
                     <div style="margin-top:5px">
@@ -435,7 +435,7 @@
                     } else if (data.cache_status === 'corrupt') {
                         el.innerHTML = '<span style="color:red">Cache corrupt</span>';
                     } else {
-                        var dateStr = data.created_at ? new Date(data.created_at).toLocaleString() : 'Unknown';
+                        var dateStr = data.created_at ? data.created_at : 'Unknown';
                         var sources = data.fusion_sources || 'Unknown';
                         // Truncate sources if too long
                         if (sources.length > 50) sources = sources.substring(0, 47) + '...';
