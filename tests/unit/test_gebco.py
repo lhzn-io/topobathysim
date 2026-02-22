@@ -66,6 +66,8 @@ def mock_gebco_dataset() -> xr.Dataset:
     )
 
     ds = xr.Dataset({"sub_ice_topo_bathymetry": da_elev, "tid": da_tid})
+    # Add rio accessor to ensure we have crs setup correctly for interpolation limits
+    ds.rio.write_crs("EPSG:4326", inplace=True)
     return ds
 
 
@@ -128,9 +130,9 @@ def test_sample_elevation(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Datase
         warnings.filterwarnings("ignore", category=PerformanceWarning)
         gebco.load()
 
-    # Sample center (0,0 is in our mock data)
+    # Sample center (0.5, 0.5 is safely inside our 0 to 1 box)
     # Mock data is all zeros for elevation
-    elev = gebco.sample_elevation(0, 0)
+    elev = gebco.sample_elevation(0.5, 0.5)
     assert elev == 0.0
 
     # Test error before load

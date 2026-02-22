@@ -184,6 +184,7 @@ def render_png(
     vmax: float | None = None,
     zoom: int = 13,
     legend: dict[int, str] | None = None,  # NEW ARGUMENT
+    pad: int = 0,
 ) -> bytes:
     """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
     import matplotlib.colors as mcolors
@@ -219,8 +220,8 @@ def render_png(
 
     # Source Visualization Style
     if style == "source":
-        if vals.shape == (258, 258):
-            vals = vals[1:-1, 1:-1]
+        if pad > 0:
+            vals = vals[pad:-pad, pad:-pad]
         h, w = vals.shape
 
         # Qualitative Palette (Set3 / Paired)
@@ -271,8 +272,8 @@ def render_png(
 
     # Contours Style
     if style == "contours":
-        if vals.shape == (258, 258):
-            vals = vals[1:-1, 1:-1]
+        if pad > 0:
+            vals = vals[pad:-pad, pad:-pad]
         h, w = vals.shape
 
         # Safety Check for NaN
@@ -321,8 +322,8 @@ def render_png(
 
     if style == "hillshade":
         hillshade = ls.hillshade(vals, vert_exag=10, dx=1.0, dy=1.0)
-        if hillshade.shape == (258, 258):
-            hillshade = hillshade[1:-1, 1:-1]
+        if pad > 0:
+            hillshade = hillshade[pad:-pad, pad:-pad]
         mpimg.imsave(buf, hillshade, cmap="gray", format="png")
         buf.seek(0)
         return buf.getvalue()
@@ -386,15 +387,15 @@ def render_png(
             dy=1.0,
             blend_mode="overlay",
         )
-        if rgb.shape[:2] == (258, 258):
-            rgb = rgb[1:-1, 1:-1]
+        if pad > 0:
+            rgb = rgb[pad:-pad, pad:-pad]
 
         mpimg.imsave(buf, rgb, format="png")
 
     except Exception as e:
         logger.warning(f"Shade failed: {e}")
-        if vals.shape == (258, 258):
-            vals = vals[1:-1, 1:-1]
+        if pad > 0:
+            vals = vals[pad:-pad, pad:-pad]
         mpimg.imsave(buf, vals, cmap="terrain", format="png")
 
     buf.seek(0)
@@ -635,6 +636,7 @@ def get_xyz_tile(
     style: str = Query("default", description="Visualization style"),
     vmin: float | None = Query(None, description="Explicit Min Elevation"),
     vmax: float | None = Query(None, description="Explicit Max Elevation"),
+    tile_size: int = Query(512, description="Output pixel dimension for standard square XYZ tiles"),
 ) -> Response:
     """
     XYZ Tile Endpoint.
@@ -678,7 +680,7 @@ def get_xyz_tile(
         ext = "tif" if format == "tiff" else format
 
     # Hash unique parameters (Policy, VMin/Max) to handle different renderings of same tile
-    params_str = f"{policy_path.name}|{vmin}|{vmax}"
+    params_str = f"{policy_path.name}|{vmin}|{vmax}|{tile_size}"
     import hashlib
 
     param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
@@ -704,14 +706,18 @@ def get_xyz_tile(
 
     # Pad requested bbox to supply surrounding context for PNG Hillshade rendering
     # Ensures Matplotlib 3x3 surface normal calculation interpolates accurately
+    # Use pad_px=2 to completely remove any 3x3 kernel edge effects
     pad_px = 2 if format == "png" else 0
-    dx_deg = (east - west) / 256
-    dy_deg = (north - south) / 256
+    dx_deg = (east - west) / tile_size
+    dy_deg = (north - south) / tile_size
 
-    req_west = west - dx_deg * pad_px
-    req_east = east + dx_deg * pad_px
-    req_south = south - dy_deg * pad_px
-    req_north = north + dy_deg * pad_px
+    # Fetch slightly larger region than strictly necessary to prevent Web Mercator
+    # interpolation NaNs at the tile edge
+    fetch_pad = pad_px + 2
+    req_west = west - dx_deg * fetch_pad
+    req_east = east + dx_deg * fetch_pad
+    req_south = south - dy_deg * fetch_pad
+    req_north = north + dy_deg * fetch_pad
 
     # Run Fusion
     try:
@@ -752,25 +758,70 @@ def get_xyz_tile(
             lat_rad_north = math.atan(math.sinh(math.pi * (1 - 2 * y / n_tiles)))
             max_y_m = r_earth * math.log(math.tan(math.pi / 4 + lat_rad_north / 2))
 
-            dx_m = (max_x_m - min_x_m) / 256
-            dy_m = (max_y_m - min_y_m) / 256
+            dx_m = (max_x_m - min_x_m) / tile_size
+            dy_m = (max_y_m - min_y_m) / tile_size
 
             # Add 1x pixel padding specifically for PNG Hillshade rendering to avoid 3x3 kernel edge artifacts
-            pad = 1 if format == "png" else 0
-            n_dim = 256 + 2 * pad
-            target_x = np.linspace(min_x_m - dx_m * (pad - 0.5), max_x_m + dx_m * (pad - 0.5), n_dim)
+            n_dim = tile_size + 2 * pad_px
+            target_x = np.linspace(min_x_m - dx_m * (pad_px - 0.5), max_x_m + dx_m * (pad_px - 0.5), n_dim)
             target_y = np.linspace(
-                max_y_m + dy_m * (pad - 0.5), min_y_m - dy_m * (pad - 0.5), n_dim
+                max_y_m + dy_m * (pad_px - 0.5), min_y_m - dy_m * (pad_px - 0.5), n_dim
             )  # North up
 
+            crs = ds.rio.crs
             ds_elev = ds["elevation"].interp(x=target_x, y=target_y, method="linear")
             if "source_elevation" in ds:
                 ds_src = ds["source_elevation"].interp(x=target_x, y=target_y, method="nearest")
                 ds = xr.Dataset({"elevation": ds_elev, "source_elevation": ds_src})
             else:
                 ds = xr.Dataset({"elevation": ds_elev})
+            if crs is not None:
+                ds.rio.write_crs(crs, inplace=True)
+        else:
+            # Fallback for non-EPSG:3857 to explicitly enforce output dimensions using scipy zoom
+            target_px = tile_size + 2 * pad_px
+            if ds["elevation"].shape != (target_px, target_px):
+                import warnings
+
+                from scipy.ndimage import zoom as _zoom
+
+                elev = ds["elevation"].values
+                zy = target_px / elev.shape[0]
+                zx = target_px / elev.shape[1]
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    elev_resized = _zoom(elev.astype(np.float32), (zy, zx), order=1)
+
+                old_x = ds.coords["x"].values
+                old_y = ds.coords["y"].values
+                new_x = np.linspace(old_x[0], old_x[-1], target_px)
+                new_y = np.linspace(old_y[0], old_y[-1], target_px)
+
+                ds_out = {
+                    "elevation": xr.DataArray(elev_resized, dims=("y", "x"), coords={"y": new_y, "x": new_x})
+                }
+
+                if "source_elevation" in ds:
+                    src_elev = ds["source_elevation"].values
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        src_elev_resized = _zoom(src_elev.astype(np.float32), (zy, zx), order=0).astype(
+                            np.uint16
+                        )
+                    ds_out["source_elevation"] = xr.DataArray(
+                        src_elev_resized, dims=("y", "x"), coords={"y": new_y, "x": new_x}
+                    )
+
+                crs = ds.rio.crs
+                ds_attrs = ds.attrs
+                ds = xr.Dataset(ds_out)
+                ds.attrs = ds_attrs
+                if crs is not None:
+                    ds.rio.write_crs(crs, inplace=True)
+
     except Exception as e:
-        logger.warning(f"Failed to cleanly interpolate 256x256 EPSG:3857 bounds: {e}")
+        logger.warning(f"Failed to cleanly interpolate/resize tile bounds: {e}")
 
     # Render
     if format == "png":
@@ -790,10 +841,16 @@ def get_xyz_tile(
                 legend_map = None
 
             data = render_png(
-                ds["source_elevation"], style="source", vmin=vmin, vmax=vmax, zoom=z, legend=legend_map
+                ds["source_elevation"],
+                style="source",
+                vmin=vmin,
+                vmax=vmax,
+                zoom=z,
+                legend=legend_map,
+                pad=pad_px,
             )
         else:
-            data = render_png(ds["elevation"], style=style, vmin=vmin, vmax=vmax, zoom=z)
+            data = render_png(ds["elevation"], style=style, vmin=vmin, vmax=vmax, zoom=z, pad=pad_px)
         media_type = "image/png"
 
     elif format in ["npy", "npz"]:

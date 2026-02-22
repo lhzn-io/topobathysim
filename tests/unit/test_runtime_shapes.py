@@ -127,7 +127,9 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
             elevation = ds["elevation"]
 
             assert elevation.ndim == 2, f"Expected 2D array, got {elevation.ndim}"
-            assert elevation.values[0, 0] == 5.0
+            valid_vals = elevation.values[~np.isnan(elevation.values)]
+            assert len(valid_vals) > 0, "Expected valid values but array is all NaNs"
+            assert valid_vals[0] == 5.0
 
             # 2. Test Multi Band (3, H, W) -> Should pick Band 1 (Value 1.0)
             mock_policy.variables[0].steps = [
@@ -141,8 +143,8 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
             # Should be 1.0 (first band) not 2.0 or 3.0
             # Note: We align to canvas, so check valid pixels
             valid_vals = elevation.values[~np.isnan(elevation.values)]
-            if len(valid_vals) > 0:
-                assert valid_vals[0] == 1.0
+            assert len(valid_vals) > 0, "Expected valid values but array is all NaNs"
+            assert valid_vals[0] == 1.0
 
             # 3. Test Channel Last (H, W, 1) -> Should reduce to (H, W)
             mock_policy.variables[0].steps = [
@@ -154,8 +156,8 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
 
             assert elevation.ndim == 2
             valid_vals = elevation.values[~np.isnan(elevation.values)]
-            if len(valid_vals) > 0:
-                assert valid_vals[0] == 7.0
+            assert len(valid_vals) > 0, "Expected valid values but array is all NaNs"
+            assert valid_vals[0] == 7.0
 
 
 if __name__ == "__main__":

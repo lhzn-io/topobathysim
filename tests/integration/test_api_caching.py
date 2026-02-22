@@ -83,3 +83,30 @@ def test_tile_request_caches_data(client: TestClient, clean_cache: Path) -> None
     # 4. Check Output Cache (The generated PNG)
     output_cache = clean_cache / "tiles" / "visual" / "default"
     assert any(output_cache.rglob("*.png")), "Output PNG was not cached."
+
+    # 5. Verify NPZ format and default 512x512 tile limits
+    import io
+
+    import numpy as np
+
+    url_npz = f"/tiles/{z}/{x}/{y}.npz"
+    resp_npz = client.get(url_npz)
+    assert resp_npz.status_code == 200, f"NPZ request failed: {resp_npz.text}"
+
+    with np.load(io.BytesIO(resp_npz.content)) as data:
+        assert data["elevation"].shape == (
+            512,
+            512,
+        ), f"Expected default 512x512, got {data['elevation'].shape}"
+        if "source_elevation" in data:
+            assert data["source_elevation"].shape == (512, 512)
+
+    # 6. Verify tile_size parameter
+    url_npz_256 = f"/tiles/{z}/{x}/{y}.npz?tile_size=256"
+    resp_npz_256 = client.get(url_npz_256)
+    assert resp_npz_256.status_code == 200, f"NPZ request failed: {resp_npz_256.text}"
+
+    with np.load(io.BytesIO(resp_npz_256.content)) as data:
+        assert data["elevation"].shape == (256, 256), f"Expected 256x256, got {data['elevation'].shape}"
+        if "source_elevation" in data:
+            assert data["source_elevation"].shape == (256, 256)
