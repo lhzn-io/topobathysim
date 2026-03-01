@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
-  { name = "Antigravity Agent", email = "agent@deepmind.com" },
+  { name = "Daniel Fry", email = "dfry@lhzn.io" },
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -21,43 +21,56 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-  "bmi-topography==0.9.0",
+  # Core scientific stack
   "xarray",
   "rioxarray",
   "zarr",
   "numpy",
+  "scipy",
+  "pandas",
+  "geopandas",
+  "shapely",
+  "pyproj",
+  "rasterio",
+  "affine",
+  # Data access
+  "bmi-topography==0.9.0",
   "pydap",
   "fsspec",
   "s3fs",
   "requests",
-  "geopandas",
-  "pdal",
   "httpx",
-  "matplotlib",
   "planetary-computer",
   "pystac-client",
+  # Point cloud
+  "pdal",
+  "laspy",
   "lazrs",
   "h5py",
-  "uvicorn",
-  "fastapi",
-  "python-dotenv",
-  "filelock",
+  # Policy & config
   "pydantic>=2.0",
   "pyyaml",
+  "python-dotenv",
+  "filelock",
+  # Visualization
+  "matplotlib",
+  # CLI
   "questionary",
   "rich",
+  # Service (used by topobathyserve)
+  "uvicorn",
+  "fastapi",
 ]
 
 [project.urls]
-Documentation = "https://github.com/lhzn-io/biologger-sim/tree/main/bathysim"
-Issues = "https://github.com/lhzn-io/biologger-sim/issues"
-Source = "https://github.com/lhzn-io/biologger-sim/tree/main/bathysim"
+Documentation = "https://topobathysim.docs.lhzn.io"
+Issues = "https://github.com/lhzn-io/topobathysim/issues"
+Source = "https://github.com/lhzn-io/topobathysim"
 
 [tool.hatch.envs.default]
 dependencies = [
   "coverage[toml]>=6.5",
   "pytest",
-  "geopandas",
 ]
 
 [tool.hatch.envs.default.scripts]

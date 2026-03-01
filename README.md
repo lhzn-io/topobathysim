@@ -196,6 +196,12 @@ If you have domain expertise for a region, you can encode it as a policy preset:
 - `docs/planning/roadmap.md` — roadmap (including time-varying covariates and Sentinel plans)
 - `policies/README.md` — policy presets and how to run iconic demos
 
+## Built with agentic engineering
+
+TopoBathySim is developed using [agentic engineering](https://simonwillison.net/2026/Feb/23/agentic-engineering-patterns/) practices — professional software development amplified by AI coding agents. The tools we use include [Antigravity](https://antigravity.dev) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+
+Domain expertise, architectural decisions, and quality judgment remain human responsibilities. The agents accelerate implementation, catch bugs, and handle boilerplate — but every provider, policy, and fusion strategy reflects deliberate engineering choices informed by geospatial domain knowledge.
+
 ## License
 
 MIT License (code).

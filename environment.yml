@@ -5,35 +5,49 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - pdal
-  - python-pdal
-  - gdal
-  - rasterio
-  - geopandas
+  # Core scientific stack
   - xarray
   - rioxarray
   - zarr
   - numpy
   - scipy
+  - pandas
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio
+  - affine
+  - gdal
+  - dask
+  # Data access
+  - bmi-topography=0.9.0
+  - fsspec
+  - s3fs
+  - requests
+  - planetary-computer
+  - pystac-client
+  # Point cloud
+  - pdal
+  - python-pdal
   - laspy
   - lazrs-python
   - h5py
-  - pystac-client
-  - pystac-client
-  - planetary-computer
-  - s3fs
-  - requests
-  - dask
-  - bmi-topography=0.9.0
-  - rich
-  - pyproj
-  - joblib
-  - uvicorn
-  - fastapi
+  # Policy & config
+  - pydantic>=2.0
+  - pyyaml
   - python-dotenv
   - filelock
+  # Visualization
+  - matplotlib
+  # CLI
+  - questionary
+  - rich
+  # Service
+  - uvicorn
+  - fastapi
   # Dev dependencies
   - pytest
+  - coverage
   - pre-commit
   - ruff
   - mypy
@@ -45,3 +59,8 @@ dependencies:
   - sphinx-rtd-theme
   - myst-parser
   - sphinxcontrib-mermaid
+  # pip-only (stale or missing on conda-forge)
+  - pip:
+      - httpx
+      - pydap
+      - -e .

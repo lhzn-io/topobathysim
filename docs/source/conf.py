@@ -25,5 +25,37 @@ exclude_patterns: list[str] = []
 
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
+html_extra_path = ["_extra"]
 
-autodoc_mock_imports = ["osgeo"]
+autodoc_mock_imports = [
+    "osgeo",
+    "xarray",
+    "rioxarray",
+    "numpy",
+    "scipy",
+    "pyproj",
+    "affine",
+    "rasterio",
+    "bmi_topography",
+    "h5py",
+    "zarr",
+    "fsspec",
+    "s3fs",
+    "geopandas",
+    "pdal",
+    "pydap",
+    "matplotlib",
+    "planetary_computer",
+    "pystac_client",
+    "requests",
+    "httpx",
+    "filelock",
+    "pydantic",
+    "uvicorn",
+    "fastapi",
+    "dotenv",
+    "questionary",
+    "rich",
+    "lazrs",
+    "yaml",
+]
