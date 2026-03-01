@@ -1,34 +1,232 @@
 CLI Tools
 =========
 
-TopoBathySim includes several command-line utilities for managing data caches, verifying integrity, and running the tile server.
+TopoBathySim includes a unified command-line utility — ``cache_manager`` — for
+inspecting, verifying integrity, and purging cached data.  A separate ``run_server``
+script starts the tile server.
 
-Cache Verification & Maintenance
---------------------------------
+Understanding the Cache Hierarchy
+----------------------------------
 
-Since TopoBathySim aggressively caches gigabytes of survey data (BAG, Lidar, COGs), use the integrity tool to manage storage health. This script identifies and (optionally) removes corrupt downloads or stale lock files from crashed processes.
+TopoBathySim maintains five cache tiers, ordered from the safest to the most
+expensive to rebuild:
+
+.. list-table:: Cache Tier Inventory
+   :widths: 5 25 40 30
+   :header-rows: 1
+
+   * - #
+     - Tier
+     - Paths (relative to ``~/.cache/topobathysim/``)
+     - Rebuild cost
+   * - 1
+     - Output tiles & metadata
+     - ``tiles/visual/``, ``tiles/data/``, ``tiles/raw/`` (PNGs, NPY/NPZ, ``_meta.json``, ``_src.npz``)
+     - Seconds — re-rendered on next tile request
+   * - 2
+     - Fused zarr
+     - ``fused_zarr/`` (multi-provider composite grids)
+     - Minutes — re-fused from provider zarr
+   * - 3
+     - Provider zarr
+     - ``{provider}/zarr/*.zarr`` (rasterised per-provider grids)
+     - Minutes–hours — re-rasterised from raw source files
+   * - 4
+     - Discovery caches
+     - 5 JSON/GeoJSON metadata files (see below)
+     - Seconds–minutes — re-queried from disk or network
+   * - 5
+     - Raw source files ⚠️
+     - ``*.bag``, ``*.tiff``, ``*.tif``, ``*.laz`` in provider directories
+     - Hours — full re-download
+
+**Tier 4 discovery cache files** (lightweight indices, fast to rebuild):
+
+.. list-table::
+   :widths: 40 60
+   :header-rows: 1
+
+   * - File (relative to ``~/.cache/topobathysim/``)
+     - Stores
+   * - ``ncei_bag/discovery_cache.json``
+     - bbox → BAG download-URL list (NCEI ArcGIS API)
+   * - ``metadata/ncei_bag_redirects.json``
+     - NCEI landing-page URL → ``.bag`` file URL
+   * - ``noaa_bluetopo/tile_url_cache.json``
+     - tile_id → HTTPS asset URL (S3 glob lookup)
+   * - ``noaa_bluetopo/BlueTopo_Tile_Scheme.gpkg``
+     - tile footprint spatial index (downloaded from NOAA S3)
+   * - ``noaa_bluetopo/sidecars/``
+     - per-tile RAT ``.aux.xml`` files mapping pixel values to survey IDs;
+       ``.failed`` sentinels mark tiles whose RAT_Link is stale (404)
+   * - ``noaa_topobathy/*.zip``
+     - per-project tile-index shapefiles (one per lidar project)
+   * - ``metadata/noaa_coastal_lidar.json``
+     - project ID → folder name (S3 index HTML)
+   * - ``metadata/noaa_project_extents.geojson``
+     - project spatial bbox index (GeoJSON)
+
+Discovery caches survive server restarts so tile generation is fully offline
+once a region is hydrated.  Invalidate them when you expect newly published
+survey data to be available.
+
+.. note::
+
+   ``noaa_bluetopo``, ``noaa_topobathy``, and ``usgs_3dep`` are *streaming
+   providers* — they never download raw source files.  They read Cloud
+   Optimized GeoTIFFs directly from S3 and write straight to provider zarr.
+   Only ``ncei_bag``, ``usgs_lidar``, and ``ncei_cudem`` populate tier 5.
+
+
+Cache Manager
+-------------
+
+Use ``cache_manager`` for all cache operations: status, integrity checks, and
+selective or bulk purging.
+
+Interactive Mode (default)
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Run without arguments to enter the interactive menu:
 
 .. code-block:: bash
 
-   # 1. Audit Cache (Dry Run)
-   # Checks ZIPs, BAGs, LAZ files, and Zarr stores for corruption
-   micromamba run -n topobathysim python src/topobathysim/scripts/verify_cache_integrity.py --check
+   python -m topobathysim.scripts.cache_manager
 
-   # 2. Repair Cache (Clean Mode)
-   # Deletes corrupt source files and releases locks older than the timeout
-   micromamba run -n topobathysim python src/topobathysim/scripts/verify_cache_integrity.py --clean
+The menu displays a live status table and loops after each operation::
 
-   # 3. Custom Timeout
-   # Consider locks stale after 2 minutes (120s) instead of the default 1 hour
-   micromamba run -n topobathysim python src/topobathysim/scripts/verify_cache_integrity.py --check --lock-timeout 120
+   TopoBathySim Cache Manager
+   ==========================
+     Cache root : ~/.cache/topobathysim
+     Total size : 4.2 GB
 
-Key Features:
-^^^^^^^^^^^^^
+     #   Tier                            Size    Items
+     ────────────────────────────────────────────────────────
+   ✓  [1] Output tiles & metadata          23.4 MB      847
+   ✓  [2] Fused zarr                        0.2 MB        3
+   ✓  [3] Provider zarr                     3.8 GB       12
+   ✓  [4] Discovery caches                 12.0 KB        5
+   ✓  [5] Raw source files ⚠               0.4 GB       38
 
-- **Source Validation**: Uses native drivers (`rasterio`, `laspy`) to inspect file headers for standard geospatial formats (`.bag`, `.tiff`, `.laz`).
-- **Zarr Integrity**: verifies the consistency of derived Zarr cache directories.
-- **Stale Lock Cleanup**: Identifies `.lock` files abandoned by interrupted processes.
-- **Benign Warning Suppression**: Automatically filters harmless C-level warnings (e.g., NCEI BAG metadata precision issues) to reduce noise.
+     ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+     [1–5] purge tier   [c] check integrity   [i] tier info   [q] quit
+
+Available interactive commands:
+
+- ``1``–``5`` — purge that tier (prompts for confirmation; tier 5 requires typing ``yes``)
+- ``c`` — run a read-only integrity audit across all providers and discovery caches
+- ``i`` — print detailed per-tier descriptions with when/why to purge
+- ``q`` — quit
+
+Non-Interactive Flags
+^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: bash
+
+   # 1. Integrity audit (read-only)
+   python -m topobathysim.scripts.cache_manager --check
+
+   # 2. Integrity check + delete corrupt files and stale locks
+   python -m topobathysim.scripts.cache_manager --clean
+
+   # 3. Purge a specific tier
+   python -m topobathysim.scripts.cache_manager --purge 1
+
+   # 4. Purge multiple tiers
+   python -m topobathysim.scripts.cache_manager --purge 1 2 4
+
+   # 5. Purge all tiers (prompts for tier 5 confirmation unless --yes)
+   python -m topobathysim.scripts.cache_manager --purge all
+
+   # 6. Dry run — preview what would be deleted without deleting
+   python -m topobathysim.scripts.cache_manager --dry-run --purge all
+
+   # 7. Skip confirmation prompts (use with care for tier 5)
+   python -m topobathysim.scripts.cache_manager --yes --purge 1 2
+
+Arguments
+^^^^^^^^^
+
+- ``--check`` — read-only integrity scan (corrupt files, stale locks, malformed JSON)
+- ``--clean`` — same as ``--check`` but also deletes the corrupt/stale items
+- ``--purge TIER [TIER ...]`` — tier number(s) 1–5, or ``all``
+- ``--dry-run`` — show what would be deleted without deleting
+- ``--yes`` — skip confirmation prompts
+- ``--lock-timeout N`` — seconds before a ``.lock`` file is considered stale (default: 3600)
+
+
+Common Scenarios
+^^^^^^^^^^^^^^^^
+
+**Re-render tiles after a style change**
+
+.. code-block:: bash
+
+   python -m topobathysim.scripts.cache_manager --purge 1 --yes
+
+**Force re-fusion after updating the policy YAML**
+
+.. code-block:: bash
+
+   # Purge fused zarr so next tile request re-runs the fusion pipeline
+   python -m topobathysim.scripts.cache_manager --purge 2 --yes
+
+**NCEI has published new multibeam surveys for your area**
+
+.. code-block:: bash
+
+   python -m topobathysim.scripts.cache_manager --purge 4 --yes
+
+**NOAA has updated BlueTopo tiles (filenames changed with a new date stamp)**
+
+.. code-block:: bash
+
+   # Stale tile_url_cache entries will 404; purge tier 4 to force re-discovery
+   python -m topobathysim.scripts.cache_manager --purge 4 --yes
+
+**BlueTopo sidecar RAT_Links returning 404 (stale tile scheme)**
+
+When NOAA republishes a tile with a new date stamp, the ``RAT_Link`` URLs
+baked into the cached ``BlueTopo_Tile_Scheme.gpkg`` go stale.  The provider
+writes a ``.failed`` sentinel so downloads are not retried on every request,
+but the underlying surveys can no longer be resolved to human-readable names
+until the scheme is refreshed:
+
+.. code-block:: bash
+
+   # Purge tier 4 — clears the GPKG, sidecars, and .failed sentinels together
+   python -m topobathysim.scripts.cache_manager --purge 4 --yes
+
+**A new NOAA topobathy lidar project was added to the archive**
+
+.. code-block:: bash
+
+   python -m topobathysim.scripts.cache_manager --purge 4 --yes
+
+**Start completely fresh (keep raw source files)**
+
+.. code-block:: bash
+
+   # Clears tiers 1–4; raw files are retained so re-rendering is fast
+   python -m topobathysim.scripts.cache_manager --purge 1 2 3 4 --yes
+
+**Check for corrupt or stale files after a crash**
+
+.. code-block:: bash
+
+   python -m topobathysim.scripts.cache_manager --check
+
+   # If issues are found, run with --clean to delete them
+   python -m topobathysim.scripts.cache_manager --clean
+
+.. note::
+
+   Purging a tier does **not** purge lower-numbered tiers.  For example, purging
+   tier 4 (discovery caches) does not delete provider zarr or raw source files.
+   If the underlying provider data is still cached, discovery caches will be
+   re-populated from that local data on the next tile request — no network calls
+   are needed for already-cached survey regions.
+
 
 Server Management
 -----------------

@@ -49,8 +49,11 @@ def test_wlis_fusion_policy() -> None:
     # Ensure at least some data comes from non-default (0) sources
     assert len(unique_sources) > 1
 
-    # Check specifically for BlueTopo (2) or CUDEM (3) which should cover this marine area
-    assert 2 in unique_sources or 3 in unique_sources
+    # Check specifically for BlueTopo or CUDEM which should cover this marine area.
+    # We now check using the detailed provenance dictionary since IDs are dynamic assets.
+    prov_dict = ds.attrs.get("provenance_dict", {})
+    providers_used = [info.get("provider") for info in prov_dict.values() if isinstance(info, dict)]
+    assert "noaa_bluetopo" in providers_used or "ncei_cudem" in providers_used
 
     # 4. Check Attributes
     assert "policy_hash" in ds.attrs

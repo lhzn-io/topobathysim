@@ -167,7 +167,7 @@
             initStyle = params.get('style');
         }
 
-        var map = L.map('map');
+        var map = L.map('map', { minZoom: 10 });
 
         if (initBounds) {
             map.fitBounds(initBounds);
@@ -302,7 +302,11 @@
                 .then(data => {
                     var html = '';
                     if (data.items) {
+                        window.layerColors = {};
+                        window.layerPriority = {};
                         data.items.forEach(item => {
+                            window.layerColors[item.name] = item.color;
+                            window.layerPriority[item.name] = item.priority || 0;
                             html += `
                                 <div style="display:flex; align-items:center;">
                                     <span style="width:12px; height:12px; background:${item.color}; margin-right:5px; border:1px solid #ccc;"></span>
@@ -323,6 +327,10 @@
 
         styleSelect.value = initStyle;
         updateLegend(initStyle);
+
+        // Pre-fetch legend data on page load so window.layerColors / layerPriority are ready
+        // before the user clicks any tile (works even when style != "source").
+        fetchSourceLegend();
 
         styleSelect.addEventListener('change', function () {
             var newStyle = this.value;
@@ -376,7 +384,7 @@
             var metaUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}/metadata?style=${currentStyle}`;
 
             var popupContent = `
-                <div style="font-family: monospace; font-size: 13px; min-width: 240px;">
+                <div style="font-family: monospace; font-size: 13px; min-width: 260px; max-width: 340px;">
                     <b>Location Info</b><br/>
                     <div style="margin-top:5px">
                         Lat: <input type="text" value="${lat.toFixed(6)}" style="width: 100px;" onclick="this.select()"><br/>
@@ -423,6 +431,30 @@
                     if (el) el.innerHTML = '<span style="color:#999">No Elevation Data</span>';
                 });
 
+            // Shared closure so whichever fetch (pixel or metadata) finishes last wins.
+            var pixelHtml = null;       // set by pixel fetch
+            var metaSlotReady = false;  // set by metadata fetch after DOM slot is written
+            var pixelSlotId = `pixel-source-${tile.z}-${tile.x}-${tile.y}`;
+
+            function renderPixelSlot() {
+                if (!metaSlotReady || pixelHtml === null) return;
+                var el = document.getElementById(pixelSlotId);
+                if (el) el.innerHTML = pixelHtml;
+            }
+
+            // Fetch Pixel-Level Source
+            fetch(`/tiles/${tile.z}/${tile.x}/${tile.y}/pixel?lat=${lat}&lon=${lng}&style=${currentStyle}`)
+                .then(response => { if (!response.ok) return null; return response.json(); })
+                .then(data => {
+                    if (!data || !data.source) return;
+                    var provName = data.source.provider || 'unknown';
+                    var colorHex = (window.layerColors && window.layerColors[provName]) ? window.layerColors[provName] : '#808080';
+                    var srcName = data.source.name || 'Unknown';
+                    pixelHtml = `<span style="flex-shrink:0; display:inline-block; width:8px; height:8px; background:${colorHex}; border:1px solid #aaa; border-radius:1px;"></span><b style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${srcName}">${srcName}</b>`;
+                    renderPixelSlot();
+                })
+                .catch(function() {});
+
             // Fetch Metadata
             fetch(metaUrl)
                 .then(response => response.json())
@@ -436,14 +468,42 @@
                         el.innerHTML = '<span style="color:red">Cache corrupt</span>';
                     } else {
                         var dateStr = data.created_at ? data.created_at : 'Unknown';
-                        var sources = data.fusion_sources || 'Unknown';
-                        // Truncate sources if too long
-                        if (sources.length > 50) sources = sources.substring(0, 47) + '...';
+
+                        var sourcesHtml = "";
+                        if (data.provenance_dict && Object.keys(data.provenance_dict).length > 0) {
+                            // Deduplicate by (name, provider), then sort highest-priority first
+                            var seen = new Set();
+                            var uniqueSources = [];
+                            Object.values(data.provenance_dict).forEach(function(info) {
+                                var key = (info.name || '') + '|' + (info.provider || '');
+                                if (!seen.has(key)) { seen.add(key); uniqueSources.push(info); }
+                            });
+                            uniqueSources.sort(function(a, b) {
+                                var pa = (window.layerPriority && window.layerPriority[a.provider]) || 0;
+                                var pb = (window.layerPriority && window.layerPriority[b.provider]) || 0;
+                                return pb - pa;
+                            });
+                            sourcesHtml = `<details style="margin-top:2px; cursor:pointer;"><summary style="font-weight:bold;">Tile Sources (${uniqueSources.length})</summary><ul style="margin:2px 0 0 0; padding-left:0; font-size:10px; list-style-type:none;">`;
+                            uniqueSources.forEach(function(info) {
+                                var provName = info.provider || 'unknown';
+                                var colorHex = (window.layerColors && window.layerColors[provName]) ? window.layerColors[provName] : '#808080';
+                                var displayName = info.name || 'Unknown';
+                                sourcesHtml += `<li style="margin-bottom:2px; display:flex; align-items:center; gap:4px;"><span style="flex-shrink:0; display:inline-block; width:8px; height:8px; background-color:${colorHex}; border:1px solid #aaa; border-radius:1px;"></span><span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:240px;" title="${displayName}">${displayName}</span></li>`;
+                            });
+                            sourcesHtml += `</ul></details>`;
+                        } else {
+                            var sources = data.fusion_sources || 'Unknown';
+                            if (sources.length > 50) sources = sources.substring(0, 47) + '...';
+                            sourcesHtml = `<b>Sources:</b> ${sources}`;
+                        }
 
                         el.innerHTML = `
                             <b>Created:</b> ${dateStr}<br/>
-                            <b>Sources:</b> ${sources}
+                            <div style="margin-top:2px; font-size:11px; display:flex; align-items:center; gap:4px;"><b>Pixel:</b>&nbsp;<span id="${pixelSlotId}" style="display:inline-flex; align-items:center; gap:4px;"><i style="color:#999">—</i></span></div>
+                            ${sourcesHtml}
                         `;
+                        metaSlotReady = true;
+                        renderPixelSlot();
                     }
                 })
                 .catch(err => {

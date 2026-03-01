@@ -55,7 +55,14 @@ def mock_gebco_dataset() -> xr.Dataset:
         np.zeros((100, 100)),
         coords={"lat": lat, "lon": lon},
         dims=("lat", "lon"),
-        name="sub_ice_topo_bathymetry",
+        name="elevation",
+    )
+
+    da_source_id = xr.DataArray(
+        np.zeros((100, 100), dtype=np.uint32),
+        coords={"lat": lat, "lon": lon},
+        dims=("lat", "lon"),
+        name="source_id",
     )
 
     da_tid = xr.DataArray(
@@ -65,7 +72,7 @@ def mock_gebco_dataset() -> xr.Dataset:
         name="tid",
     )
 
-    ds = xr.Dataset({"sub_ice_topo_bathymetry": da_elev, "tid": da_tid})
+    ds = xr.Dataset({"elevation": da_elev, "source_id": da_source_id, "tid": da_tid})
     # Add rio accessor to ensure we have crs setup correctly for interpolation limits
     ds.rio.write_crs("EPSG:4326", inplace=True)
     return ds
@@ -92,7 +99,7 @@ def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Data
 
     # Check Elevation logic
     assert da is not None
-    assert da.name == "elevation"
+    assert "elevation" in da.data_vars
 
     # Check TID logic - TID not currently implemented in Provider
     # tid = gebco.get_tid_classification()
@@ -106,7 +113,7 @@ def test_fetch_elev_and_tid(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Data
     offset = Gebco2025.HALF_PIXEL_OFFSET
     # Just check that it's not an integer (mock data lies on integers/simple fractions)
     # and has the offset remainder
-    val = da.lat.values[0]
+    val = da.y.values[0]
     _ = offset % 1  # simplistic check or just check diff from nearest grid
 
     # Better: check that the difference between the fetched value and the 'raw' mock value

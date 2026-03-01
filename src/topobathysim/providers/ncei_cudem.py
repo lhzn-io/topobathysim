@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import geopandas as gpd
+import numpy as np
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
@@ -21,7 +22,7 @@ from shapely.geometry import box
 
 from ..quality import QualityClass
 from ..vdatum import VDatumResolver
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class CUDEMProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Fetch CUDEM data for the given bounding box.
         """
@@ -69,58 +70,104 @@ class CUDEMProvider(Provider):
         matches = self.resolve_tiles(west, south, east, north)
 
         if matches.empty:
-            raise KeyError(f"No CUDEM tiles found for bbox {bbox}")
+            raise ProviderNoDataError(f"No CUDEM tiles found for bbox {bbox}")
 
         logger.info(f"Found {len(matches)} CUDEM tiles for bbox.")
 
-        das: list[xr.DataArray] = []
+        project_layers = []
+        provenance_dict: dict[int, dict[str, str]] = {}
+
         for _, row in matches.iterrows():
             url = self._get_tile_url(row)
             if url:
                 tile_result = self.load_tile(row, (west, south, east, north))
 
                 if isinstance(tile_result, xr.DataArray):
-                    das.append(tile_result)
+                    da = tile_result
                 elif tile_result is not None:
-                    with contextlib.suppress(Exception):
-                        das.append(cast(xr.DataArray, tile_result))
+                    try:
+                        da = cast(xr.DataArray, tile_result)
+                    except Exception:
+                        continue
+                else:
+                    continue
 
-        if not das:
-            raise KeyError(f"Failed to load valid CUDEM data for bbox {bbox}")
+                import hashlib
 
-        if len(das) == 1:
-            merged = das[0]
+                filename = url.split("/")[-1].replace(".tif", "").replace(".tiff", "")
+                project_uid = int(hashlib.md5(filename.encode()).hexdigest(), 16) % 100000 + 30000
+                provenance_dict[project_uid] = {
+                    "name": filename,
+                    "provider": "ncei_cudem",
+                }
+
+                da.name = "elevation"
+                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                p_source.name = "source_id"
+                p_source.rio.write_nodata(0, inplace=True)
+                p_source.attrs["_FillValue"] = 0
+
+                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+                if da.rio.crs:
+                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+                project_layers.append(p_ds)
+
+        if not project_layers:
+            raise ProviderNoDataError(f"Failed to load valid CUDEM data for bbox {bbox}")
+
+        if len(project_layers) == 1:
+            merged_ds = project_layers[0]
         else:
             try:
-                merged = merge_arrays(das)
+                elevs = [ds["elevation"] for ds in project_layers]
+                sources = [ds["source_id"] for ds in project_layers]
+
+                final_elev = merge_arrays(elevs)
+                final_src = merge_arrays(sources)
+                merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
                 logger.error(f"Failed to merge CUDEM tiles: {e}")
-                merged = das[0]
+                merged_ds = project_layers[0]
 
         # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds) to avoid reprojecting full tile
         try:
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            final_elev = merged_ds["elevation"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            final_src = merged_ds["source_id"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
         except Exception as e:
             logger.warning(f"Clip failed (no overlap?): {e}")
-            if not das:  # If this was a single tile flow
-                raise KeyError(f"CUDEM tile clipped out: {bbox}") from e
+            if len(project_layers) == 1:  # If this was a single tile flow
+                raise ProviderNoDataError(f"CUDEM tile clipped out: {bbox}") from e
 
         # Reproject if needed
-        if crs and merged.rio.crs and merged.rio.crs != crs:
+        if crs and merged_ds["elevation"].rio.crs and merged_ds["elevation"].rio.crs != crs:
             try:
-                # logger.info(f"Reprojecting CUDEM from {merged.rio.crs} to {crs}")
-                merged = merged.rio.reproject(crs)
+                final_elev = merged_ds["elevation"].rio.reproject(crs)
+                final_src = merged_ds["source_id"].rio.reproject(crs)
+                merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
                 logger.warning(f"Reprojection failed: {e}")
 
         # Final Exact Clip (to target bbox in target CRS)
         # This ensures pixel alignment with the requested window
         with contextlib.suppress(Exception):
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            final_elev = merged_ds["elevation"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            final_src = merged_ds["source_id"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
 
-        merged.name = "elevation"
-        logger.debug("Found CUDEM Coverage")
-        return cast(xr.DataArray, merged)
+        merged_ds.attrs["provenance_dict"] = provenance_dict
+        logger.debug(f"Found CUDEM Coverage with provenance {provenance_dict}")
+        return cast(xr.Dataset, merged_ds)
 
     def get_metadata(self) -> dict[str, Any]:
         """

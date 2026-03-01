@@ -20,6 +20,7 @@ from pyproj import CRS, Transformer
 from topobathysim.operators.blend import metric_feather, overwrite
 from topobathysim.policy.loader import generate_provider_legend, hash_policy, load_policy
 from topobathysim.policy.schema import OperatorType
+from topobathysim.providers.base import ProviderNoDataError
 from topobathysim.providers.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -146,13 +147,15 @@ def _run_cell(
     elevation.rio.write_transform(transform, inplace=True)
 
     source_elevation = xr.DataArray(
-        data=np.full((height, width), 0, dtype=np.uint16),
+        data=np.full((height, width), 0, dtype=np.uint32),
         coords={"y": ys, "x": xs},
         dims=("y", "x"),
         name="source_elevation",
     )
     source_elevation.rio.write_crs(target_crs, inplace=True)
     source_elevation.rio.write_transform(transform, inplace=True)
+
+    cell_provenance_dict: dict[int, str] = {}
 
     # 5. Execution Loop
     for variable in policy.variables:
@@ -174,12 +177,23 @@ def _run_cell(
                     crs=target_crs,
                     filter=step.filter.model_dump() if step.filter else {},
                 )
-            except (KeyError, ValueError, RuntimeError):
-                # Skip provider if data is missing or fetch fails (common for sparse datasets)
+            except ProviderNoDataError as e:
+                logger.debug(f"Provider {step.provider} has no data for this cell: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Provider {step.provider} exception: {e}", exc_info=True)
                 continue
 
             if fetched_data is None:
                 continue
+
+            # Extract per-provider source provenance from Dataset
+            provider_source_id_da = None
+            if isinstance(fetched_data, xr.Dataset):
+                if "provenance_dict" in fetched_data.attrs:
+                    cell_provenance_dict.update(fetched_data.attrs["provenance_dict"])
+                provider_source_id_da = fetched_data.get("source_id")
+                fetched_data = fetched_data["elevation"]
 
             # --- Global Filter Constraints ---
             if step.filter:
@@ -219,6 +233,22 @@ def _run_cell(
 
             if not new_data_mask.any():
                 continue
+
+            aligned_source_id = None
+            if provider_source_id_da is not None:
+                try:
+                    from rasterio.enums import Resampling
+
+                    aligned_source_id = provider_source_id_da.rio.reproject_match(
+                        elevation, resampling=Resampling.nearest
+                    )
+                    # Squeeze any spurious band dimension introduced by reproject
+                    if "band" in aligned_source_id.dims:
+                        aligned_source_id = aligned_source_id.squeeze("band", drop=True)
+                    if aligned_source_id.ndim != 2:
+                        aligned_source_id = aligned_source_id.squeeze(drop=True)
+                except Exception as e:
+                    logger.warning(f"Failed to reproject source_id mask for {step.provider}: {e}")
 
             # 4. Generate Provider Legend & IDs
             legend = generate_provider_legend(policy)
@@ -271,7 +301,13 @@ def _run_cell(
                 elevation = elevation.where(~remaining_mask, blended_default)
 
             # Update Provenance (Global update for all valid pixels)
-            source_elevation = xr.where(new_data_mask, provider_id, source_elevation)  # type: ignore
+            if aligned_source_id is not None:
+                source_elevation = xr.where(new_data_mask, aligned_source_id, source_elevation)  # type: ignore
+            else:
+                source_elevation = xr.where(new_data_mask, provider_id, source_elevation)  # type: ignore
+            # Enforce 2D — xr.where can reintroduce a band dim from aligned_source_id
+            if "band" in source_elevation.dims:
+                source_elevation = source_elevation.squeeze("band", drop=True)
 
     # 6. Clip Halo Away! We only want the exact cell bounds
     # The cell bounds are clip_min_x, clip_min_y, clip_max_x, clip_max_y
@@ -281,8 +317,11 @@ def _run_cell(
     # We slice based on 'x' and 'y' coordinates of the dataset.
     # Note: ys are usually decreasing (max_y to min_y) in raster.
 
-    # Careful of float precision when slicing, use a tiny buffer inside the clip bounds.
-    epsilon = res_x * 0.1
+    # Use epsilon > 0.5 * res_x so that any pixel center within one step of a cell boundary is
+    # always included by at least one adjacent cell.  The 0.05° WGS84 cell grid does not align
+    # exactly with the EPSG:3857 pixel grid, so the clip boundary can fall between two pixel
+    # centers leaving a 1-pixel gap.  0.6 * res_x guarantees overlap (handled by drop_duplicates).
+    epsilon = res_x * 0.6
     ds = xr.Dataset({"elevation": elevation, "source_elevation": source_elevation})
 
     # Slice X
@@ -299,6 +338,9 @@ def _run_cell(
     # Ensure valid dimensions
     if ds.x.size == 0 or ds.y.size == 0:
         logger.warning(f"Clip resulted in empty dimensions for cell {cell_bbox}")
+
+    logger.debug(f"_run_cell returning provenance: {cell_provenance_dict}")
+    ds.attrs["provenance_dict"] = cell_provenance_dict
 
     return cast(xr.Dataset, ds)
 
@@ -391,6 +433,12 @@ def run(
             except Exception as e:
                 logger.warning(f"Failed to load cache {cache_path}: {e}")
 
+            # Squeeze any spurious band dimension that may have been saved by older cache writes
+            if ds_cell is not None:
+                for var in ["elevation", "source_elevation"]:
+                    if var in ds_cell and "band" in ds_cell[var].dims:
+                        ds_cell[var] = ds_cell[var].squeeze("band", drop=True)
+
         if ds_cell is None:
             # Cache miss! Execute the cell
             ds_cell = _run_cell(
@@ -403,13 +451,18 @@ def run(
             )
 
             # Attributes
-            ds_cell.attrs = {
+            new_attrs = {
                 "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
                 "policy_legend": str(legend),
                 "crs": target_crs,
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),
             }
+            ds_cell.attrs.update(new_attrs)
+
+            if "provenance_dict" in ds_cell.attrs:
+                # Keep it as is or JSON dump it
+                ds_cell.attrs["provenance_dict_json"] = json.dumps(ds_cell.attrs["provenance_dict"])
 
             # Attempt to save to cache
             if use_cache:
@@ -442,23 +495,27 @@ def run(
     if len(cell_datasets) == 1:
         merged_ds = cell_datasets[0]
     else:
-        # Sort each cell's coordinates to ensure monotonic indexes before combining
-        # Sort each cell's coordinates to ensure monotonic indexes before combining.
+        # Sort coordinates to ensure monotonic indexes before combining.
         sorted_cells = [ds.sortby("y", ascending=False).sortby("x", ascending=True) for ds in cell_datasets]
-        # Use merge or combine_by_coords, telling xarray it's okay to overwrite mismatched attributes
-        # like created_at and cell_bbox. We re-apply final attributes anyway.
+        # combine_attrs="override" discards per-cell attrs (created_at, cell_bbox); reapplied below.
         try:
             merged_ds = cast(xr.Dataset, xr.combine_by_coords(sorted_cells, combine_attrs="override"))
         except ValueError:
-            # Fallback to merge if non-monotonic indexes still complain
-            merged_ds = cast(xr.Dataset, xr.merge(sorted_cells, compat="override", combine_attrs="override"))
+            # Fallback: chain combine_first so NaN never overrides valid data.
+            # xr.merge(compat="override") uses first-value-wins which lets NaN from a cell that
+            # doesn't cover a coordinate silently mask valid data from another cell.
+            merged_ds = sorted_cells[0]
+            for next_ds in sorted_cells[1:]:
+                merged_ds = cast(xr.Dataset, merged_ds.combine_first(next_ds))
 
-        # CRITICAL FIX: combine_by_coords inherently sorts all coordinates ascending!
-        # We must restore mathematical top-to-bottom spatial coherence.
+        # combine_by_coords sorts all coords ascending; restore north-up Y ordering.
         merged_ds = merged_ds.sortby("y", ascending=False).sortby("x", ascending=True)
 
-    # Finally, clip to the Exact Arbitrary Bounding Box requested!
-    # Have to project the requested EPSG:4326 bbox to Target CRS first
+        # Drop float duplicate coordinates that can arise at grid cell boundaries to prevent
+        # downstream "Reindexing only valid with uniquely valued Index" errors.
+        merged_ds = merged_ds.drop_duplicates(dim="x").drop_duplicates(dim="y")
+
+    # Clip to the exact requested bbox, reprojecting bounds to target CRS if needed.
     if target_crs != "EPSG:4326":
         transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
         r_min_x, r_min_y = transformer.transform(start_lon, start_lat)
@@ -480,11 +537,22 @@ def run(
         merged_ds = merged_ds.sel(y=slice(req_min_y - epsilon, req_max_y + epsilon))
 
     # Add combined attributes
+    global_provenance: dict[int, dict[str, str]] = {}
+    for cell_ds in cell_datasets:
+        if "provenance_dict" in cell_ds.attrs:
+            for k, v in cell_ds.attrs["provenance_dict"].items():
+                global_provenance[int(k)] = v
+        elif "provenance_dict_json" in cell_ds.attrs:
+            loaded_dict = json.loads(cell_ds.attrs["provenance_dict_json"])
+            for k, v in loaded_dict.items():
+                global_provenance[int(k)] = v
+
     merged_ds.attrs = {
         "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
         "policy_legend": str(legend),
         "crs": target_crs,
         "mosaiced_from_cells": len(cells),
+        "provenance_dict": global_provenance,
     }
 
     return cast(xr.Dataset, merged_ds)

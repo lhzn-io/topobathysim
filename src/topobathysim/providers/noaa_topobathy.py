@@ -1,9 +1,10 @@
 import contextlib
 import logging
 import re
+import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import fsspec
 import geopandas as gpd
@@ -14,7 +15,7 @@ from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
 from ..vdatum import VDatumResolver
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,24 @@ class NoaaTopobathyProvider(Provider):
     INDEX_URL = "https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/laz/index.html"
     BUCKET_BASE = "noaa-nos-coastal-lidar-pds"
 
+    # Class-level in-process cache.
+    #
+    # run() creates one NoaaTopobathyProvider instance per grid cell (up to 9x
+    # per tile request).  Using class-level variables instead of instance-level ones
+    # means the project list and spatial index are loaded from disk only once per
+    # process instead of nine times.
+    #
+    # Disk backing files (under ~/.cache/topobathysim/metadata/):
+    #   noaa_coastal_lidar.json   - project ID -> folder name mapping (fetched from S3 HTML)
+    #   noaa_project_extents.geojson - spatial bbox index (built from project list)
+    #
+    # To discover newly published topo-bathy lidar projects, delete those files:
+    #   manage_discovery_cache.py --invalidate noaa_topobathy
+    _cls_projects: ClassVar[dict[str, str]] = {}
+    _cls_projects_metadata_urls: ClassVar[dict[str, str]] = {}
+    _cls_spatial_index: ClassVar["gpd.GeoDataFrame | None"] = None
+    _cls_lock: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
         """
         Initializes the Topobathy provider, creating necessary cache directories.
@@ -57,14 +76,25 @@ class NoaaTopobathyProvider(Provider):
 
         self.vdatum = VDatumResolver()
 
-        # Internal state
-        self._projects: dict[str, str] = {}  # ID -> FolderName
-        self._projects_metadata_urls: dict[str, str] = {}  # ID -> InPort/Info URL
+        # Internal state — point to class-level shared dicts so all instances within
+        # the same process share a single loaded copy (avoids 9x redundant disk reads
+        # when run() creates one provider instance per cell).
+        self._projects: dict[str, str] = NoaaTopobathyProvider._cls_projects
+        self._projects_metadata_urls: dict[str, str] = NoaaTopobathyProvider._cls_projects_metadata_urls
 
         self._active_project_id: str | None = None
         self._tile_index: gpd.GeoDataFrame | None = None
-        self._spatial_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
+
+    @property
+    def _spatial_index(self) -> "gpd.GeoDataFrame | None":
+        """Transparently reads from the class-level shared spatial index."""
+        return NoaaTopobathyProvider._cls_spatial_index
+
+    @_spatial_index.setter
+    def _spatial_index(self, value: "gpd.GeoDataFrame | None") -> None:
+        """Writes to the class-level shared spatial index."""
+        NoaaTopobathyProvider._cls_spatial_index = value
 
     def fetch_layer(
         self,
@@ -72,11 +102,13 @@ class NoaaTopobathyProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Fetches and merges Topobathy data from ALL overlapping projects.
         Prioritizes better datasets (Name/Datum/Recency) by layering them on top.
         """
+        import numpy as np
+
         west, south, east, north = bbox
 
         # Extract filter from kwargs
@@ -87,11 +119,12 @@ class NoaaTopobathyProvider(Provider):
         pids = self.find_projects_by_box(west, south, east, north, filter_criteria=filter_criteria)
         if not pids:
             # Try to report what happened
-            raise KeyError(f"No NOAA Topobathy projects found for bbox {bbox}")
+            raise ProviderNoDataError(f"No NOAA Topobathy projects found for bbox {bbox}")
 
         logger.info(f"Topobathy fetch: Found {len(pids)} overlapping projects. Processing...")
 
         project_layers = []
+        provenance_dict: dict[int, dict[str, str]] = {}
 
         # 2. Process Each Project
         for pid in pids:
@@ -145,7 +178,33 @@ class NoaaTopobathyProvider(Provider):
                     # Default is last-on-top, but for a single project tiles shouldn't overlap much
                     try:
                         p_merged = merge_arrays(project_das)
-                        project_layers.append(p_merged)
+
+                        # Extract Provenance info
+                        try:
+                            project_uid = int(pid) + 10000
+                        except ValueError:
+                            import hashlib
+
+                            project_uid = int(hashlib.md5(pid.encode()).hexdigest(), 16) % 100000 + 10000
+
+                        project_name = self._projects.get(pid, f"Project {pid}")
+                        provenance_dict[project_uid] = {
+                            "name": project_name,
+                            "provider": "noaa_topobathy",
+                        }
+
+                        p_merged.name = "elevation"
+                        p_source = xr.where(p_merged.notnull(), project_uid, 0).astype(np.uint32)
+                        p_source.name = "source_id"
+                        p_source.rio.write_nodata(0, inplace=True)
+                        p_source.attrs["_FillValue"] = 0
+
+                        p_ds = xr.Dataset({"elevation": p_merged, "source_id": p_source})
+                        # carry over spatial attributes
+                        p_ds.rio.write_crs(p_merged.rio.crs, inplace=True)
+                        p_ds.rio.write_transform(p_merged.rio.transform(), inplace=True)
+
+                        project_layers.append(p_ds)
                     except Exception as e:
                         logger.warning(f"Failed to merge tiles for project {pid}: {e}")
 
@@ -153,24 +212,36 @@ class NoaaTopobathyProvider(Provider):
                 logger.warning(f"Failed to process project {pid}: {e}")
 
         if not project_layers:
-            raise KeyError(f"No valid data returned from {len(pids)} projects for bbox {bbox}")
+            raise ProviderNoDataError(f"No valid data returned from {len(pids)} projects for bbox {bbox}")
 
         # 3. Merge Projects
         # project_layers is ordered [Best, ..., Worst]
         # merge_arrays puts the LAST element on top.
         # We want Best on top, so we must pass [Worst, ..., Best]
         # Reverse the list.
-        final_merged = merge_arrays(project_layers[::-1])
+        elevs = [ds["elevation"] for ds in project_layers[::-1]]
+        sources = [ds["source_id"] for ds in project_layers[::-1]]
+
+        final_elev = merge_arrays(elevs)
+        final_src = merge_arrays(sources)
 
         # 4. Final Clip
         with contextlib.suppress(Exception):
-            final_merged = final_merged.rio.clip_box(
+            final_elev = final_elev.rio.clip_box(
                 minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
             )
+            final_src = final_src.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
 
-        final_merged.name = "elevation"
-        logger.debug("Found NOAA Topobathy Coverage")
-        return cast(xr.DataArray, final_merged)
+        final_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
+        # Ensure CRS is maintained after merge and clip
+        target_crs = final_elev.rio.crs or "EPSG:4326"
+        final_ds.rio.write_crs(target_crs, inplace=True)
+        final_ds["elevation"].rio.write_crs(target_crs, inplace=True)
+        final_ds["source_id"].rio.write_crs(target_crs, inplace=True)
+
+        final_ds.attrs["provenance_dict"] = provenance_dict
+        logger.debug(f"NOAA Topobathy Return -> CRS: {final_ds.rio.crs}")
+        return cast(xr.Dataset, final_ds)
 
     def get_metadata(self) -> dict[str, Any]:
         """
@@ -197,20 +268,100 @@ class NoaaTopobathyProvider(Provider):
         """
         Parses the map of ID -> Project Folder Name.
         Checks local JSON or fetches remote HTML index.
+        Uses a class-level lock so the disk read happens only once per process
+        even when multiple cells are processed concurrently.
         """
         if self._projects:
+            logger.debug(f"Topobathy Project Index Cache Hit (in-process): {len(self._projects)} projects")
             return
 
-        json_path = self.metadata_dir / "noaa_coastal_lidar.json"
-        import json
-        import time
+        with NoaaTopobathyProvider._cls_lock:
+            # Re-check after acquiring lock (another thread may have loaded it)
+            if self._projects:
+                logger.debug(f"Topobathy Project Index Cache Hit (post-lock): {len(self._projects)} projects")
+                return
 
-        # 1. Try Loading JSON
-        if json_path.exists():
-            age = time.time() - json_path.stat().st_mtime
-            # 7 days expiration
-            if age < 604800:
+            json_path = self.metadata_dir / "noaa_coastal_lidar.json"
+            import json
+            import time
+
+            # 1. Try Loading JSON
+            if json_path.exists():
+                age = time.time() - json_path.stat().st_mtime
+                # 7 days expiration
+                if age < 604800:
+                    try:
+                        with open(json_path) as f:
+                            data = json.load(f)
+                            for k, v in data.items():
+                                if isinstance(v, dict):
+                                    self._projects[k] = v.get("name", "")
+                                    if "info" in v:
+                                        self._projects_metadata_urls[k] = v["info"]
+                                else:
+                                    self._projects[k] = str(v)
+
+                            logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
+                            return
+                    except Exception as e:
+                        logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
+
+            # 2. Fetch and Parse HTML
+            try:
+                text = self._fetch_index()
+                new_projects = {}
+                new_metadata_urls = {}
+
+                lines = text.split("\n")
+                current_folder = None
+
+                for line in lines:
+                    # 1. Find Folder / Bulk Link
+                    folder_match = re.search(r'href=".*dem/([^/]+)/index\.html"', line)
+                    if folder_match:
+                        folder_name = folder_match.group(1)
+                        parts = folder_name.split("_")
+                        if parts and parts[-1].isdigit():
+                            pid = parts[-1]
+                            current_folder = (pid, folder_name)
+                            new_projects[pid] = folder_name
+
+                    # 2. Find InPort Link
+                    if current_folder and "metadata" in line:
+                        pid = current_folder[0]
+                        # Check for metadata link in the SAME line
+                        pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
+                        inport_match = re.search(pattern, line)
+                        if inport_match:
+                            new_metadata_urls[pid] = inport_match.group(1)
+
+                # Use .update() to populate the shared class-level dicts in-place
+                # (rebinding with = would break the reference set in __init__)
+                NoaaTopobathyProvider._cls_projects.update(new_projects)
+                NoaaTopobathyProvider._cls_projects_metadata_urls.update(new_metadata_urls)
+
+                p_count = len(self._projects)
+                m_count = len(self._projects_metadata_urls)
+                logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
+
+                # 3. Save to JSON
+                save_data = {}
+                for pid, folder in self._projects.items():
+                    entry = {"name": folder}
+                    if pid in self._projects_metadata_urls:
+                        entry["info"] = self._projects_metadata_urls[pid]
+                    save_data[pid] = entry
+
                 try:
+                    with open(json_path, "w") as f:
+                        json.dump(save_data, f, indent=2)
+                except Exception as e:
+                    logger.warning(f"Failed to write metadata JSON: {e}")
+
+            except Exception as e:
+                logger.error(f"Failed to load project index: {e}")
+                if json_path.exists():
+                    logger.warning("Using stale metadata JSON as fallback.")
                     with open(json_path) as f:
                         data = json.load(f)
                         for k, v in data.items():
@@ -220,75 +371,6 @@ class NoaaTopobathyProvider(Provider):
                                     self._projects_metadata_urls[k] = v["info"]
                             else:
                                 self._projects[k] = str(v)
-
-                        logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
-                        return
-                except Exception as e:
-                    logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
-
-        # 2. Fetch and Parse HTML
-        try:
-            text = self._fetch_index()
-            new_projects = {}
-            new_metadata_urls = {}
-
-            lines = text.split("\n")
-            current_folder = None
-
-            for line in lines:
-                # 1. Find Folder / Bulk Link
-                folder_match = re.search(r'href=".*dem/([^/]+)/index\.html"', line)
-                if folder_match:
-                    folder_name = folder_match.group(1)
-                    parts = folder_name.split("_")
-                    if parts and parts[-1].isdigit():
-                        pid = parts[-1]
-                        current_folder = (pid, folder_name)
-                        new_projects[pid] = folder_name
-
-                # 2. Find InPort Link
-                if current_folder and "metadata" in line:
-                    pid = current_folder[0]
-                    # Check for metadata link in the SAME line
-                    pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
-                    inport_match = re.search(pattern, line)
-                    if inport_match:
-                        new_metadata_urls[pid] = inport_match.group(1)
-
-            self._projects = new_projects
-            self._projects_metadata_urls = new_metadata_urls
-
-            p_count = len(self._projects)
-            m_count = len(self._projects_metadata_urls)
-            logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
-
-            # 3. Save to JSON
-            save_data = {}
-            for pid, folder in self._projects.items():
-                entry = {"name": folder}
-                if pid in self._projects_metadata_urls:
-                    entry["info"] = self._projects_metadata_urls[pid]
-                save_data[pid] = entry
-
-            try:
-                with open(json_path, "w") as f:
-                    json.dump(save_data, f, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to write metadata JSON: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed to load project index: {e}")
-            if json_path.exists():
-                logger.warning("Using stale metadata JSON as fallback.")
-                with open(json_path) as f:
-                    data = json.load(f)
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            self._projects[k] = v.get("name", "")
-                            if "info" in v:
-                                self._projects_metadata_urls[k] = v["info"]
-                        else:
-                            self._projects[k] = str(v)
 
     def fetch_inport_metadata(self, project_id: str) -> dict | None:
         """
@@ -545,48 +627,60 @@ class NoaaTopobathyProvider(Provider):
         """
         Loads the spatial index of project extents (GeoJSON).
         If missing, attempts to build it (this may take time).
+        Uses a class-level lock so the file is read only once per process.
         """
         if self._spatial_index is not None:
+            logger.debug(
+                f"Topobathy Spatial Index Cache Hit (in-process): {len(self._spatial_index)} projects"
+            )
             return
 
-        index_path = self.metadata_dir / "noaa_project_extents.geojson"
-
-        if not index_path.exists():
-            logger.warning(
-                "Spatial index missing. Building NOAA Project Index (this may take several minutes)..."
-            )
-            try:
-                # Note: `scripts` must be a package for this to work relative within `topobathysim` context
-                from ..scripts.build_noaa_index import main as build_index
-
-                # Run the builder script logic
-                build_index()
-            except ImportError:
-                # Fallback if scripts isn't importable as package
-                logger.error(
-                    "Could not import build_noaa_index script. Please run "
-                    "'python -m topobathysim.scripts.build_noaa_index' manually."
+        with NoaaTopobathyProvider._cls_lock:
+            # Re-check after acquiring lock (another thread may have loaded it)
+            if self._spatial_index is not None:
+                logger.debug(
+                    f"Topobathy Spatial Index Cache Hit (post-lock): {len(self._spatial_index)} projects"
                 )
                 return
-            except Exception as e:
-                logger.error(f"Failed to build spatial index: {e}")
-                return
 
-        if index_path.exists():
-            try:
-                self._spatial_index = gpd.read_file(index_path)
-                # Parse dates for sorting
-                import pandas as pd
+            index_path = self.metadata_dir / "noaa_project_extents.geojson"
 
-                if "end_date" in self._spatial_index.columns:
-                    self._spatial_index["end_date"] = pd.to_datetime(
-                        self._spatial_index["end_date"], errors="coerce"
+            if not index_path.exists():
+                logger.warning(
+                    "Spatial index missing. Building NOAA Project Index (this may take several minutes)..."
+                )
+                try:
+                    # scripts must be a package for relative import to resolve
+                    from ..scripts.build_noaa_index import main as build_index
+
+                    # Run the builder script logic
+                    build_index()
+                except ImportError:
+                    # Fallback if scripts isn't importable as package
+                    logger.error(
+                        "Could not import build_noaa_index script. Please run "
+                        "'python -m topobathysim.scripts.build_noaa_index' manually."
                     )
+                    return
+                except Exception as e:
+                    logger.error(f"Failed to build spatial index: {e}")
+                    return
 
-                logger.info(f"Loaded NOAA Spatial Index with {len(self._spatial_index)} projects.")
-            except Exception as e:
-                logger.error(f"Failed to load spatial index {index_path}: {e}")
-                self._spatial_index = None
+            if index_path.exists():
+                try:
+                    self._spatial_index = gpd.read_file(index_path)
+                    # Parse dates for sorting
+                    import pandas as pd
+
+                    if "end_date" in self._spatial_index.columns:
+                        self._spatial_index["end_date"] = pd.to_datetime(
+                            self._spatial_index["end_date"], errors="coerce"
+                        )
+
+                    logger.info(f"Loaded NOAA Spatial Index with {len(self._spatial_index)} projects.")
+                except Exception as e:
+                    logger.error(f"Failed to load spatial index {index_path}: {e}")
+                    self._spatial_index = None
 
     def find_projects_by_box(
         self,
@@ -884,9 +978,12 @@ class NoaaTopobathyProvider(Provider):
                         break
 
             if fname:
-                # If we picked up a full URL, strip it to just the filename
+                # Full URL: pass directly; fetch_tile extracts the local filename.
                 if fname.startswith("http"):
-                    fname = Path(fname).name
+                    if not fname.endswith(".tif"):
+                        fname += ".tif"
+                    results.append(fname)
+                    continue
 
                 # Cleanup internal absolute paths like /san1/raster/.../Project_Folder/block/tile.tif
                 if self._active_project_id:
@@ -974,7 +1071,6 @@ class NoaaTopobathyProvider(Provider):
 
         # 0. Check Negative Cache
         if missing_marker_path.exists():
-            # logger.debug(f"Topobathy 404 Cache Hit (Skipping): {zarr_name}")
             return None
 
         # 0. Check if FULL Tile is already cached (Avoids streaming from S3 if we already have the parent)
@@ -1053,7 +1149,6 @@ class NoaaTopobathyProvider(Provider):
                             try:
                                 clip_bbox = transform_bounds("EPSG:4326", source_crs, *bbox)
                                 clip_crs = source_crs
-                                # logger.debug(f"Reprojected Clip BBox to {source_crs}: {clip_bbox}")
                             except Exception as e:
                                 logger.warning(
                                     f"Failed to reproject bbox to {source_crs}: {e}. Retrying with 4326."

@@ -8,10 +8,11 @@ It uses 'bmi-topography' or OPeNDAP access to fetch data, managing caching local
 import logging
 from collections import namedtuple
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import xarray as xr
 from bmi_topography import Topography
+from rioxarray.merge import merge_arrays
 
 from .base import Provider
 from .registry import registry
@@ -81,7 +82,7 @@ class GEBCO2025Provider(Topography, Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Implements Provider.fetch_layer
         """
@@ -103,7 +104,7 @@ class GEBCO2025Provider(Topography, Provider):
             "url": self.OPENDAP_URL,
         }
 
-    def fetch(self, bbox_override: BBox | None = None) -> xr.DataArray:
+    def fetch(self, bbox_override: BBox | None = None) -> xr.Dataset:
         """
         Fetch data from GEBCO 2025 OPeNDAP server, utilizing a local Zarr cache
         tiled by 1x1 degree chunks to minimize repeat OPeNDAP hits.
@@ -137,7 +138,8 @@ class GEBCO2025Provider(Topography, Provider):
                 # Store in zarr subdirectory
                 zarr_dir = Path(self.cache_dir) / "zarr"
                 cache_path = zarr_dir / f"{tile_key}.zarr"
-                da_tile = None
+                da_tile: xr.DataArray | xr.Dataset | None = None
+                provenance_dict = {}
 
                 # A. Try loading from Zarr Cache
                 if cache_path.exists():
@@ -149,16 +151,37 @@ class GEBCO2025Provider(Topography, Provider):
                             warnings.filterwarnings(
                                 "ignore", message="Variable.s. referenced in grid_mapping not in variables"
                             )
-                            da_tile = xr.open_dataarray(
-                                cache_path, engine="zarr", chunks="auto", decode_coords="all"
-                            )
+                            # Try to open as Dataset first (new format with TID)
+                            try:
+                                da_tile = xr.open_dataset(
+                                    cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                )
+                                if "elevation" not in da_tile:
+                                    # Fallback to DataArray
+                                    da_tile = xr.open_dataarray(
+                                        cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                    )
+                            except Exception:
+                                da_tile = xr.open_dataarray(
+                                    cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                )
+
                         # Ensure CRS
-                        if da_tile.rio.crs is None:
+                        assert da_tile is not None
+                        has_crs = False
+                        if isinstance(da_tile, xr.Dataset):
+                            has_crs = da_tile["elevation"].rio.crs is not None
+                        else:
+                            has_crs = da_tile.rio.crs is not None
+
+                        if not has_crs:
                             logger.warning(f"GEBCO Zarr Cache {tile_key} missing CRS. Setting EPSG:4326")
-                            da_tile.rio.write_crs("EPSG:4326", inplace=True)
+                            da_tile = da_tile.rio.write_crs("EPSG:4326")
 
                         # Basic check
-                        if da_tile.size == 0:
+                        if (isinstance(da_tile, xr.Dataset) and da_tile["elevation"].size == 0) or (
+                            not isinstance(da_tile, xr.Dataset) and da_tile.size == 0
+                        ):
                             da_tile = None
                         else:
                             logger.info(f"GEBCO Zarr Cache Hit: {tile_key}")
@@ -211,19 +234,29 @@ class GEBCO2025Provider(Topography, Provider):
                                         self.__class__._ds_remote = xr.open_dataset(
                                             self.OPENDAP_URL, engine="pydap"
                                         )
+                                        # Also initialize TID dataset connection
+                                        tid_url = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/type_identifier_grid/netcdf/gebco_2025_tid.nc"
+                                        self.__class__._tid_remote = xr.open_dataset(tid_url, engine="pydap")
                                     except Exception as connection_err:
                                         logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
                                         raise
 
                                 ds_remote = self.__class__._ds_remote
+                                tid_remote = getattr(self.__class__, "_tid_remote", None)
 
-                                logger.info(f"Downloading GEBCO 1x1 Tile to Cache: {tile_key}")
+                                logger.info(f"Downloading GEBCO 1x1 Tile + TID to Cache: {tile_key}")
 
                                 # Slice exactly this 1x1 degree chunk
                                 subset = ds_remote.sel(
                                     lat=slice(lat_idx, lat_idx + 1.0),
                                     lon=slice(lon_idx, lon_idx + 1.0),
                                 )
+                                tid_subset = None
+                                if tid_remote is not None:
+                                    tid_subset = tid_remote.sel(
+                                        lat=slice(lat_idx, lat_idx + 1.0),
+                                        lon=slice(lon_idx, lon_idx + 1.0),
+                                    )
 
                                 if "sub_ice_topo_bathymetry" in subset:
                                     da_source = subset["sub_ice_topo_bathymetry"]
@@ -242,26 +275,57 @@ class GEBCO2025Provider(Topography, Provider):
                                 if "grid_mapping" in da_source.encoding:
                                     del da_source.encoding["grid_mapping"]
 
+                                # Process TID
+                                da_tid = None
+                                if tid_subset is not None and "tid" in tid_subset:
+                                    da_tid = tid_subset["tid"].load()
+                                    if "grid_mapping" in da_tid.attrs:
+                                        del da_tid.attrs["grid_mapping"]
+                                    if "grid_mapping" in da_tid.encoding:
+                                        del da_tid.encoding["grid_mapping"]
+
                                 if da_source.size > 0:
                                     da_source = da_source.chunk({"lat": 240, "lon": 240})
                                     da_source.name = "elevation"
-                                    da_source.to_zarr(cache_path, mode="w", consolidated=True)
+
                                     logger.info(f"GEBCO Zarr Cache Created: {tile_key}")
+
+                                    if da_tid is not None:
+                                        da_tid = da_tid.chunk({"lat": 240, "lon": 240})
+                                        da_tid.name = "source_id"
+                                        # Merge into a Dataset and write CRS before saving so it
+                                        # survives the zarr round-trip without needing a patch on load.
+                                        ds_to_save = xr.Dataset({"elevation": da_source, "source_id": da_tid})
+                                        ds_to_save = ds_to_save.rio.write_crs("EPSG:4326")
+                                        ds_to_save.to_zarr(cache_path, mode="w", consolidated=True)
+                                    else:
+                                        da_source.to_zarr(cache_path, mode="w", consolidated=True)
 
                                     with warnings.catch_warnings():
                                         warnings.filterwarnings(
                                             "ignore",
                                             message="Variable.s. referenced in grid_mapping not in variables",
                                         )
-                                        da_tile = xr.open_dataarray(
-                                            cache_path, engine="zarr", chunks="auto", decode_coords="all"
-                                        )
-                                        if da_tile.rio.crs is None:
-                                            logger.warning(
-                                                f"GEBCO Zarr (Newly Created) {tile_key} missing CRS. "
-                                                "Setting EPSG:4326"
+                                        # Reload exactly as saved
+                                        if da_tid is None:
+                                            da_tile = xr.open_dataarray(
+                                                cache_path, engine="zarr", chunks="auto", decode_coords="all"
                                             )
-                                            da_tile.rio.write_crs("EPSG:4326", inplace=True)
+                                        else:
+                                            da_tile = xr.open_dataset(
+                                                cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                            )
+
+                                        # Re-apply CRS if it was dropped during save
+                                        assert da_tile is not None
+                                        has_crs = False
+                                        if isinstance(da_tile, xr.Dataset):
+                                            has_crs = da_tile["elevation"].rio.crs is not None
+                                        else:
+                                            has_crs = da_tile.rio.crs is not None
+
+                                        if not has_crs:
+                                            da_tile = da_tile.rio.write_crs("EPSG:4326")
 
                                 else:
                                     logger.warning(f"GEBCO Tile {tile_key} returned empty data.")
@@ -277,6 +341,22 @@ class GEBCO2025Provider(Topography, Provider):
                         pass
 
                 if da_tile is not None:
+                    # Extract unique TIDs for this chunk to build the provenance_dict
+                    if isinstance(da_tile, xr.Dataset) and "source_id" in da_tile:
+                        # Find unique values in the chunk
+                        import numpy as np
+
+                        unique_tids = np.unique(da_tile["source_id"].values)
+                        for tid in unique_tids:
+                            tid = int(tid)
+                            if tid == 0 or np.isnan(tid):
+                                continue
+                            if tid not in provenance_dict:
+                                provenance_dict[tid] = {
+                                    "name": f"GEBCO 2025 (TID {tid})",
+                                    "provider": "gebco_2025",
+                                }
+
                     das_to_merge.append(da_tile)
 
         if not das_to_merge:
@@ -285,39 +365,91 @@ class GEBCO2025Provider(Topography, Provider):
         # 2. Merge tiles if multiple
         try:
             if len(das_to_merge) == 1:
-                self._da = das_to_merge[0]
+                merged_ds = das_to_merge[0]
             else:
-                normalized = []
+                normalized: list[xr.DataArray | xr.Dataset] = []
                 for d in das_to_merge:
-                    d.name = "elevation"
-                    normalized.append(d)
+                    # GEBCO dimensions are lat/lon until renamed later.
+                    # rioxarray.merge_arrays requires descending Y and ascending X.
+                    if "lat" in d.dims:
+                        d = d.sortby("lat", ascending=False)
+                    if "lon" in d.dims:
+                        d = d.sortby("lon", ascending=True)
 
-                self._da = xr.merge(normalized)["elevation"]
+                    if isinstance(d, xr.Dataset):
+                        d["elevation"].name = "elevation"
+                        if "source_id" in d:
+                            d["source_id"].name = "source_id"
+                            # Ensure _FillValue is appropriately set for merge_arrays
+                            d["source_id"].rio.write_nodata(0, inplace=True)
+                            d["source_id"].attrs["_FillValue"] = 0
+                        normalized.append(d)
+                    else:
+                        d.name = "elevation"
+                        normalized.append(d)
+
+                # Separate elevation and source_id for merging
+                elevs = [d["elevation"] if isinstance(d, xr.Dataset) else d for d in normalized]
+                sources = [
+                    d["source_id"] for d in normalized if isinstance(d, xr.Dataset) and "source_id" in d
+                ]
+
+                final_elev = merge_arrays(elevs)
+
+                if sources:
+                    final_src = merge_arrays(sources)
+                    merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
+                else:
+                    merged_ds = xr.Dataset({"elevation": final_elev})
 
         except Exception as merge_err:
             logger.error(f"Merge failed: {merge_err}")
-            self._da = das_to_merge[0]  # Fallback to first
+            merged_ds = das_to_merge[0]  # Fallback to first
 
         # 3. Slice to request bounds with padding
         # Pad bounds by 0.01 degrees to ensure data is returned for high zoom levels
         # where the requested extent is smaller than the native (15 arcsec) resolution.
-        if self._da is not None:
+        if merged_ds is not None:
+            # Normalize lat to ascending order before slicing.
+            # The multi-tile merge path sorts lat descending for rioxarray.merge_arrays,
+            # so slice(south, north) with start < stop would return empty on a
+            # descending coordinate.  Sorting ascending here is safe because the
+            # rename to y/x and rio.write_crs happen immediately after.
+            if "lat" in merged_ds.dims:
+                import numpy as np
+
+                lat_vals = merged_ds["lat"].values
+                if len(lat_vals) > 1 and float(lat_vals[0]) > float(lat_vals[-1]):
+                    merged_ds = merged_ds.sortby("lat", ascending=True)
+
             pad = 0.01
-            self._da = self._da.sel(
+            merged_ds = merged_ds.sel(
                 lat=slice(max(s - pad, -90), min(n + pad, 90)),
                 lon=slice(max(w - pad, -180), min(e + pad, 180)),
             )
 
-        if self._da is None or self._da.size == 0:
-            raise KeyError(f"Failed to fetch GEBCO data for {self.layer_name}")
+        if merged_ds is None or merged_ds["elevation"].size == 0:
+            raise KeyError("Failed to fetch GEBCO data for GEBCO 2025")
 
         logger.debug("Found GEBCO 2025 Coverage")
         # Ensure consistent naming
-        self._da.name = "elevation"
+        merged_ds["elevation"].name = "elevation"
+        merged_ds.attrs["provenance_dict"] = provenance_dict
 
-        return self._da
+        # Rename lat/lon to y/x so rioxarray can identify spatial dimensions
+        if "lat" in merged_ds.dims and "lon" in merged_ds.dims:
+            merged_ds = merged_ds.rename({"lat": "y", "lon": "x"})
 
-    def load(self) -> xr.DataArray:
+        # Ensure CRS is maintained
+        merged_ds = merged_ds.rio.write_crs("EPSG:4326")
+
+        logger.debug(f"GEBCO Final Output CRS: {merged_ds.rio.crs}")
+        logger.debug(f"GEBCO Array CRS: {merged_ds['elevation'].rio.crs}")
+
+        self._da = merged_ds["elevation"]  # Keep reference for sample_elevation
+        return cast(xr.Dataset, merged_ds)
+
+    def load(self) -> xr.Dataset:
         """Standard BMI load method calling fetch"""
         return self.fetch()
 
@@ -340,7 +472,7 @@ class GEBCO2025Provider(Topography, Provider):
             raise RuntimeError("Data not loaded. Call fetch() or load() first.")
 
         # xarray's interp handles bilinear interpolation by default (linear)
-        val = self._da.interp(lat=lat, lon=lon, method="linear")
+        val = self._da.interp(y=lat, x=lon, method="linear")
         return float(val.values)
 
 

@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pytest
@@ -39,6 +38,11 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
 
     assert lidar_da is not None, "Failed to fetch Lidar data."
     lidar_da.load()  # Force load into memory
+
+    # Extract elevation array if it's a dataset
+    if isinstance(lidar_da, xr.Dataset):
+        lidar_da = lidar_da["elevation"]
+
     print(f"[Test] Lidar Stats: Min {float(lidar_da.min()):.2f}, Max {float(lidar_da.max()):.2f}")
 
     # Define bounds for BlueTopo based on Lidar extent
@@ -56,9 +60,16 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     bathy_da_maybe = manager.get_grid(south, north, west, east, target_shape=(128, 128))
 
     assert bathy_da_maybe is not None, "Failed to fetch Bathymetry."
-    assert isinstance(bathy_da_maybe, xr.DataArray), "Expected DataArray not tuple."
 
-    bathy_da = cast(xr.DataArray, bathy_da_maybe)
+    if isinstance(bathy_da_maybe, tuple):
+        bathy_da, _ = bathy_da_maybe
+    else:
+        bathy_da = bathy_da_maybe
+
+    if isinstance(bathy_da, xr.Dataset):
+        bathy_da = bathy_da["elevation"]
+
+    assert isinstance(bathy_da, xr.DataArray), "Expected DataArray."
 
     # Filter nodata
     bathy_valid = bathy_da.where(bathy_da != -9999.0)  # Assuming nodata handling

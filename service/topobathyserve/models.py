@@ -40,3 +40,4 @@ class TileMetadataResponse(BaseModel):
     fusion_sources: str | None = None
     cache_status: str
     request_params: str | None = None
+    provenance_dict: dict[str, dict[str, str]] | None = None

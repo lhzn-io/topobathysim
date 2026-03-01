@@ -168,7 +168,7 @@ class BathyManager:
         logger.info(f"Requesting Grid: S={south}, N={north}, W={west}, E={east}, Shape={target_shape}")
 
         # 1. Collect all potential layers
-        valid_layers: list[tuple[float, str, xr.DataArray]] = []
+        valid_layers: list[tuple[float, str, xr.DataArray | xr.Dataset]] = []
 
         # Tier 0: BAG (Absolute Priority)
         if self.bag:
@@ -370,7 +370,7 @@ class BathyManager:
                         if (d := self.blue_topo.load_tile_as_da(tid, (west, south, east, north))) is not None
                     ]
                     if das:
-                        da = merge_arrays(das)
+                        da = merge_arrays(das)  # type: ignore[arg-type]
                         valid_layers.append((2, "BlueTopo", da))
             except Exception as e:
                 logger.warning(f"BlueTopo error: {e}")
@@ -378,7 +378,7 @@ class BathyManager:
         # Tier 3: CUDEM (Coastal Gap Fill)
         if self.cudem:
             try:
-                da = self.cudem.fetch_layer((west, south, east, north))
+                da = self.cudem.fetch_layer((west, south, east, north))  # type: ignore[assignment]
                 if da is not None:
                     valid_layers.append((3, "CUDEM", da))
             except Exception as e:
@@ -387,7 +387,7 @@ class BathyManager:
         # Tier 3.5: Land (3DEP / NASADEM)
         if self.land:
             try:
-                da = self.land.fetch_layer((west, south, east, north))
+                da = self.land.fetch_layer((west, south, east, north))  # type: ignore[assignment]
                 if da is not None:
                     # Using priority 3.5 to ensure it fills gaps but respects Bathy sources (BlueTopo/CUDEM)
                     # unless it's Lidar (which is Tier 1, handled above).
@@ -490,7 +490,7 @@ class BathyManager:
             assert source_da is not None
 
         # Apply helper
-        def _ensure_crs(d: xr.DataArray) -> xr.DataArray:
+        def _ensure_crs(d: xr.DataArray | xr.Dataset) -> xr.DataArray | xr.Dataset:
             if not d.rio.crs:
                 d.rio.write_crs("EPSG:4326", inplace=True)
             return d

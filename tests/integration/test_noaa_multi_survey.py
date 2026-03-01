@@ -80,11 +80,12 @@ def test_noaa_clip_logic(mock_tif: object) -> None:
             pytest.fail(f"fetch_layer failed with exception: {e}")
 
         # Verify
-        assert isinstance(da, xr.DataArray)
-        print(f"Result Shape: {da.shape}")
+        assert isinstance(da, xr.Dataset)
+        da_elev = da["elevation"]
+        print(f"Result Shape: {da_elev.shape}")
 
         # Trigger compute to test reading
-        val = da.compute()
+        val = da_elev.compute()
         valid_count = val.count().item()
         print(f"Valid Pixels: {valid_count}")
 

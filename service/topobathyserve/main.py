@@ -185,6 +185,7 @@ def render_png(
     zoom: int = 13,
     legend: dict[int, str] | None = None,  # NEW ARGUMENT
     pad: int = 0,
+    provenance_dict: dict[Any, dict[str, str]] | None = None,
 ) -> bytes:
     """Renders DataArray to PNG bytes using a terrain colormap, optionally with hillshade."""
     import matplotlib.colors as mcolors
@@ -239,20 +240,35 @@ def render_png(
 
         # Helper to get color for an ID
         def get_color(uid: int) -> tuple[float, float, float, float]:
-            if uid == 0:
-                return (0, 0, 0, 1)  # No Data / Background
-            if np.isnan(uid):
-                return (0, 0, 0, 0)  # Transparent
-
-            # Map ID to Index
-            # If we have a legend, we can be consistent about sorting?
-            # Using the ID directly is simplest if IDs are stable (1, 2, 3...)
-            # The IDs from generate_provider_legend are 1-based indices into sorted providers.
-            # So ID 1 = First Provider, ID 2 = Second Provider.
-
             from typing import cast
 
-            idx = (int(uid) - 1) % 12  # Cycle through 12 colors
+            if uid == 0:
+                return cast(tuple[float, float, float, float], (0, 0, 0, 1))  # No Data / Background
+            if np.isnan(uid):
+                return cast(tuple[float, float, float, float], (0, 0, 0, 0))  # Transparent
+
+            # Use provenance_dict to map detailed IDs back to their provider color consistently
+            if provenance_dict:
+                int_uid = int(uid)
+                str_uid = str(int_uid)
+
+                prov_info = provenance_dict.get(int_uid) or provenance_dict.get(str_uid)
+
+                if prov_info:
+                    provider_str = prov_info.get("provider", "")
+
+                    if provider_str and legend:
+                        # Look up the provider string in the legend map to get its global integer ID
+                        for leg_id, leg_name in legend.items():
+                            if leg_name == provider_str:
+                                idx = (leg_id - 1) % 12
+                                return cast(tuple[float, float, float, float], base_cmap(idx))
+
+            # Fallback for generic provider IDs
+            try:
+                idx = (int(uid) - 1) % 12  # Cycle through 12 colors
+            except (ValueError, TypeError):
+                idx = 0
             return cast(tuple[float, float, float, float], base_cmap(idx))
 
         h, w = vals.shape
@@ -422,6 +438,12 @@ async def get_legend(policy_path: Annotated[Path, Depends(get_policy_path)]) -> 
         # Generate Colors matching render_png logic (Set3)
         cmap = plt.get_cmap("Set3")
 
+        # Build priority map: provider_key -> step_index (0-based, higher = higher priority)
+        priority_map: dict[str, int] = {}
+        for variable in policy.variables:
+            for step_idx, step in enumerate(variable.steps):
+                priority_map[step.provider] = step_idx
+
         items = []
         for pid, name in legend_map.items():
             # ID to Color
@@ -429,7 +451,7 @@ async def get_legend(policy_path: Annotated[Path, Depends(get_policy_path)]) -> 
             rgba = cmap(idx)
             hex_color = mcolors.to_hex(rgba)
 
-            items.append({"id": pid, "name": name, "color": hex_color})
+            items.append({"id": pid, "name": name, "color": hex_color, "priority": priority_map.get(name, 0)})
 
         return {"items": items}
 
@@ -626,6 +648,7 @@ def get_tile_metadata(
 
     created_at = None
     cache_status = "miss"
+    provenance_dict = None
 
     for path_to_check in [npy_path, png_path]:
         if path_to_check.exists() and path_to_check.stat().st_size > 0:
@@ -633,6 +656,18 @@ def get_tile_metadata(
             dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
             created_at = dt.strftime("%Y%m%d-%H:%M:%S UTC")
             cache_status = "hit"
+
+            # Check for sidecar metadata JSON
+            import json
+
+            meta_path = path_to_check.parent / f"{y}_{param_hash}_meta.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path) as f:
+                        provenance_dict = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Failed to read provenance {meta_path}: {e}")
+
             break
 
     return TileMetadataResponse(
@@ -644,7 +679,79 @@ def get_tile_metadata(
         cache_status=cache_status,
         fusion_sources=policy_path.name,
         request_params=params_str,
+        provenance_dict=provenance_dict,
     )
+
+
+@app.get("/tiles/{z}/{x}/{y}/pixel")
+def get_tile_pixel_source(
+    z: int,
+    x: int,
+    y: int,
+    lat: float,
+    lon: float,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+    style: str = Query("default"),
+    vmin: float | None = Query(None),
+    vmax: float | None = Query(None),
+    tile_size: int = Query(512),
+) -> dict[str, Any]:
+    """
+    Returns the source that contributed the pixel at (lat, lon) within tile (z, x, y).
+
+    Requires the PNG tile to have been generated first (reads the ``_src.npz`` sidecar
+    written alongside the PNG cache file).
+    """
+    import hashlib
+    import json
+
+    earth_r = 6378137.0
+    half = math.pi * earth_r  # 20037508.342789244
+
+    # Tile bounds in Web Mercator (EPSG:3857)
+    tile_width_m = 2 * half / (2**z)
+    west_m = x * tile_width_m - half
+    north_m = half - y * tile_width_m
+
+    # Project lat/lon (EPSG:4326) to Web Mercator
+    x_m = earth_r * math.radians(lon)
+    y_m = earth_r * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+    # Map to pixel coordinates in the tile_size x tile_size grid
+    col = int((x_m - west_m) / tile_width_m * tile_size)
+    row = int((north_m - y_m) / tile_width_m * tile_size)
+    col = max(0, min(tile_size - 1, col))
+    row = max(0, min(tile_size - 1, row))
+
+    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
+    safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
+    tile_dir = base_cache_dir / "visual" / safe_style / str(z) / str(x)
+    params_str = f"{policy_path.name}|{vmin}|{vmax}|{tile_size}"
+    param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
+
+    src_npz_path = tile_dir / f"{y}_{param_hash}_src.npz"
+    if not src_npz_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Pixel source data not available. Request the PNG tile first.",
+        )
+
+    source_arr = np.load(src_npz_path)["source_elevation"]
+    row = min(row, source_arr.shape[0] - 1)
+    col = min(col, source_arr.shape[1] - 1)
+    source_id = int(source_arr[row, col])
+
+    meta_path = tile_dir / f"{y}_{param_hash}_meta.json"
+    provenance_dict: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                provenance_dict = json.load(f)
+        except Exception:
+            pass
+
+    source_info = provenance_dict.get(str(source_id))
+    return {"source_id": source_id, "source": source_info, "pixel": {"row": row, "col": col}}
 
 
 @app.get("/tiles/{z}/{x}/{y}")
@@ -756,6 +863,7 @@ def get_xyz_tile(
             resolution=res_meters,
             use_cache=True,
         )
+        logger.debug(f"/tiles run() returned ds with attrs: {ds.attrs}")
     except ValueError as e:
         # CRS Validation Error
         logger.warning(f"Tile {z}/{x}/{y} out of bounds for policy: {e}")
@@ -798,12 +906,14 @@ def get_xyz_tile(
             )  # North up
 
             crs = ds.rio.crs
+            ds_attrs = ds.attrs
             ds_elev = ds["elevation"].interp(x=target_x, y=target_y, method="linear")
             if "source_elevation" in ds:
                 ds_src = ds["source_elevation"].interp(x=target_x, y=target_y, method="nearest")
                 ds = xr.Dataset({"elevation": ds_elev, "source_elevation": ds_src})
             else:
                 ds = xr.Dataset({"elevation": ds_elev})
+            ds.attrs = ds_attrs
             if crs is not None:
                 ds.rio.write_crs(crs, inplace=True)
         else:
@@ -877,6 +987,7 @@ def get_xyz_tile(
                 zoom=z,
                 legend=legend_map,
                 pad=pad_px,
+                provenance_dict=ds.attrs.get("provenance_dict"),
             )
         else:
             data = render_png(ds["elevation"], style=style, vmin=vmin, vmax=vmax, zoom=z, pad=pad_px)
@@ -916,6 +1027,36 @@ def get_xyz_tile(
     try:
         with open(tile_path, "wb") as f:
             f.write(data)
+
+        logger.debug(f"Tile attributes before json write: {ds.attrs}")
+
+        # Write Sidecar Metadata if we have provenance, filtered to IDs present in this tile
+        if "provenance_dict" in ds.attrs:
+            import json
+
+            all_provenance = ds.attrs["provenance_dict"]
+            if "source_elevation" in ds:
+                present_ids = {int(v) for v in np.unique(ds["source_elevation"].values) if v != 0}
+                filtered_provenance = {k: v for k, v in all_provenance.items() if int(k) in present_ids}
+            else:
+                filtered_provenance = dict(all_provenance)
+            meta_path = tile_dir / f"{y}_{param_hash}_meta.json"
+            with open(meta_path, "w") as f:
+                json.dump(filtered_provenance, f)
+
+        # Write source_elevation NPZ sidecar for pixel-level source lookups
+        if format == "png" and "source_elevation" in ds:
+            src_npz_path = tile_dir / f"{y}_{param_hash}_src.npz"
+            if not src_npz_path.exists():
+                src_arr = ds["source_elevation"].values
+                # Strip padding applied for hillshade rendering so array aligns with the 512x512 PNG
+                if pad_px > 0 and src_arr.ndim == 2 and src_arr.shape[0] == tile_size + 2 * pad_px:
+                    src_arr = src_arr[pad_px:-pad_px, pad_px:-pad_px]
+                buf = BytesIO()
+                np.savez_compressed(buf, source_elevation=src_arr)
+                with open(src_npz_path, "wb") as f:
+                    f.write(buf.getvalue())
+
     except Exception as e:
         logger.warning(f"Failed to write cache file {tile_path}: {e}")
 
@@ -924,6 +1065,7 @@ def get_xyz_tile(
 
 
 @app.post("/cache/clear")
+@app.get("/cache/clear")
 async def clear_cache(type: str = "output") -> dict[str, object]:
     import shutil
 
@@ -953,6 +1095,7 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
             for subdir in [
                 "usgs_3dep",
                 "noaa_bluetopo",
+                "noaa_topobathy",
                 "usgs_lidar",
                 "ncei_bag",
                 "ncei_cudem",

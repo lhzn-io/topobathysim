@@ -22,7 +22,7 @@ from pystac_client import Client
 from rioxarray.merge import merge_arrays
 
 from ..manifest import OfflineManifest
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ class Usgs3DepProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.Dataset:
         """
         Fetch USGS 3DEP (or fallback) data for the given bounding box.
         """
@@ -77,24 +77,21 @@ class Usgs3DepProvider(Provider):
         da = self._fetch_collection(bounds, "3dep-seamless")
         if da is not None:
             logger.debug("Found USGS 3DEP Coverage")
-            da.name = "elevation"
             return da
 
         # 2. Try Copernicus DEM (GLO-30)
         da = self._fetch_collection(bounds, "cop-dem-glo-30")
         if da is not None:
             logger.debug("Found Copernicus DEM Coverage")
-            da.name = "elevation"
             return da
 
         # 3. Try NASADEM
         da = self._fetch_collection(bounds, "nasadem")
         if da is not None:
             logger.debug("Found NASADEM Coverage")
-            da.name = "elevation"
             return da
 
-        raise KeyError(f"No USGS 3DEP/Land coverage found for bbox {bbox}")
+        raise ProviderNoDataError(f"No USGS 3DEP/Land coverage found for bbox {bbox}")
 
     def get_grid(
         self,
@@ -103,14 +100,12 @@ class Usgs3DepProvider(Provider):
         east: float,
         north: float,
         target_shape: tuple[int, int] | None = None,
-    ) -> xr.DataArray | None:
+    ) -> xr.DataArray | xr.Dataset | None:
         """
         Unified access method for Manager compatibility.
         """
-        try:
-            return self.fetch_layer(bbox=(west, south, east, north))
-        except KeyError:
-            return None
+        # Maintain get_grid compatibility (it shouldn't throw KeyError anymore but handled natively)
+        return self.fetch_layer(bbox=(west, south, east, north))
 
     def get_metadata(self) -> dict[str, Any]:
         """
@@ -213,7 +208,7 @@ class Usgs3DepProvider(Provider):
 
         return None
 
-    def _fetch_collection(self, bounds: tuple, collection_id: str) -> xr.DataArray | None:
+    def _fetch_collection(self, bounds: tuple, collection_id: str) -> xr.Dataset | None:
         try:
             items = None
 
@@ -385,21 +380,69 @@ class Usgs3DepProvider(Provider):
                 self.manifest.record_search(collection_id, bounds, 0)
                 return None
 
+            # 3. Create Provenance and merge as Dataset
+            provenance_dict = {}
+            import hashlib
+
+            import numpy as np
+
+            p_das = []
+            for item_idx, da in enumerate(das):
+                href = items_found[item_idx].get("href", f"unknown_stac_asset_{item_idx}")
+                project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 60000
+
+                # Try to get a clean name
+                asset_name = Path(href.split("?")[0]).name
+                if not asset_name or len(asset_name) > 50:
+                    asset_name = f"Asset {project_uid}"
+
+                provenance_dict[project_uid] = {
+                    "name": f"3DEP: {asset_name}",
+                    "provider": "usgs_3dep",
+                }
+
+                da.name = "elevation"
+                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                p_source.name = "source_id"
+                p_source.rio.write_nodata(0, inplace=True)
+                p_source.attrs["_FillValue"] = 0
+
+                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+                if da.rio.crs:
+                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+                p_das.append(p_ds)
+
             # Merge
-            merged = merge_arrays(das)
+            try:
+                if len(p_das) == 1:
+                    merged = p_das[0]
+                else:
+                    elevs = [ds["elevation"] for ds in p_das]
+                    sources = [ds["source_id"] for ds in p_das]
+
+                    final_elev = merge_arrays(elevs)
+                    final_src = merge_arrays(sources)
+                    merged = xr.Dataset({"elevation": final_elev, "source_id": final_src})
+            except Exception as e:
+                logger.error(f"Failed to merge 3DEP STAC items: {e}")
+                merged = p_das[0]
 
             # Ensure CRS
-            if not merged.rio.crs:
+            if not merged["elevation"].rio.crs:
                 # STAC Land collections (3DEP/COP-30) are EPSG:4326
-                merged.rio.write_crs("EPSG:4326", inplace=True)
+                merged["elevation"].rio.write_crs("EPSG:4326", inplace=True)
+                merged["source_id"].rio.write_crs("EPSG:4326", inplace=True)
 
             # Check if effective data remains
-            if merged.isnull().all():
+            if merged["elevation"].isnull().all():
                 logger.debug(f"3DEP/Land data masked out (All Water?) for {collection_id}.")
                 self.manifest.record_search(collection_id, bounds, 0)
                 return None
 
-            return cast(xr.DataArray | None, merged)
+            merged.attrs["provenance_dict"] = provenance_dict
+            return cast(xr.Dataset, merged)
 
         except Exception as e:
             logger.error(f"Error fetching {collection_id}: {e}", exc_info=True)

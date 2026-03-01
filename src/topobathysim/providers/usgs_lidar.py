@@ -6,6 +6,7 @@ It queries the Microsoft Planetary Computer STAC API for '3dep-lidar-copc' and
 rasterizes the point clouds to a target resolution/CRS.
 """
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -21,7 +22,7 @@ from affine import Affine
 
 from ..manifest import OfflineManifest
 from ..utils.cache import concurrent_lru_cache
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ class UsgsLidarProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Fetch USGS Lidar data for the given bounding box.
         """
@@ -141,7 +142,7 @@ class UsgsLidarProvider(Provider):
             except Exception as e:
                 logger.warning(f"NOAA Topographic fallback failed: {e}")
 
-            raise KeyError(f"No USGS Lidar found for bbox {bbox} (and fallback failed)")
+            raise ProviderNoDataError(f"No USGS Lidar found for bbox {bbox} (and fallback failed)")
 
         logger.debug("Found USGS Lidar Coverage")
         return da
@@ -247,7 +248,7 @@ class UsgsLidarProvider(Provider):
         resolution: float = 4.0,
         target_crs: str = "EPSG:4326",
         native_crs_str: str | None = None,
-    ) -> xr.DataArray | None:
+    ) -> xr.Dataset | None:
         """
         Reads a local LAZ file, filters Class 2, and rasterizes.
         Uses Zarr caching to avoid re-rasterizing the same file.
@@ -260,33 +261,42 @@ class UsgsLidarProvider(Provider):
 
         # 1. Check Zarr Cache (Full File Rasterized)
         if zarr_path.exists():
+            ds = None
             try:
                 ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
-                if "elevation" in ds:
-                    da = ds["elevation"]
-                else:
-                    # Fallback to first variable
+
+                # Check for empty datasets to avoid StopIteration
+                if not ds.data_vars:
+                    ds.close()
+                    raise ValueError("Empty Zarr Dataset")
+
+                if "elevation" not in ds:
                     var_name = next(iter(ds.data_vars))
-                    da = ds[var_name]
+                    ds = ds.rename_vars({var_name: "elevation"})
 
                 # Filter bounds if requested
                 if bounds:
                     try:
-                        da = da.rio.clip_box(*bounds)
+                        # Use EPSG:4326 for clipping bounds
+                        ds = ds.rio.clip_box(*bounds, crs="EPSG:4326")
                     except Exception as clip_err:
                         logger.debug(
                             f"Lidar Zarr {zarr_path.name} does not intersect requested bounds: {clip_err}"
                         )
+                        ds.close()
                         return None
 
                 logger.info(f"Lidar Zarr Cache Hit: {zarr_path.name}")
-                return da
+                return ds
             except Exception as e:
+                if ds is not None:
+                    with contextlib.suppress(Exception):
+                        ds.close()
                 logger.warning(f"Corrupt Lidar Zarr cache {zarr_path}: {e}")
                 import shutil
 
                 if zarr_path.exists():
-                    shutil.rmtree(zarr_path)
+                    shutil.rmtree(zarr_path, ignore_errors=True)
 
         logger.info(f"Lidar Zarr Cache Miss: {zarr_path.name}")
 
@@ -389,9 +399,32 @@ class UsgsLidarProvider(Provider):
 
             # Return filtered
             if bounds:
+                # Use EPSG:4326 for clipping bounds (which are passed as WGS84)
                 da = da.rio.clip_box(*bounds, crs="EPSG:4326")
 
-            return da
+            # Create provenance Dataset
+            import hashlib
+
+            project_uid = int(hashlib.md5(local_path.name.encode()).hexdigest(), 16) % 100000 + 70000
+
+            p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+            p_source.name = "source_id"
+            p_source.rio.write_nodata(0, inplace=True)
+            p_source.attrs["_FillValue"] = 0
+
+            p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+            if da.rio.crs:
+                p_ds.rio.write_crs(da.rio.crs, inplace=True)
+            p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+            p_ds.attrs["provenance_dict"] = {
+                project_uid: {
+                    "name": f"Lidar Point Cloud: {local_path.name}",
+                    "provider": "usgs_lidar",
+                }
+            }
+
+            return cast(xr.Dataset, p_ds)
 
         except Exception as e:
             # Handle empty clip gracefully
@@ -407,7 +440,7 @@ class UsgsLidarProvider(Provider):
         resolution: float = 4.0,
         target_crs: str = "EPSG:4326",
         force_cache: bool = True,  # Now means "Cache in background if not present"
-    ) -> xr.DataArray | None:
+    ) -> xr.DataArray | xr.Dataset | None:
         """
         Fetches Lidar from Microsoft Planetary Computer STAC API (3DEP COPC).
         """
@@ -632,17 +665,72 @@ class UsgsLidarProvider(Provider):
                 Path(output_filename).unlink()
                 # from typing import cast (already imported)
 
-                # --- WRITE TO STREAM ZARR CACHE ---
                 try:
                     if "slice_zarr_path" in locals() and not slice_zarr_path.exists():
+                        import hashlib
+
+                        import numpy as np
+
+                        project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 70000
+                        p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                        p_source.name = "source_id"
+                        p_source.rio.write_nodata(0, inplace=True)
+                        p_source.attrs["_FillValue"] = 0
+
+                        p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+                        if da.rio.crs:
+                            p_ds.rio.write_crs(da.rio.crs, inplace=True)
+                        p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+                        asset_name = Path(href.split("?")[0]).name
+                        if not asset_name or len(asset_name) > 50:
+                            asset_name = f"Asset {project_uid}"
+
+                        p_ds.attrs["provenance_dict"] = {
+                            project_uid: {
+                                "name": f"Lidar Point Cloud: {asset_name}",
+                                "provider": "usgs_lidar",
+                            }
+                        }
+
                         # Chunk for Zarr
-                        da_to_cache = da.chunk({"y": 1024, "x": 1024})
+                        da_to_cache = p_ds.chunk({"y": 1024, "x": 1024})
                         da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=True)
                         logger.info(f"Cached Streamed Lidar to Zarr: {slice_zarr_path.name}")
+
+                        return cast(xr.Dataset, p_ds)
+
                 except Exception as e:
                     logger.warning(f"Failed to cache Streamed Lidar Zarr: {e}")
 
-                return cast(xr.DataArray, da)
+                # If we failed to cache, still return the dataset
+                import hashlib
+
+                import numpy as np
+
+                project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 70000
+                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                p_source.name = "source_id"
+                p_source.rio.write_nodata(0, inplace=True)
+                p_source.attrs["_FillValue"] = 0
+
+                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+                if da.rio.crs:
+                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+                asset_name = Path(href.split("?")[0]).name
+                if not asset_name or len(asset_name) > 50:
+                    asset_name = f"Asset {project_uid}"
+
+                p_ds.attrs["provenance_dict"] = {
+                    project_uid: {
+                        "name": f"Lidar Point Cloud: {asset_name}",
+                        "provider": "usgs_lidar",
+                    }
+                }
+
+                return cast(xr.Dataset, p_ds)
 
             return None
 
@@ -656,7 +744,7 @@ class UsgsLidarProvider(Provider):
         url: str,
         resolution: float = 4.0,
         target_crs: str = "EPSG:4326",
-    ) -> xr.DataArray | None:
+    ) -> xr.DataArray | xr.Dataset | None:
         """Fetch from a specific LAZ URL (legacy/test support)."""
         local_path = self._download_and_cache(url)
         if not local_path:

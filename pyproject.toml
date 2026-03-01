@@ -44,6 +44,8 @@ dependencies = [
   "filelock",
   "pydantic>=2.0",
   "pyyaml",
+  "questionary",
+  "rich",
 ]
 
 [project.urls]

@@ -87,7 +87,7 @@ def test_real_world_tile_scenarios(
 
     # Use a smaller shape for speed, but large enough to catch features
     result = manager.get_grid(south, north, west, east, target_shape=(256, 256))
-    da = cast(xr.DataArray, result)
+    da = result["elevation"] if isinstance(result, xr.Dataset) else cast(xr.DataArray, result)
 
     assert da is not None, "Grid generation failed (returned None)"
     assert da.shape == (256, 256)

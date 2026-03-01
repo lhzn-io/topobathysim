@@ -6,6 +6,7 @@ bathymetry from modern surveys. It handles S3 access, tile resolution via RAT, a
 """
 
 import contextlib
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,13 @@ import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
+from filelock import FileLock
 from rioxarray.merge import merge_arrays
 from shapely.geometry import Point, box
 
 from ..quality import QualityClass
 from ..vdatum import VDatumResolver
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,16 @@ class NoaaBlueTopoProvider(Provider):
         "BlueTopo/_BlueTopo_Tile_Scheme/BlueTopo_Tile_Scheme_20260206_112953.gpkg"
     )
 
+    # Persistent cache mapping tile_id -> resolved HTTPS URL.
+    # Format: {"BA04XA": "https://noaa-ocs-nationalbathymetry-pds.s3.../BA04XA_20240101.tiff", ...}
+    # Stored in: ~/.cache/topobathysim/noaa_bluetopo/tile_url_cache.json
+    #
+    # BlueTopo tile filenames include a date stamp so their S3 keys change when the NOAA
+    # team republishes a tile with updated bathymetry.  Invalidate this cache to pick up
+    # renamed/republished tile assets:
+    #   manage_discovery_cache.py --invalidate noaa_bluetopo
+    TILE_URL_CACHE_PATH = Path("~/.cache/topobathysim/noaa_bluetopo/tile_url_cache.json").expanduser()
+
     def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
         """
         Initialize the BlueTopo provider.
@@ -55,7 +67,6 @@ class NoaaBlueTopoProvider(Provider):
         self.cache_dir = base_cache / "noaa_bluetopo"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
-        # Tile Scheme stays in root or moves? Let's move to bluetopo dir too to be clean.
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
 
@@ -65,7 +76,7 @@ class NoaaBlueTopoProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Fetch BlueTopo layer for the given bounding box.
         Resolves, fetches, and merges all intersecting tiles.
@@ -75,29 +86,91 @@ class NoaaBlueTopoProvider(Provider):
         # 1. Resolve Tiles
         tile_ids = self.resolve_tiles_in_bbox(west, south, east, north)
         if not tile_ids:
-            raise KeyError(f"No BlueTopo tiles found for bbox {bbox}")
+            raise ProviderNoDataError(f"No BlueTopo tiles found for bbox {bbox}")
 
         logger.info(f"BlueTopo fetch: Resolved {len(tile_ids)} tiles for bbox {bbox}")
 
         # 2. Fetch/Load Tiles
         das = []
+        provenance_dict = {}
         for tid in tile_ids:
             # Pass the query bbox to maximize efficiency if underlying method supports it
             # defaulting to full tile load via existing method
-            da = self.load_tile_as_da(tid, bbox)
-            if da is not None:
-                das.append(da)
+            ds = self.load_tile_as_da(tid, bbox)
+            if ds is not None:
+                import hashlib
+
+                import numpy as np
+
+                da_elev = ds["elevation"]
+
+                if "source_id" in ds:
+                    da_src = ds["source_id"]
+                    unique_vals = np.unique(da_src.values)
+
+                    translated_src = xr.zeros_like(da_src, dtype=np.uint32)
+                    for pval in unique_vals:
+                        if pval == 0 or np.isnan(pval):
+                            continue
+
+                        pval_int = int(pval)
+                        survey_id = self._resolve_from_sidecar_rat(tid, pval_int)
+                        # fallback
+                        if not survey_id:
+                            mid_lat = (south + north) / 2
+                            mid_lon = (west + east) / 2
+                            survey_id = self.get_source_survey_id(mid_lat, mid_lon)
+
+                        name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}_{pval_int}"
+                        project_uid = int(hashlib.md5(name.encode()).hexdigest(), 16) % 100000 + 50000
+
+                        provenance_dict[project_uid] = {
+                            "name": name,
+                            "provider": "noaa_bluetopo",
+                        }
+
+                        translated_src = xr.where(da_src == pval, project_uid, translated_src)
+
+                    p_source = translated_src.astype(np.uint32)
+                else:
+                    project_uid = int(hashlib.md5(tid.encode()).hexdigest(), 16) % 100000 + 50000
+                    mid_lat = (south + north) / 2
+                    mid_lon = (west + east) / 2
+                    survey_id = self.get_source_survey_id(mid_lat, mid_lon)
+
+                    name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}"
+                    provenance_dict[project_uid] = {
+                        "name": name,
+                        "provider": "noaa_bluetopo",
+                    }
+                    p_source = xr.where(da_elev.notnull(), project_uid, 0).astype(np.uint32)
+
+                p_source.name = "source_id"
+                p_source.rio.write_nodata(0, inplace=True)
+                p_source.attrs["_FillValue"] = 0
+
+                p_ds = xr.Dataset({"elevation": da_elev, "source_id": p_source})
+                if da_elev.rio.crs:
+                    p_ds.rio.write_crs(da_elev.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da_elev.rio.transform(), inplace=True)
+
+                das.append(p_ds)
 
         if not das:
-            raise KeyError(f"Failed to load any BlueTopo data for bbox {bbox}")
+            raise ProviderNoDataError(f"Failed to load any BlueTopo data for bbox {bbox}")
 
         # 3. Merge
         if len(das) == 1:
             merged = das[0]
         else:
             try:
-                # Merge arrays
-                merged = merge_arrays(das)
+                # Merge arrays natively puts last element on top
+                elevs = [ds["elevation"] for ds in das]
+                sources = [ds["source_id"] for ds in das]
+
+                final_elev = merge_arrays(elevs)
+                final_src = merge_arrays(sources)
+                merged = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
                 logger.error(f"Failed to merge BlueTopo tiles: {e}")
                 merged = das[0]  # Fallback
@@ -112,18 +185,27 @@ class NoaaBlueTopoProvider(Provider):
         # Reproject to Requested CRS if needed
         if crs and merged.rio.crs and merged.rio.crs != crs:
             try:
-                # logger.info(f"Reprojecting BlueTopo from {merged.rio.crs} to {crs}")
                 merged = merged.rio.reproject(crs)
             except Exception as e:
                 logger.warning(f"Reprojection failed: {e}")
 
         # Final Exact Clip to exact bbox (cleanup)
         with contextlib.suppress(Exception):
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            merged_elev = merged["elevation"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            merged_src = merged["source_id"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            merged = xr.Dataset({"elevation": merged_elev, "source_id": merged_src})
 
-        merged.name = "elevation"
+        merged["elevation"].name = "elevation"
+        merged.attrs["provenance_dict"] = provenance_dict
         logger.debug("Found BlueTopo Coverage")
-        return merged
+
+        from typing import cast
+
+        return cast(xr.Dataset, merged)
 
     def get_metadata(self) -> dict[str, Any]:
         """
@@ -276,19 +358,56 @@ class NoaaBlueTopoProvider(Provider):
                     results.append(str(row[col]))
                     break
 
-        # logger.debug(f"Resolved BlueTopo Tiles: {results}")
         return list(set(results))
+
+    def _get_tile_url_from_cache(self, tile_id: str) -> str | None:
+        """Read tile_id→url from disk cache. No lock needed on read."""
+        if not self.TILE_URL_CACHE_PATH.exists():
+            return None
+        try:
+            with open(self.TILE_URL_CACHE_PATH) as f:
+                data = json.load(f)
+            result = data.get(tile_id)
+            return str(result) if isinstance(result, str) else None
+        except Exception:
+            return None
+
+    def _update_tile_url_cache(self, tile_id: str, url: str) -> None:
+        """Write tile_id→url to disk cache atomically with FileLock."""
+        try:
+            self.TILE_URL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self.TILE_URL_CACHE_PATH.with_suffix(".json.lock")
+            with FileLock(lock_path):
+                data: dict[str, str] = {}
+                if self.TILE_URL_CACHE_PATH.exists():
+                    try:
+                        with open(self.TILE_URL_CACHE_PATH) as f:
+                            data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = {}
+                if data.get(tile_id) == url:
+                    return
+                data[tile_id] = url
+                with open(self.TILE_URL_CACHE_PATH, "w") as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                    f.write("\n")
+        except Exception as e:
+            logger.warning(f"Failed to update BlueTopo tile URL cache: {e}")
 
     def _resolve_tile_url(self, tile_id: str) -> str | None:
         """
         Resolves the HTTPS URL for a given tile ID by checking S3.
-        Used for streaming access.
+        Results are persisted to disk so subsequent calls avoid S3 glob lookups.
         """
-        try:
-            # Optimize: Check if we can construct URL directly?
-            # BlueTopo filenames are currently variable (dates), so we must glob.
-            # TODO: Add LRU cache / local map to avoid S3 calls on every tile.
+        # 1. Check disk cache (tile filenames include a date stamp, so S3 glob is needed
+        #    on first access; thereafter the URL is stable until the tile scheme is refreshed)
+        cached_url = self._get_tile_url_from_cache(tile_id)
+        if cached_url:
+            logger.debug(f"BlueTopo tile URL cache hit: {tile_id}")
+            return cached_url
 
+        logger.debug(f"BlueTopo tile URL cache miss: {tile_id} — resolving via S3 glob")
+        try:
             fs = fsspec.filesystem("s3", anon=True)
             search_pattern = f"{self.BUCKET_BASE}/{tile_id}/*.tiff"
             files = fs.glob(search_pattern)
@@ -310,7 +429,12 @@ class NoaaBlueTopoProvider(Provider):
                 return None
             key = parts[1]
 
-            return f"https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/{key}"
+            url = f"https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/{key}"
+
+            # 2. Persist to disk for future calls
+            self._update_tile_url_cache(tile_id, url)
+            logger.debug(f"BlueTopo tile URL cache created: {tile_id} -> {url}")
+            return url
 
         except Exception as e:
             logger.error(f"BlueTopo URL Resolve Error: {e}")
@@ -389,7 +513,7 @@ class NoaaBlueTopoProvider(Provider):
             return QualityClass.DIRECT
         return QualityClass.UNKNOWN
 
-    def load_tile_as_da(self, tile_id: str, bbox: tuple[float, float, float, float]) -> "xr.DataArray | None":
+    def load_tile_as_da(self, tile_id: str, bbox: tuple[float, float, float, float]) -> "xr.Dataset | None":
         """
         Loads the cached tile and clips to bbox (west, south, east, north).
         Uses Streaming Access (VSICURL) to avoid full download.
@@ -405,9 +529,8 @@ class NoaaBlueTopoProvider(Provider):
                 ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
                 logger.debug(f"BlueTopo Zarr Cache Hit: {zarr_name}")
                 if "elevation" in ds:
-                    return ds["elevation"]
-                var_name = next(iter(ds.data_vars))
-                return ds[var_name]
+                    return ds
+                return ds
             except Exception as e:
                 logger.warning(f"Corrupt BlueTopo Zarr cache {zarr_path}: {e}")
                 import shutil
@@ -425,23 +548,30 @@ class NoaaBlueTopoProvider(Provider):
         # 3. Stream & Cache to Zarr
         try:
             # Open Streaming
-            da_raw = rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048})
+            da_raw: xr.DataArray = rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048})  # type: ignore[assignment]
 
-            da: xr.DataArray
             from typing import cast
 
-            if isinstance(da_raw, list):
-                da = cast(xr.DataArray, da_raw[0])
-            elif isinstance(da_raw, xr.Dataset):
-                da = da_raw.to_array().isel(variable=0)
+            # BlueTopo: Band 1=Elevation, Band 2=Uncertainty, Band 3=Contributor
+            if "band" in da_raw.dims and da_raw.sizes["band"] >= 3:
+                da_elev = da_raw.isel(band=0).drop_vars("band")
+                da_elev.name = "elevation"
+                da_src = da_raw.isel(band=2).drop_vars("band")
+                da_src.name = "source_id"
+                ds_to_cache = xr.Dataset({"elevation": da_elev, "source_id": da_src})
             else:
-                da = cast(xr.DataArray, da_raw)
+                if isinstance(da_raw, list):
+                    da = cast(xr.DataArray, da_raw[0])
+                elif isinstance(da_raw, xr.Dataset):
+                    da = da_raw.to_array().isel(variable=0)
+                else:
+                    da = cast(xr.DataArray, da_raw)
 
-            if "band" in da.dims:
-                da = da.isel(band=0).drop_vars("band")
-
-            da = cast(xr.DataArray, da)
-            da.name = "elevation"
+                if "band" in da.dims:
+                    da = da.isel(band=0).drop_vars("band")
+                da = cast(xr.DataArray, da)
+                da.name = "elevation"
+                ds_to_cache = xr.Dataset({"elevation": da})
 
             # Cache to Zarr
             # Lock to prevent race conditions
@@ -451,16 +581,16 @@ class NoaaBlueTopoProvider(Provider):
 
             with FileLock(lock_path):
                 if zarr_path.exists():
-                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto")["elevation"]
+                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
-                if da.size > 0:
-                    if "y" in da.dims and "x" in da.dims:
-                        da = da.chunk({"y": 1024, "x": 1024})
+                if ds_to_cache["elevation"].size > 0:
+                    if "y" in ds_to_cache.dims and "x" in ds_to_cache.dims:
+                        ds_to_cache = ds_to_cache.chunk({"y": 1024, "x": 1024})
 
                     logger.info(f"Caching BlueTopo tile to Zarr: {zarr_name}")
-                    da.to_zarr(zarr_path, mode="w", consolidated=True)
+                    ds_to_cache.to_zarr(zarr_path, mode="w", consolidated=True)
 
-                    return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
         except Exception as e:
             logger.error(f"Failed to stream/cache BlueTopo tile {tile_id}: {e}")
@@ -624,8 +754,12 @@ class NoaaBlueTopoProvider(Provider):
         return None
 
     def _resolve_from_sidecar_rat(self, tile_id: str, pixel_val: int) -> str | None:
-        """
-        Downloads and parses the sidecar RAT linked in the GPKG.
+        """Look up the survey ID for a pixel value via the tile's sidecar RAT file.
+
+        Downloads the `.aux.xml` or `.dbf` RAT linked in the BlueTopo Tile Scheme GPKG and
+        caches it locally under ``sidecars/``.  A ``.failed`` sentinel is written on HTTP
+        errors (typically 404 when the tile scheme's RAT_Link is stale) so the download is
+        not retried on subsequent requests for the same tile.
         """
         self._ensure_scheme_loaded()
         if self._gdf is None:
@@ -642,11 +776,18 @@ class NoaaBlueTopoProvider(Provider):
 
             tile_row = matches.iloc[0]
             rat_link = tile_row.get("RAT_Link") or tile_row.get("rat_link")
+            if not rat_link:
+                return None
             # Download Sidecar
             filename = Path(rat_link).name
-            sidecar_dir = Path(self.cache_dir) / "bluetopo" / "sidecars"
+            sidecar_dir = self.cache_dir / "sidecars"
             sidecar_dir.mkdir(parents=True, exist_ok=True)
             sidecar_file = sidecar_dir / filename
+            failed_sentinel = sidecar_file.with_suffix(sidecar_file.suffix + ".failed")
+
+            if failed_sentinel.exists():
+                logger.debug(f"Skipping previously failed sidecar: {filename}")
+                return None
 
             if not sidecar_file.exists():
                 logger.info(f"Downloading Sidecar RAT: {rat_link}")
@@ -655,7 +796,11 @@ class NoaaBlueTopoProvider(Provider):
                     with open(sidecar_file, "wb") as f:
                         f.write(r.content)
                 else:
-                    logger.warning(f"Failed to download sidecar: {r.status_code}")
+                    logger.warning(
+                        f"Failed to download sidecar {filename}: HTTP {r.status_code} — "
+                        f"tile scheme RAT_Link may be stale. Will not retry."
+                    )
+                    failed_sentinel.touch()
                     return None
 
             # Parse based on extension

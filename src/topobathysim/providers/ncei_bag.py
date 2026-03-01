@@ -22,7 +22,7 @@ from rioxarray.merge import merge_arrays
 
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumResolver
-from .base import Provider
+from .base import Provider, ProviderNoDataError
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -249,6 +249,13 @@ class BAGDiscovery:
     # Stored in ~/.cache/topobathysim/metadata/ncei_bag_redirects.json
     REDIRECT_CACHE_PATH = Path("~/.cache/topobathysim/metadata/ncei_bag_redirects.json").expanduser()
 
+    # Persistent Cache for BBox -> BAG URL list discovery results
+    # Stored in ~/.cache/topobathysim/ncei_bag/discovery_cache.json
+    # Format: {"west_south_east_north": ["https://...bag", ...], ...}
+    # Invalidate to discover newly published multibeam surveys from NCEI.
+    # See: manage_discovery_cache.py --invalidate ncei_bag
+    DISCOVERY_CACHE_PATH = Path("~/.cache/topobathysim/ncei_bag/discovery_cache.json").expanduser()
+
     @classmethod
     def _read_bag_cached(cls, local_path: Path) -> xr.DataArray | None:
         """
@@ -304,6 +311,59 @@ class BAGDiscovery:
 
         except Exception as e:
             logger.warning(f"Failed to update redirect cache: {e}")
+
+    @classmethod
+    def _get_from_discovery_cache(cls, bbox_key: str) -> list[str] | None:
+        """
+        Read bbox→BAG URL list from the disk discovery cache.
+
+        Lock-free on read; the write side uses ``FileLock`` for safety.
+        Returns ``None`` on a cache miss so the caller can fall back to the
+        network query and then populate the cache via
+        :meth:`_update_discovery_cache`.
+
+        To force a fresh lookup (e.g. after NCEI publishes new surveys), delete
+        ``DISCOVERY_CACHE_PATH`` or run
+        ``manage_discovery_cache.py --invalidate ncei_bag``.
+        """
+        if not cls.DISCOVERY_CACHE_PATH.exists():
+            return None
+        try:
+            with open(cls.DISCOVERY_CACHE_PATH) as f:
+                data = json.load(f)
+            result = data.get(bbox_key)
+            return list(result) if isinstance(result, list) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _update_discovery_cache(cls, bbox_key: str, urls: list[str]) -> None:
+        """
+        Persist a bbox→BAG URL list to the disk discovery cache atomically.
+
+        Uses ``FileLock`` to prevent concurrent writes from multiple worker
+        processes from corrupting the JSON file.  Empty result lists are also
+        stored so that known-empty bounding boxes are not re-queried.
+        """
+        try:
+            cls.DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = cls.DISCOVERY_CACHE_PATH.parent / (cls.DISCOVERY_CACHE_PATH.name + ".lock")
+            with FileLock(lock_path):
+                data: dict[str, list[str]] = {}
+                if cls.DISCOVERY_CACHE_PATH.exists():
+                    try:
+                        with open(cls.DISCOVERY_CACHE_PATH) as f:
+                            data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = {}
+                if bbox_key in data and data[bbox_key] == urls:
+                    return
+                data[bbox_key] = urls
+                with open(cls.DISCOVERY_CACHE_PATH, "w") as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                    f.write("\n")
+        except Exception as e:
+            logger.warning(f"Failed to update BAG discovery cache: {e}")
 
     @classmethod
     def _scrape_landing_page(cls, download_url: str) -> list[str]:
@@ -474,12 +534,22 @@ class BAGDiscovery:
         return []
 
     @classmethod
-    @concurrent_lru_cache()
     def find_bags_by_bbox(cls, west: float, south: float, east: float, north: float) -> list[str]:
         """
         Queries NCEI for BAGs intersecting the bounding box.
         Returns list of download URLs.
+        Results are persisted to disk so subsequent calls (including across server restarts)
+        return immediately without a network round-trip.
         """
+        bbox_key = f"{round(west, 6)}_{round(south, 6)}_{round(east, 6)}_{round(north, 6)}"
+
+        # 1. Check disk cache (survives server restarts and process recycling)
+        cached = cls._get_from_discovery_cache(bbox_key)
+        if cached is not None:
+            logger.debug(f"BAG Discovery Cache Hit: {bbox_key} ({len(cached)} urls)")
+            return cached
+
+        logger.debug(f"BAG Discovery Cache Miss: {bbox_key} — querying NCEI ArcGIS API")
         found_urls: list[str] = []
         try:
             from pyproj import Transformer
@@ -565,6 +635,9 @@ class BAGDiscovery:
         except Exception as e:
             logger.warning(f"BBox query failed: {e}")
 
+        # 2. Persist to disk (even empty results, to avoid re-querying known-empty bboxes)
+        cls._update_discovery_cache(bbox_key, found_urls)
+        logger.debug(f"BAG Discovery Cache Created: {bbox_key} ({len(found_urls)} urls persisted)")
         return found_urls
 
 
@@ -591,7 +664,7 @@ class BAGProvider(Provider):
         resolution: float | None = None,
         crs: str = "EPSG:4326",
         **kwargs: Any,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | xr.Dataset:
         """
         Fetches and merges BAG files intersecting the bounding box.
         """
@@ -600,12 +673,14 @@ class BAGProvider(Provider):
         # 1. Discover BAGs
         urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
         if not urls:
-            raise KeyError(f"No BAG files found for bbox {bbox}")
+            raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
 
         logger.info(f"BAG fetch: Found {len(urls)} files to process.")
 
         # 2. Fetch/Load Each
-        das = []
+        project_layers = []
+        provenance_dict: dict[int, dict[str, str]] = {}
+
         for url in urls:
             try:
                 # Load (Lazy/Zarr if available)
@@ -650,37 +725,69 @@ class BAGProvider(Provider):
                         logger.warning(f"Reprojection failed for BAG segment: {e}")
                         continue
 
-                das.append(da)
+                import hashlib
+
+                filename = url.split("/")[-1].replace(".bag", "")
+                project_uid = int(hashlib.md5(filename.encode()).hexdigest(), 16) % 100000 + 40000
+                provenance_dict[project_uid] = {
+                    "name": filename,
+                    "provider": "ncei_bag",
+                }
+
+                da.name = "elevation"
+                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                p_source.name = "source_id"
+                p_source.rio.write_nodata(0, inplace=True)
+                p_source.attrs["_FillValue"] = 0
+
+                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+                if da.rio.crs:
+                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+                project_layers.append(p_ds)
 
             except Exception as e:
                 logger.warning(f"Failed to process BAG {url}: {e}")
 
-        if not das:
+        if not project_layers:
             # It is possible all BAGs were clipped out or failed
             # This is not necessarily an error, just no coverage in this detailed window
             # Return empty or raise?
             # Runtime expects an array. Raise KeyError to trigger 'continue' in runtime loop.
-            raise KeyError(f"No BAG data intersects bbox {bbox} after clipping")
+            raise ProviderNoDataError(f"No BAG data intersects bbox {bbox} after clipping")
 
         # 3. Merge
-        if len(das) == 1:
-            merged = das[0]
+        if len(project_layers) == 1:
+            merged_ds = project_layers[0]
         else:
             try:
-                # Sort by resolution (finest first) if possible
-                merged = merge_arrays(das)
+                # merge_arrays puts LAST element on TOP.
+                # URLs are sorted oldest first by default, so newest ends up on top.
+                elevs = [ds["elevation"] for ds in project_layers]
+                sources = [ds["source_id"] for ds in project_layers]
+
+                final_elev = merge_arrays(elevs)
+                final_src = merge_arrays(sources)
+                merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
                 logger.error(f"Failed to merge BAGs: {e}")
-                merged = das[0]
+                merged_ds = project_layers[0]
 
         # 4. Final Clip (Cleanup)
         # Ensure exact bounds (reprojection might have introduced slight over-run)
         with contextlib.suppress(Exception):
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            final_elev = merged_ds["elevation"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            final_src = merged_ds["source_id"].rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+            )
+            merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
 
-        merged.name = "elevation"
-        logger.debug("Found NCEI BAG Coverage")
-        return cast(xr.DataArray, merged)
+        merged_ds.attrs["provenance_dict"] = provenance_dict
+        logger.debug(f"Found NCEI BAG Coverage with provenance {provenance_dict}")
+        return cast(xr.Dataset, merged_ds)
 
     def get_metadata(self) -> dict[str, Any]:
         """
