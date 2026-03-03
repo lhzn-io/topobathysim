@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, os.path.abspath("../../src"))
 
 project = "TopoBathySim"
-copyright = "2025, WHOI Marine Predators Group"
-author = "Daniel Fry (Ported from Camrin Braun)"
+copyright = "2026, Long Horizon Observatory"
+author = "Daniel Fry"
 release = "0.1.0"
 
 extensions = [
