@@ -89,7 +89,7 @@ def test_bluetopo_real_integration(tmp_path: Path) -> None:
         east=e,
         cache_dir=str(cache_dir),  # Reuse our temp cache
     )
-    gebco.load()
+    gebco.fetch()
     gebco_depth = gebco.sample_elevation(EXECUTION_ROCKS_LAT, EXECUTION_ROCKS_LON)
 
     print(f"[Integration] GEBCO Elevation: {gebco_depth} meters")

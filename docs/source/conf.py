@@ -36,7 +36,6 @@ autodoc_mock_imports = [
     "pyproj",
     "affine",
     "rasterio",
-    "bmi_topography",
     "h5py",
     "zarr",
     "fsspec",

@@ -34,7 +34,6 @@ dependencies = [
   "rasterio",
   "affine",
   # Data access
-  "bmi-topography==0.9.0",
   "pydap",
   "fsspec",
   "s3fs",

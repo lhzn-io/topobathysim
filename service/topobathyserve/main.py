@@ -103,10 +103,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if env_path.exists():
         load_dotenv(env_path)
 
-    # Ensure bmi_topography finds the key
-    if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
-        os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
-
     global POLICY_PATH
     policy_env = os.getenv("TOPOBATHY_POLICY")
     POLICY_PATH = Path(policy_env) if policy_env else DEFAULT_POLICY

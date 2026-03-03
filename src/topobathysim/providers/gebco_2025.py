@@ -8,10 +8,9 @@ It uses 'bmi-topography' or OPeNDAP access to fetch data, managing caching local
 import logging
 from collections import namedtuple
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import xarray as xr
-from bmi_topography import Topography
 from rioxarray.merge import merge_arrays
 
 from .base import Provider
@@ -22,10 +21,10 @@ logger = logging.getLogger(__name__)
 BBox = namedtuple("BBox", ["west", "south", "east", "north"])
 
 
-class GEBCO2025Provider(Topography, Provider):
+class GEBCO2025Provider(Provider):
     """
-    BMI-compliant interface for GEBCO 2025 data.
-    Wraps bmi-topography to fetch from OPeNDAP with specific corrections.
+    Interface for GEBCO 2025 data.
+    Fetches from OPeNDAP with specific corrections.
     """
 
     # Official GEBCO 2025 OpenDAP URL
@@ -34,6 +33,11 @@ class GEBCO2025Provider(Topography, Provider):
 
     RESOLUTION_ARCSEC = 15
     HALF_PIXEL_OFFSET = (15 / 3600) * 0.5  # Degrees
+
+    _locks: ClassVar[dict[str, Any]] = {}
+    _locks_lock: ClassVar[Any] = None
+    _ds_remote: ClassVar[xr.Dataset | None] = None
+    _tid_remote: ClassVar[xr.Dataset | None] = None
 
     def __init__(
         self,
@@ -57,24 +61,11 @@ class GEBCO2025Provider(Topography, Provider):
         p = Path(cache_dir).expanduser() / "gebco_2025"
         p.mkdir(parents=True, exist_ok=True)
         (p / "zarr").mkdir(exist_ok=True)  # Zarr subdir
-        super().__init__(
-            dem_type="SRTMGL3",  # Pass valid type to satisfy validation; we override fetch() anyway
-            south=south,
-            north=north,
-            west=west,
-            east=east,
-            output_format=output_format,
-            cache_dir=str(p),
-        )
+        super().__init__()
+        self.bbox = BBox(west, south, east, north)
+        self.cache_dir = str(p)
         self.tid_data: xr.DataArray | None = None
         self._da: xr.DataArray | None = None
-
-    def extract_subset(self, bbox: BBox) -> xr.DataArray:
-        """
-        Implementation of Topography.extract_subset.
-        For now just raises NotImplementedError as we use fetch_layer.
-        """
-        raise NotImplementedError("Use fetch_layer instead")
 
     def fetch_layer(
         self,
@@ -200,14 +191,14 @@ class GEBCO2025Provider(Topography, Provider):
                     from filelock import FileLock
 
                     # Class level thread lock for deduplication
-                    if not hasattr(self.__class__, "_locks"):
-                        self.__class__._locks = {}
-                        self.__class__._locks_lock = threading.Lock()
+                    if GEBCO2025Provider._locks_lock is None:
+                        GEBCO2025Provider._locks = {}
+                        GEBCO2025Provider._locks_lock = threading.Lock()
 
-                    with self.__class__._locks_lock:
-                        if tile_key not in self.__class__._locks:
-                            self.__class__._locks[tile_key] = threading.Lock()
-                        thread_lock = self.__class__._locks[tile_key]
+                    with GEBCO2025Provider._locks_lock:
+                        if tile_key not in GEBCO2025Provider._locks:
+                            GEBCO2025Provider._locks[tile_key] = threading.Lock()
+                        thread_lock = GEBCO2025Provider._locks[tile_key]
 
                     lock_path = cache_path.with_suffix(".zarr.lock")
                     with thread_lock, FileLock(lock_path):
@@ -225,24 +216,23 @@ class GEBCO2025Provider(Topography, Provider):
                         else:
                             logger.info(f"GEBCO Zarr Cache Miss: {tile_key}")
                             try:
-                                if (
-                                    not hasattr(self.__class__, "_ds_remote")
-                                    or self.__class__._ds_remote is None
-                                ):
+                                if GEBCO2025Provider._ds_remote is None:
                                     try:
                                         logger.info("Initializing global GEBCO OPeNDAP Connection...")
-                                        self.__class__._ds_remote = xr.open_dataset(
+                                        GEBCO2025Provider._ds_remote = xr.open_dataset(
                                             self.OPENDAP_URL, engine="pydap"
                                         )
                                         # Also initialize TID dataset connection
                                         tid_url = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/type_identifier_grid/netcdf/gebco_2025_tid.nc"
-                                        self.__class__._tid_remote = xr.open_dataset(tid_url, engine="pydap")
+                                        GEBCO2025Provider._tid_remote = xr.open_dataset(
+                                            tid_url, engine="pydap"
+                                        )
                                     except Exception as connection_err:
                                         logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
                                         raise
 
-                                ds_remote = self.__class__._ds_remote
-                                tid_remote = getattr(self.__class__, "_tid_remote", None)
+                                ds_remote = GEBCO2025Provider._ds_remote
+                                tid_remote = GEBCO2025Provider._tid_remote
 
                                 logger.info(f"Downloading GEBCO 1x1 Tile + TID to Cache: {tile_key}")
 
@@ -448,10 +438,6 @@ class GEBCO2025Provider(Topography, Provider):
 
         self._da = merged_ds["elevation"]  # Keep reference for sample_elevation
         return cast(xr.Dataset, merged_ds)
-
-    def load(self) -> xr.Dataset:
-        """Standard BMI load method calling fetch"""
-        return self.fetch()
 
     def get_tid_classification(self) -> xr.DataArray | None:
         """Returns the cached TID DataArray"""

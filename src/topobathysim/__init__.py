@@ -1,21 +1,12 @@
 import logging
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env before imports to silence bmi_topography warnings
-# Find .env in project root (assuming we are in src/topobathysim)
-# Path(__file__) = src/topobathysim/__init__.py
-# .parent = src/topobathysim
-# .parent.parent = src
-# .parent.parent.parent = topobathysim (root)
+# Load .env variables
 env_path = Path(__file__).resolve().parent.parent.parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
-
-if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
-    os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
 
 from .manager import BathyManager  # noqa: E402
 from .providers.registry import registry  # noqa: E402
