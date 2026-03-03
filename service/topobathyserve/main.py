@@ -472,9 +472,12 @@ async def get_elevation(
         if ds["elevation"].size == 0:
             return ElevationResponse(elevation=None)  # type: ignore
 
-        # Sample closest using x/y (Projected CRS or EPSG:4326 uses x/y dims in runtime)
-        # Note: runtime run() returns Dataset with dims ('y', 'x')
-        val = ds["elevation"].sel(x=lon, y=lat, method="nearest").item()
+        # Sample closest using projected coordinates (EPSG:3857)
+        earth_r = 6378137.0
+        x_m = earth_r * math.radians(lon)
+        y_m = earth_r * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+        val = ds["elevation"].sel(x=x_m, y=y_m, method="nearest").item()
 
         return ElevationResponse(elevation=float(val) if not np.isnan(val) else None)
     except ValueError as e:
@@ -497,7 +500,12 @@ async def get_source_info(
         if ds["source_elevation"].size == 0:
             return {"source": "No Data", "id": "NaN"}
 
-        sid = ds["source_elevation"].sel(lat=lat, lon=lon, method="nearest").item()
+        # Sample closest using projected coordinates (EPSG:3857)
+        earth_r = 6378137.0
+        x_m = earth_r * math.radians(lon)
+        y_m = earth_r * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+        sid = ds["source_elevation"].sel(x=x_m, y=y_m, method="nearest").item()
 
         # TODO: Lookup ID in ds.attrs or legend
         return {"source": f"Provider ID {sid}", "id": str(sid), "policy": policy_path.name}
