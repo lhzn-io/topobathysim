@@ -153,11 +153,15 @@ def test_runtime_flow(mock_policy_file: str) -> None:
 
     # Sampling using spatial slices to avoid unaligned grid edge NaNs
     # Left side (lon < -73.6)
-    val_left = ds["elevation"].sel(x=slice(None, -73.6)).mean().item()
+    subset_left = ds["elevation"].sel(x=slice(None, -73.6))
+    # Filter out background values (-999.0) resulting from edge reprojection artifacts
+    val_left = subset_left.where(subset_left != -999.0).mean().item()
     src_left = ds["source_elevation"].sel(x=slice(None, -73.6)).max().item()
 
     # Right side (lon > -73.4)
-    val_right = ds["elevation"].sel(x=slice(-73.4, None)).mean().item()
+    subset_right = ds["elevation"].sel(x=slice(-73.4, None))
+    # Filter out background values (-999.0)
+    val_right = subset_right.where(subset_right != -999.0).mean().item()
 
     # Allow some tiny floating point differences across the mean
     assert pytest.approx(val_left, 0.01) == 10.0

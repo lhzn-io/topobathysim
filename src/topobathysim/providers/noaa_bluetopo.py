@@ -24,6 +24,7 @@ from ..quality import QualityClass
 from ..vdatum import VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
+from .source_classifier import classify_source_provider
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,21 @@ class NoaaBlueTopoProvider(Provider):
                             mid_lon = (west + east) / 2
                             survey_id = self.get_source_survey_id(mid_lat, mid_lon)
 
+                        if survey_id:
+                            # Dynamic deduplication via classifier rubric
+                            preferred_provider = classify_source_provider(survey_id)
+                            if preferred_provider:
+                                logger.warning(
+                                    f"Skipping BlueTopo source '{survey_id}' "
+                                    f"(likely covered by Tier integration: {preferred_provider})"
+                                )
+                                continue
+
+                            survey_id = survey_id.strip()
+
                         name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}_{pval_int}"
-                        project_uid = int(hashlib.md5(name.encode()).hexdigest(), 16) % 100000 + 50000
+                        digest = hashlib.md5(name.encode()).hexdigest()
+                        project_uid = int(digest, 16) % 100000 + 50000
 
                         provenance_dict[project_uid] = {
                             "name": name,
@@ -133,10 +147,23 @@ class NoaaBlueTopoProvider(Provider):
 
                     p_source = translated_src.astype(np.uint32)
                 else:
-                    project_uid = int(hashlib.md5(tid.encode()).hexdigest(), 16) % 100000 + 50000
+                    digest = hashlib.md5(tid.encode()).hexdigest()
+                    project_uid = int(digest, 16) % 100000 + 50000
                     mid_lat = (south + north) / 2
                     mid_lon = (west + east) / 2
                     survey_id = self.get_source_survey_id(mid_lat, mid_lon)
+
+                    # NEW LOGIC HERE: (Dynamic Deduplication)
+                    if survey_id:
+                        preferred_provider = classify_source_provider(survey_id)
+                        if preferred_provider:
+                            logger.warning(
+                                f"Skipping BlueTopo source '{survey_id}' "
+                                f"(likely covered by Tier integration: {preferred_provider})"
+                            )
+                            continue
+
+                        survey_id = survey_id.strip()
 
                     name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}"
                     provenance_dict[project_uid] = {
@@ -148,6 +175,9 @@ class NoaaBlueTopoProvider(Provider):
                 p_source.name = "source_id"
                 p_source.rio.write_nodata(0, inplace=True)
                 p_source.attrs["_FillValue"] = 0
+
+                # Mask elevation where source was filtered out (0)
+                da_elev = da_elev.where(p_source != 0)
 
                 p_ds = xr.Dataset({"elevation": da_elev, "source_id": p_source})
                 if da_elev.rio.crs:

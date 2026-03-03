@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from topobathysim.vdatum import VDatumResolver
+from topobathysim.vdatum import VDatumNoDataError, VDatumResolver
 
 
 def test_vdatum_valid_response() -> None:
@@ -21,7 +21,7 @@ def test_vdatum_valid_response() -> None:
 
 
 def test_vdatum_nodata_response_raises_value_error() -> None:
-    """Test that extreme NoData values (-999999.0) raise a ValueError."""
+    """Test that extreme NoData values (-999999.0) raise a VDatumNoDataError."""
     with patch("topobathysim.vdatum.requests.Session.get") as mock_get:
         mock_response = MagicMock()
         mock_response.json.return_value = {"t_z": "-999999.0"}
@@ -31,7 +31,7 @@ def test_vdatum_nodata_response_raises_value_error() -> None:
         # Clear the lru_cache for testing
         VDatumResolver.get_mllw_to_navd88_offset.cache_clear()
 
-        with pytest.raises(ValueError, match="VDatum API returned NoData value"):
+        with pytest.raises(VDatumNoDataError, match="VDatum API returned NoData value"):
             VDatumResolver.get_mllw_to_navd88_offset(43.0, -70.0)
 
 

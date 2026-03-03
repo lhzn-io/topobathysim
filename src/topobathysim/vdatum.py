@@ -9,6 +9,18 @@ from urllib3.util.retry import Retry  # type: ignore
 logger = logging.getLogger(__name__)
 
 
+class VDatumError(Exception):
+    """Base class for VDatum errors."""
+
+    pass
+
+
+class VDatumNoDataError(VDatumError):
+    """Raised when VDatum returns a NoData value (outside valid region)."""
+
+    pass
+
+
 class VDatumResolver:
     """
     Resolves vertical datum offsets between NAVD88 and Local Mean Sea Level (LMSL)
@@ -61,11 +73,13 @@ class VDatumResolver:
             if "t_z" in data:
                 val = float(data["t_z"])
                 if val < -90000.0 or val > 90000.0:
-                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                    raise VDatumNoDataError(f"VDatum API returned NoData value: {val}")
                 return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
+        except VDatumNoDataError:
+            raise
         except Exception as e:
             logger.error(f"Datum conversion failed for ({lat}, {lon}): {e}")
             raise
@@ -100,11 +114,14 @@ class VDatumResolver:
                 # If s_z=0, t_z is the height of MLLW zero in NAVD88 frame.
                 val = float(data["t_z"])
                 if val < -90000.0 or val > 90000.0:
-                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                    # Don't log error here, let the caller handle it (it's expected for inland points)
+                    raise VDatumNoDataError(f"VDatum API returned NoData value: {val}")
                 return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
+        except VDatumNoDataError:
+            raise
         except Exception as e:
             logger.error(f"Datum (MLLW->NAVD88) conversion failed for ({lat}, {lon}): {e}")
             raise
@@ -138,11 +155,13 @@ class VDatumResolver:
             if "t_z" in data:
                 val = float(data["t_z"])
                 if val < -90000.0 or val > 90000.0:
-                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                    raise VDatumNoDataError(f"VDatum API returned NoData value: {val}")
                 return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
+        except VDatumNoDataError:
+            raise
         except Exception as e:
             logger.error(f"Datum (Ellipsoid->NAVD88) conversion failed for ({lat}, {lon}): {e}")
             raise
@@ -175,11 +194,13 @@ class VDatumResolver:
             if "t_z" in data:
                 val = float(data["t_z"])
                 if val < -90000.0 or val > 90000.0:
-                    raise ValueError(f"VDatum API returned NoData value: {val}")
+                    raise VDatumNoDataError(f"VDatum API returned NoData value: {val}")
                 return val
 
             raise ValueError(f"VDatum API returned no elevation data: {data}")
 
+        except VDatumNoDataError:
+            raise
         except Exception as e:
             logger.error(f"Datum (EGM2008->NAVD88) conversion failed for ({lat}, {lon}): {e}")
             raise

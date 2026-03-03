@@ -10,6 +10,10 @@ from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
 
 @pytest.fixture
 def mock_provider(tmp_path: Path) -> NoaaTopobathyProvider:
+    # Reset class-level cache to ensure isolation
+    NoaaTopobathyProvider._cls_spatial_index = None
+    NoaaTopobathyProvider._cls_projects.clear()
+
     # Setup directories
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -18,7 +22,9 @@ def mock_provider(tmp_path: Path) -> NoaaTopobathyProvider:
     provider = NoaaTopobathyProvider(cache_dir=str(cache_dir))
 
     # Mock project list to avoid network calls
-    provider._projects = {"9999": "Test Project", "10274": "LIS Project"}
+    # provider._projects points to NoaaTopobathyProvider._cls_projects
+    provider._projects["9999"] = "Test Project"
+    provider._projects["10274"] = "LIS Project"
     provider._projects_metadata_urls = {}
 
     return provider

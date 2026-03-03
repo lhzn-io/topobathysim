@@ -21,7 +21,7 @@ from filelock import FileLock
 from rioxarray.merge import merge_arrays
 
 from ..utils.cache import concurrent_lru_cache
-from ..vdatum import VDatumResolver
+from ..vdatum import VDatumNoDataError, VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
 
@@ -109,8 +109,15 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
             # Vertical Datum Correction (to NAVD88)
             crs = elev.rio.crs
             bounds = elev.rio.bounds()  # (minx, miny, maxx, maxy)
-            center_x = (bounds[0] + bounds[2]) / 2
-            center_y = (bounds[1] + bounds[3]) / 2
+
+            # Candidate points: Center, then corners, then mid-edges
+            candidate_points = [
+                ((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2),  # Center
+                (bounds[0], bounds[1]),  # MinX, MinY
+                (bounds[2], bounds[3]),  # MaxX, MaxY
+                (bounds[0], bounds[3]),  # MinX, MaxY
+                (bounds[2], bounds[1]),  # MaxX, MinY
+            ]
 
             offset = 0.0
             try:
@@ -118,19 +125,57 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
 
                 if crs:
                     transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-                    lon, lat = transformer.transform(center_x, center_y)
 
-                    if is_ellipsoid:
-                        # Ellipsoid -> NAVD88
-                        offset = VDatumResolver.get_ellipsoid_to_navd88_offset(lat, lon)  # type: ignore
-                        logger.info(f"Applying Ellipsoid->NAVD88 offset of {offset:.3f}m for {filename}")
-                    else:
-                        # MLLW -> NAVD88
-                        offset = VDatumResolver.get_mllw_to_navd88_offset(lat, lon)  # type: ignore
-                        logger.info(f"Applying MLLW->NAVD88 offset of {offset:.3f}m for {filename}")
+                    found_offset = False
+                    last_error: Exception | None = None
+
+                    for cx, cy in candidate_points:
+                        try:
+                            lon, lat = transformer.transform(cx, cy)
+
+                            if is_ellipsoid:
+                                # Ellipsoid -> NAVD88
+                                offset = VDatumResolver.get_ellipsoid_to_navd88_offset(  # type: ignore
+                                    lat, lon
+                                )
+                                logger.info(
+                                    f"Applying Ellipsoid->NAVD88 offset of {offset:.3f}m for {filename} "
+                                    f"(at {lat:.4f}, {lon:.4f})"
+                                )
+                            else:
+                                # MLLW -> NAVD88
+                                offset = VDatumResolver.get_mllw_to_navd88_offset(  # type: ignore
+                                    lat, lon
+                                )
+                                logger.info(
+                                    f"Applying MLLW->NAVD88 offset of {offset:.3f}m for {filename} "
+                                    f"(at {lat:.4f}, {lon:.4f})"
+                                )
+
+                            found_offset = True
+                            break  # Success!
+
+                        except VDatumNoDataError as e:
+                            # This point failed, try next
+                            last_error = e
+                            continue
+                        except Exception as e:
+                            # Other errors should probably abort or warn
+                            logger.warning(f"VDatum check failed at ({lat:.4f}, {lon:.4f}): {e}")
+                            last_error = e
+
+                    if not found_offset:
+                        msg = (
+                            f"Could not determine VDatum offset for {filename} "
+                            f"(tried {len(candidate_points)} points). defaulting to 0.0."
+                        )
+                        if last_error:
+                            msg += f" Last error: {last_error}"
+                        logger.warning(msg)
 
                     # Applying offset to Dask array adds a task to the graph (Lazy).
-                    elev = elev + offset
+                    if found_offset:
+                        elev = elev + offset
 
                 # --- OPTIMIZATION: Persist the adjusted data to Zarr ---
                 # Zarr allows chunked parallel writes and reads, ideal for this use case.
@@ -581,8 +626,12 @@ class BAGDiscovery:
             data = resp.json()
 
             if "features" in data:
-                # Collect valid BAGs with their sort key (Year/Date)
-                found_bags: list[tuple[str, int]] = []  # (URL, SortVal)
+                import re
+
+                # Collect valid BAGs with their sort key (Resolution, Date)
+                # Primary Sort: Resolution (Ascending, so 0.5 < 1.0)
+                # Secondary Sort: Date (Descending, so Newest first)
+                found_bags: list[tuple[str, float, int]] = []  # (URL, Resolution, DateTimestamp)
 
                 for feature in data["features"]:
                     attr = feature.get("attributes", {})
@@ -590,22 +639,31 @@ class BAGDiscovery:
                     # Prefer precise end date (timestamp), fallback to year (int), fallback to 0
                     d_end = attr.get("DATE_SURVEY_END")
                     d_year = attr.get("SURVEY_YEAR")
-                    sort_val = 0
+                    sort_date = 0
 
                     try:
-                        # If we have a timestamp (milliseconds), use it.
-                        # If we ONLY have a year, estimate a timestamp so they are comparable.
-                        # Timestamps ~ 1.6e12 (2020s). Years ~ 2020.
                         if d_end is not None:
-                            sort_val = int(d_end)
+                            sort_date = int(d_end)
                         elif d_year is not None:
-                            # Convert Year to rough milliseconds timestamp (Year-01-01)
-                            # 1970 = 0. 2023 = (2023-1970)*31536000000
-                            sort_val = (int(d_year) - 1970) * 31536000000
+                            sort_date = (int(d_year) - 1970) * 31536000000
                     except Exception:
                         pass
 
-                    # Tuple: (URL, SortVal)
+                    # Extract Resolution from URL/Filename
+                    # e.g. H13384_MB_50cm_MLLW_1of1.bag
+                    resolution_val = 100.0  # Default low priority
+                    if download_url:
+                        fname = download_url.split("/")[-1].lower()
+                        # Match _50cm_ or _0.5m_
+                        m_cm = re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", fname)
+                        m_m = re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", fname)
+
+                        if m_cm:
+                            resolution_val = float(m_cm.group(1)) / 100.0
+                        elif m_m:
+                            resolution_val = float(m_m.group(1))
+
+                    # Tuple: (URL, Res, Date)
                     if download_url:
                         final_urls = []
                         if download_url.lower().endswith(".bag"):
@@ -616,16 +674,30 @@ class BAGDiscovery:
                                 final_urls = scraped
 
                         for url in final_urls:
-                            found_bags.append((url, sort_val))
+                            # Re-check resolution on final URLs (in case scraping found variations)
+                            fname = url.split("/")[-1].lower()
+                            res_final = resolution_val
+                            # If scraped, re-calculate resolution from actual filename
+                            m_cm = re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", fname)
+                            m_m = re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", fname)
+                            if m_cm:
+                                res_final = float(m_cm.group(1)) / 100.0
+                            elif m_m:
+                                res_final = float(m_m.group(1))
 
-                # Sort by Date (Ascending: Old -> New)
-                found_bags.sort(key=lambda x: x[1])
+                            found_bags.append((url, res_final, sort_date))
+                            logger.debug(f"Discovered BAG: {fname} | Res: {res_final}m | Date: {sort_date}")
+
+                # Sort:
+                # 1. Resolution ASC (Smallest = Best)
+                # 2. Date DESC (Largest = Newest = Best) -> Use negative
+                found_bags.sort(key=lambda x: (x[1], -x[2]))
 
                 # Extract just the URLs for compatibility
                 # Deduplicate while preserving order
                 seen = set()
                 found_urls = []
-                for url, _ in found_bags:
+                for url, _, _ in found_bags:
                     if url not in seen:
                         found_urls.append(url)
                         seen.add(url)
@@ -674,6 +746,9 @@ class BAGProvider(Provider):
         urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
         if not urls:
             raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
+
+        # Note: BAGDiscovery now returns URLs sorted Best -> Worst (Resolution, then Date).
+        # rioxarray.merge_arrays prioritizes the FIRST array (Top-Down), so this order is correct.
 
         logger.info(f"BAG fetch: Found {len(urls)} files to process.")
 
@@ -762,13 +837,25 @@ class BAGProvider(Provider):
             merged_ds = project_layers[0]
         else:
             try:
-                # merge_arrays puts LAST element on TOP.
-                # URLs are sorted oldest first by default, so newest ends up on top.
+                # merge_arrays puts FIRST element on TOP (Priority).
+                # URLs are sorted Best -> Worst by discovery.
                 elevs = [ds["elevation"] for ds in project_layers]
                 sources = [ds["source_id"] for ds in project_layers]
 
                 final_elev = merge_arrays(elevs)
                 final_src = merge_arrays(sources)
+
+                # Defensive: Drop duplicate indices from merge
+                if not final_elev.indexes["x"].is_unique:
+                    final_elev = final_elev.drop_duplicates(dim="x")
+                if not final_elev.indexes["y"].is_unique:
+                    final_elev = final_elev.drop_duplicates(dim="y")
+
+                if not final_src.indexes["x"].is_unique:
+                    final_src = final_src.drop_duplicates(dim="x")
+                if not final_src.indexes["y"].is_unique:
+                    final_src = final_src.drop_duplicates(dim="y")
+
                 merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
                 logger.error(f"Failed to merge BAGs: {e}")

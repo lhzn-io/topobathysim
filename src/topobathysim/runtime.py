@@ -228,7 +228,23 @@ def _run_cell(
             # ------------------------------
 
             # Align to Canvas
-            aligned_data = fetched_data.rio.reproject_match(elevation)
+            try:
+                # Defensive check on duplicates before reproject
+                # Handle both projected (x,y) and geographic (lon,lat) dimensions
+                for dim in ["x", "y", "lon", "lat"]:
+                    if (
+                        dim in fetched_data.dims
+                        and dim in fetched_data.indexes
+                        and not fetched_data.indexes[dim].is_unique
+                    ):
+                        fetched_data = fetched_data.drop_duplicates(dim=dim)
+
+                aligned_data = fetched_data.rio.reproject_match(elevation)
+            except Exception as e:
+                logger.error(f"Reprojection/Index Alignment failed for {step.provider}: {e}")
+                # Try dropping duplicates forcefully again? Or continue
+                continue
+
             new_data_mask = aligned_data.notnull()
 
             if not new_data_mask.any():
