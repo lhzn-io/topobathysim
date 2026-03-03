@@ -109,7 +109,8 @@ class NoaaTopobathyProvider(Provider):
         """
         import numpy as np
 
-        west, south, east, north = bbox
+        # Ensure the bbox is in EPSG:4326 for project discovery
+        west, south, east, north = self._normalize_bbox(bbox, crs)
 
         # Extract filter from kwargs
         filter_criteria = kwargs.get("filter")

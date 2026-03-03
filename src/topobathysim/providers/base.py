@@ -1,7 +1,11 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 import xarray as xr
+from pyproj import Transformer
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderNoDataError(LookupError):
@@ -21,6 +25,38 @@ class Provider(ABC):
     All data sources (GEBCO, BlueTopo, BAG, etc.) must implement this interface
     to ensure a unified data access layer for the fusion runtime.
     """
+
+    def _normalize_bbox(
+        self,
+        bbox: tuple[float, float, float, float],
+        crs: str = "EPSG:4326",
+    ) -> tuple[float, float, float, float]:
+        """
+        Ensures the bounding box is in WGS84 (EPSG:4326) degrees.
+        If input is already in 4326, returns it unchanged.
+        If in any other CRS (e.g. 3857 meters), transforms it.
+
+        Args:
+            bbox: (west, south, east, north)
+            crs: The CRS of the input bbox.
+
+        Returns:
+            Tuple[float, float, float, float]: (west, south, east, north) in WGS84.
+        """
+        if crs.upper() == "EPSG:4326":
+            return bbox
+
+        try:
+            west, south, east, north = bbox
+            # We use always_xy=True to ensure (lon, lat) ordering
+            transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            w, s = transformer.transform(west, south)
+            e, n = transformer.transform(east, north)
+            logger.debug(f"Normalized bbox from {crs} to EPSG:4326: {bbox} -> ({w}, {s}, {e}, {n})")
+            return (w, s, e, n)
+        except Exception as exc:
+            logger.warning(f"Failed to normalize bbox from {crs} to EPSG:4326: {exc}")
+            return bbox
 
     @abstractmethod
     def fetch_layer(

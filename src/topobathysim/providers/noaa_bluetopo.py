@@ -82,7 +82,8 @@ class NoaaBlueTopoProvider(Provider):
         Fetch BlueTopo layer for the given bounding box.
         Resolves, fetches, and merges all intersecting tiles.
         """
-        west, south, east, north = bbox
+        # Ensure the bbox is in EPSG:4326 for tile resolution and metadata checks
+        west, south, east, north = self._normalize_bbox(bbox, crs)
 
         # 1. Resolve Tiles
         tile_ids = self.resolve_tiles_in_bbox(west, south, east, north)

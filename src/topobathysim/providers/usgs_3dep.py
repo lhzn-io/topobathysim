@@ -71,7 +71,8 @@ class Usgs3DepProvider(Provider):
         """
         Fetch USGS 3DEP (or fallback) data for the given bounding box.
         """
-        bounds = bbox
+        # Ensure the bbox is in EPSG:4326 for STAC/Manifest queries
+        bounds = self._normalize_bbox(bbox, crs)
 
         # 1. 3DEP Seamless (10m) - Best for US
         da = self._fetch_collection(bounds, "3dep-seamless")

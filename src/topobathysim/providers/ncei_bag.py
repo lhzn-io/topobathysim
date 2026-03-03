@@ -579,14 +579,18 @@ class BAGDiscovery:
         return []
 
     @classmethod
-    def find_bags_by_bbox(cls, west: float, south: float, east: float, north: float) -> list[str]:
+    def find_bags_by_bbox(
+        cls, west: float, south: float, east: float, north: float, crs: str = "EPSG:4326"
+    ) -> list[str]:
         """
         Queries NCEI for BAGs intersecting the bounding box.
         Returns list of download URLs.
         Results are persisted to disk so subsequent calls (including across server restarts)
         return immediately without a network round-trip.
         """
-        bbox_key = f"{round(west, 6)}_{round(south, 6)}_{round(east, 6)}_{round(north, 6)}"
+        bbox_key = (
+            f"{round(west, 6)}_{round(south, 6)}_{round(east, 6)}_{round(north, 6)}_{crs.replace(':', '_')}"
+        )
 
         # 1. Check disk cache (survives server restarts and process recycling)
         cached = cls._get_from_discovery_cache(bbox_key)
@@ -599,7 +603,8 @@ class BAGDiscovery:
         try:
             from pyproj import Transformer
 
-            transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+            # MapServer expects EPSG:3857 (Web Mercator)
+            transformer = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
             minx, miny = transformer.transform(west, south)
             maxx, maxy = transformer.transform(east, north)
 
@@ -743,7 +748,7 @@ class BAGProvider(Provider):
         west, south, east, north = bbox
 
         # 1. Discover BAGs
-        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north)
+        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north, crs=crs)
         if not urls:
             raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
 

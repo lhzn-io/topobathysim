@@ -114,12 +114,15 @@ class UsgsLidarProvider(Provider):
         """
         Fetch USGS Lidar data for the given bounding box.
         """
+        # Ensure the bbox is in EPSG:4326 for STAC/Manifest lookup
+        norm_bbox = self._normalize_bbox(bbox, crs)
+
         # Default resolution for Lidar is higher than 3DEP raster
         # ~4m is safe default if not specified
         res = resolution if resolution is not None else 4.0
 
         da = self.fetch_lidar_from_stac(
-            bounds=bbox,
+            bounds=norm_bbox,
             resolution=res,
             target_crs=crs,
             force_cache=True,

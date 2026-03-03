@@ -77,8 +77,9 @@ class GEBCO2025Provider(Provider):
         """
         Implements Provider.fetch_layer
         """
-        west, south, east, north = bbox
-        bbox_override = BBox(west, south, east, north)
+        # Ensure the bbox is in EPSG:4326 for the fetch logic
+        lon_min, lat_min, lon_max, lat_max = self._normalize_bbox(bbox, crs)
+        bbox_override = BBox(lon_min, lat_min, lon_max, lat_max)
         return self.fetch(bbox_override=bbox_override)
 
     def get_metadata(self) -> dict[str, Any]:

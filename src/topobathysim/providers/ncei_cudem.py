@@ -66,7 +66,8 @@ class CUDEMProvider(Provider):
         """
         Fetch CUDEM data for the given bounding box.
         """
-        west, south, east, north = bbox
+        # Ensure the bbox is in EPSG:4326 for spatial index lookup
+        west, south, east, north = self._normalize_bbox(bbox, crs)
         matches = self.resolve_tiles(west, south, east, north)
 
         if matches.empty:
