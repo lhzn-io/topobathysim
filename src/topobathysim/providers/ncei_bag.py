@@ -12,7 +12,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np  # Added numpy import
 import requests  # type: ignore
@@ -588,9 +588,16 @@ class BAGDiscovery:
         Results are persisted to disk so subsequent calls (including across server restarts)
         return immediately without a network round-trip.
         """
-        bbox_key = (
-            f"{round(west, 6)}_{round(south, 6)}_{round(east, 6)}_{round(north, 6)}_{crs.replace(':', '_')}"
-        )
+        # OPTIMIZATION: Snap to a 0.01 degree grid to ensure high cache hit rate
+        # regardless of small floating point or halo variations.
+        grid = 0.01
+        swest = np.floor(west / grid) * grid
+        ssouth = np.floor(south / grid) * grid
+        seast = np.ceil(east / grid) * grid
+        snorth = np.ceil(north / grid) * grid
+
+        crs_tag = crs.replace(":", "_")
+        bbox_key = f"{round(swest, 4)}_{round(ssouth, 4)}_{round(seast, 4)}_{round(snorth, 4)}_{crs_tag}"
 
         # 1. Check disk cache (survives server restarts and process recycling)
         cached = cls._get_from_discovery_cache(bbox_key)
@@ -605,8 +612,8 @@ class BAGDiscovery:
 
             # MapServer expects EPSG:3857 (Web Mercator)
             transformer = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
-            minx, miny = transformer.transform(west, south)
-            maxx, maxy = transformer.transform(east, north)
+            minx, miny = transformer.transform(swest, ssouth)
+            maxx, maxy = transformer.transform(seast, snorth)
 
             headers = {"User-Agent": USER_AGENT}
 
@@ -625,8 +632,8 @@ class BAGDiscovery:
                 "f": "json",
             }
 
-            logger.info(f"Querying NCEI by BBox: {west},{south},{east},{north}")
-            resp = requests.get(cls.QUERY_URL, params=params, headers=headers, timeout=10)
+            logger.info(f"Querying NCEI by BBox: {swest},{ssouth},{seast},{snorth}")
+            resp = requests.get(cls.QUERY_URL, params=params, headers=headers, timeout=20)
             resp.raise_for_status()
             data = resp.json()
 
@@ -723,17 +730,29 @@ class BAGProvider(Provider):
     Manages downloading, caching, and reading of NOAA BAG files.
     """
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+    # Singleton instance to avoid re-initializing discovery caches
+    _singleton: ClassVar["BAGProvider | None"] = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "BAGProvider":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cast(BAGProvider, cls._singleton)
+
+    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
         """
         Initialize the BAG provider.
 
         Args:
             cache_dir: Directory to store cached data files.
         """
+        if getattr(self, "_initialized", False):
+            return
+
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_bag"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.vdatum = VDatumResolver()
+        self._initialized = True
 
     def fetch_layer(
         self,
@@ -766,6 +785,7 @@ class BAGProvider(Provider):
                 # Load (Lazy/Zarr if available)
                 da = self.fetch_bag(survey_id="unknown_bbox_fetch", download_url=url)
                 if da is None:
+                    logger.warning(f"BAG fetch: Failed to load data from {url}")
                     continue
 
                 # OPTIMIZATION: Clip EARLY (before reprojection/merge)

@@ -9,7 +9,7 @@ import contextlib
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, cast
 
 import fsspec
 import geopandas as gpd
@@ -56,13 +56,24 @@ class NoaaBlueTopoProvider(Provider):
     #   manage_discovery_cache.py --invalidate noaa_bluetopo
     TILE_URL_CACHE_PATH = Path("~/.cache/topobathysim/noaa_bluetopo/tile_url_cache.json").expanduser()
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+    _singleton: ClassVar["NoaaBlueTopoProvider | None"] = None
+    _initialized: bool
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "NoaaBlueTopoProvider":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cast(NoaaBlueTopoProvider, cls._singleton)
+
+    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
         """
         Initialize the BlueTopo provider.
 
         Args:
             cache_dir: Directory to store cached data files.
         """
+        if getattr(self, "_initialized", False):
+            return
+
         self.vdatum = VDatumResolver()
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "noaa_bluetopo"
@@ -70,6 +81,7 @@ class NoaaBlueTopoProvider(Provider):
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
         self.scheme_path = self.cache_dir / "BlueTopo_Tile_Scheme.gpkg"
         self._gdf = None
+        self._initialized = True
 
     def fetch_layer(
         self,

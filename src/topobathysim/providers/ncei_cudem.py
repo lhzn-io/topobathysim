@@ -10,7 +10,7 @@ import fcntl
 import logging
 import zipfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import geopandas as gpd
 import numpy as np
@@ -35,18 +35,30 @@ class CUDEMProvider(Provider):
     Acts as Tier 1 Data (Gap Filler for Intertidal/Coastal).
     """
 
+    # Singleton instance to avoid re-initializing S3 filesystem and tile index
+    _singleton: ClassVar["CUDEMProvider | None"] = None
+    _initialized: bool
+
     # Bucket: noaa-nos-coastal-lidar-pds
     # Prefix: dem/NCEI_ninth_Topobathy_2014_8483/
     BASE_S3_URL = "https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483"
     TILE_INDEX_ZIP = "tileindex_NCEI_ninth_Topobathy_2014.zip"
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+    def __new__(cls, *args: Any, **kwargs: Any) -> "CUDEMProvider":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cast(CUDEMProvider, cls._singleton)
+
+    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
         """
         Initialize the CUDEM provider.
 
         Args:
             cache_dir: Directory to store cached data files.
         """
+        if getattr(self, "_initialized", False):
+            return
+
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_cudem"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "zarr").mkdir(exist_ok=True)  # Create Zarr subdir
@@ -55,6 +67,7 @@ class CUDEMProvider(Provider):
         self.index_shp_dir = self.cache_dir / "index_shp"
         self._gdf: gpd.GeoDataFrame | None = None
         self.vdatum = VDatumResolver()
+        self._initialized = True
 
     def fetch_layer(
         self,

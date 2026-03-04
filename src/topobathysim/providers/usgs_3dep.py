@@ -35,7 +35,15 @@ class Usgs3DepProvider(Provider):
     Tier 3: NASADEM / Copernicus (30m)
     """
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "Usgs3DepProvider":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cast(Usgs3DepProvider, cls._instance)
+
+    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False) -> None:
         """
         Initialize the 3DEP provider.
 
@@ -43,6 +51,9 @@ class Usgs3DepProvider(Provider):
             cache_dir: Directory to store cached data files.
             offline_mode: If True, only use locally cached data/manifests.
         """
+        if self._initialized:
+            return
+
         import os
 
         if cache_dir == "~/.cache/topobathysim":
@@ -60,6 +71,7 @@ class Usgs3DepProvider(Provider):
 
         # Manifest for Offline Lookup
         self.manifest = OfflineManifest(self.metadata_dir, filename="stac_manifest.json")
+        self._initialized = True
 
     def fetch_layer(
         self,

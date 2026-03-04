@@ -29,10 +29,30 @@ logger = logging.getLogger(__name__)
 
 
 @concurrent_lru_cache()
-def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
+def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] | None:
     """
     Cached STAC query for 3DEP Lidar (In-Memory Only).
     """
+    # Use a persistent lock file for STAC query caching
+    cache_path = Path("~/.cache/topobathysim/usgs_lidar/stac_discovery_cache.json").expanduser()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_path.with_suffix(".lock")
+
+    bbox_key = f"{round(bbox[0], 6)}_{round(bbox[1], 6)}_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
+
+    from filelock import FileLock
+
+    with FileLock(lock_path):
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    data = json.load(f)
+                    if bbox_key in data:
+                        logger.debug(f"STAC Discovery Cache Hit: {bbox_key}")
+                        return cast(dict[str, Any] | None, data[bbox_key])
+            except Exception:
+                pass
+
     stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
     import planetary_computer
     from pystac_client import Client
@@ -50,26 +70,41 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict | None:
             items.append(item)
             break
 
-        if not items:
-            return None
+        result = None
+        if items:
+            # Extract only what we need to return
+            item = items[0]
+            assets = item.assets
+            href = assets["data"].href
 
-        # Extract only what we need to return
-        item = items[0]
-        assets = item.assets
-        href = assets["data"].href
+            props = item.properties
+            native_epsg = props.get("proj:epsg")
+            projjson = props.get("proj:projjson", {})
 
-        props = item.properties
-        native_epsg = props.get("proj:epsg")
-        projjson = props.get("proj:projjson", {})
+            result = {
+                "href": href,
+                "native_epsg": native_epsg,
+                "projjson": projjson,
+                "id": item.id,
+                "bbox": item.bbox,
+                "properties": item.properties,
+            }
 
-        return {
-            "href": href,
-            "native_epsg": native_epsg,
-            "projjson": projjson,
-            "id": item.id,
-            "bbox": item.bbox,
-            "properties": item.properties,
-        }
+        # Persist even None to avoid re-querying empty bboxes
+        with FileLock(lock_path):
+            data = {}
+            if cache_path.exists():
+                try:
+                    with open(cache_path) as f:
+                        data = json.load(f)
+                except Exception:
+                    pass
+            data[bbox_key] = result
+            with open(cache_path, "w") as f:
+                json.dump(data, f, indent=2)
+
+        return cast(dict[str, Any] | None, result)
+
     except Exception as e:
         logger.warning(f"STAC Query Error: {e}")
         return None
@@ -81,7 +116,15 @@ class UsgsLidarProvider(Provider):
     Filters for 'Bare Earth' (Class 2) and rasterizes to GeoTIFF.
     """
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "UsgsLidarProvider":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cast(UsgsLidarProvider, cls._instance)
+
+    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False) -> None:
         """
         Initialize the Lidar provider.
 
@@ -89,6 +132,9 @@ class UsgsLidarProvider(Provider):
             cache_dir: Directory to store cached data files.
             offline_mode: If True, only use locally cached data/manifests.
         """
+        if self._initialized:
+            return
+
         import os
 
         if cache_dir == "~/.cache/topobathysim":
@@ -103,6 +149,7 @@ class UsgsLidarProvider(Provider):
 
         # Manifest for Offline Lookup
         self.manifest = OfflineManifest(self.cache_dir)
+        self._initialized = True
 
     def fetch_layer(
         self,

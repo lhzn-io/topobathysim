@@ -30,6 +30,10 @@ class GEBCO2025Provider(Provider):
     # Official GEBCO 2025 OpenDAP URL
     # Note: 'sub_ice_topo_bathymetry' is the elevation variable
     OPENDAP_URL = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/sub_ice_topography_bathymetry/netcdf/gebco_2025_sub_ice.nc"
+    TID_URL = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/type_identifier_grid/netcdf/gebco_2025_tid.nc"
+
+    # Static instance to avoid re-initializing OPeNDAP metadata
+    _singleton: ClassVar["GEBCO2025Provider | None"] = None
 
     RESOLUTION_ARCSEC = 15
     HALF_PIXEL_OFFSET = (15 / 3600) * 0.5  # Degrees
@@ -38,6 +42,12 @@ class GEBCO2025Provider(Provider):
     _locks_lock: ClassVar[Any] = None
     _ds_remote: ClassVar[xr.Dataset | None] = None
     _tid_remote: ClassVar[xr.Dataset | None] = None
+    _initialized: bool
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "GEBCO2025Provider":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cast(GEBCO2025Provider, cls._singleton)
 
     def __init__(
         self,
@@ -58,6 +68,9 @@ class GEBCO2025Provider(Provider):
             output_format: Output format (default: GTiff).
             cache_dir: Directory to store cached data files.
         """
+        if hasattr(self, "_initialized") and self._initialized:
+            return
+
         p = Path(cache_dir).expanduser() / "gebco_2025"
         p.mkdir(parents=True, exist_ok=True)
         (p / "zarr").mkdir(exist_ok=True)  # Zarr subdir
@@ -66,6 +79,7 @@ class GEBCO2025Provider(Provider):
         self.cache_dir = str(p)
         self.tid_data: xr.DataArray | None = None
         self._da: xr.DataArray | None = None
+        self._initialized = True
 
     def fetch_layer(
         self,
@@ -224,9 +238,8 @@ class GEBCO2025Provider(Provider):
                                             self.OPENDAP_URL, engine="pydap"
                                         )
                                         # Also initialize TID dataset connection
-                                        tid_url = "dap2://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2025/type_identifier_grid/netcdf/gebco_2025_tid.nc"
                                         GEBCO2025Provider._tid_remote = xr.open_dataset(
-                                            tid_url, engine="pydap"
+                                            self.TID_URL, engine="pydap"
                                         )
                                     except Exception as connection_err:
                                         logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")

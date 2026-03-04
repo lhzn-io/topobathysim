@@ -174,7 +174,7 @@ def _run_cell(
                 fetched_data = provider_instance.fetch_layer(
                     fetch_bbox,
                     resolution=input_resolution_meters,
-                    crs=target_crs,
+                    crs="EPSG:4326",
                     filter=step.filter.model_dump() if step.filter else {},
                 )
             except ProviderNoDataError as e:
@@ -399,7 +399,7 @@ def run(
         pass
 
     # Determine Grid Cells
-    cells, _grid_size = _get_grid_cells(bbox, target_crs)
+    cells, grid_cell_size = _get_grid_cells(bbox, target_crs)
 
     # For caching
     import os
@@ -449,11 +449,25 @@ def run(
             except Exception as e:
                 logger.warning(f"Failed to load cache {cache_path}: {e}")
 
+        if ds_cell is not None and ds_cell.attrs.get("grid_cell_size") != grid_cell_size:
+            logger.info(
+                f"Grid Size Mismatch for {cache_path.name}. "
+                f"Expect {grid_cell_size}, got {ds_cell.attrs.get('grid_cell_size')}"
+            )
+            ds_cell = None
+
+        if ds_cell is not None:
             # Squeeze any spurious band dimension that may have been saved by older cache writes
-            if ds_cell is not None:
-                for var in ["elevation", "source_elevation"]:
-                    if var in ds_cell and "band" in ds_cell[var].dims:
-                        ds_cell[var] = ds_cell[var].squeeze("band", drop=True)
+            for var in ["elevation", "source_elevation"]:
+                if var in ds_cell and "band" in ds_cell[var].dims:
+                    ds_cell[var] = ds_cell[var].squeeze("band", drop=True)
+
+            # ATTRS CHECK: If cache was written with a different provider set (new code or different config),
+            # we should invalidate it to ensure provenance IDs match current legend.
+            cached_legend = ds_cell.attrs.get("policy_legend")
+            if cached_legend and cached_legend != str(legend):
+                logger.info(f"Policy Legend Mismatch for {cache_path.name}. Invalidating Cache.")
+                ds_cell = None
 
         if ds_cell is None:
             # Cache miss! Execute the cell
@@ -470,6 +484,7 @@ def run(
             new_attrs = {
                 "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
                 "policy_legend": str(legend),
+                "grid_cell_size": grid_cell_size,
                 "crs": target_crs,
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),

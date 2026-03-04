@@ -42,6 +42,9 @@ class NoaaTopobathyProvider(Provider):
     INDEX_URL = "https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/laz/index.html"
     BUCKET_BASE = "noaa-nos-coastal-lidar-pds"
 
+    # Singleton instance to avoid re-initializing S3 filesystem and discovery caches
+    _singleton: ClassVar["NoaaTopobathyProvider | None"] = None
+
     # Class-level in-process cache.
     #
     # run() creates one NoaaTopobathyProvider instance per grid cell (up to 9x
@@ -58,12 +61,22 @@ class NoaaTopobathyProvider(Provider):
     _cls_projects: ClassVar[dict[str, str]] = {}
     _cls_projects_metadata_urls: ClassVar[dict[str, str]] = {}
     _cls_spatial_index: ClassVar["gpd.GeoDataFrame | None"] = None
+    _cls_tile_indices: ClassVar[dict[str, "gpd.GeoDataFrame"]] = {}
     _cls_lock: ClassVar[threading.Lock] = threading.Lock()
+    _initialized: bool
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "NoaaTopobathyProvider":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cast(NoaaTopobathyProvider, cls._singleton)
 
     def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
         """
         Initializes the Topobathy provider, creating necessary cache directories.
         """
+        if getattr(self, "_initialized", False):
+            return
+
         self.base_cache_dir = Path(cache_dir).expanduser()
         self.cache_dir = self.base_cache_dir / "noaa_topobathy"
         self.metadata_dir = self.base_cache_dir / "metadata"
@@ -83,8 +96,24 @@ class NoaaTopobathyProvider(Provider):
         self._projects_metadata_urls: dict[str, str] = NoaaTopobathyProvider._cls_projects_metadata_urls
 
         self._active_project_id: str | None = None
-        self._tile_index: gpd.GeoDataFrame | None = None
         self.fs = fsspec.filesystem("s3", anon=True)
+        self._initialized = True
+
+    @property
+    def _tile_index(self) -> "gpd.GeoDataFrame | None":
+        """Transparently reads from the class-level shared tile index cache."""
+        if self._active_project_id is None:
+            return None
+        return NoaaTopobathyProvider._cls_tile_indices.get(self._active_project_id)
+
+    @_tile_index.setter
+    def _tile_index(self, value: "gpd.GeoDataFrame | None") -> None:
+        """Writes to the class-level shared tile index cache."""
+        if self._active_project_id is not None:
+            if value is None:
+                NoaaTopobathyProvider._cls_tile_indices.pop(self._active_project_id, None)
+            else:
+                NoaaTopobathyProvider._cls_tile_indices[self._active_project_id] = value
 
     @property
     def _spatial_index(self) -> "gpd.GeoDataFrame | None":
@@ -130,6 +159,11 @@ class NoaaTopobathyProvider(Provider):
         # 2. Process Each Project
         for pid in pids:
             try:
+                # OPTIMIZATION: Check if all expected tiles for this project are already in Zarr cache.
+                # If they are, we can skip the S3 directory listing in set_active_project().
+                # However, since tiles are dynamic per bbox, we still need the tile index.
+                # BUT, we can cache the tile index in memory (done in set_active_project).
+
                 self.set_active_project(pid)
 
                 # Resolve Tiles
@@ -288,27 +322,34 @@ class NoaaTopobathyProvider(Provider):
 
             # 1. Try Loading JSON
             if json_path.exists():
-                age = time.time() - json_path.stat().st_mtime
-                # 7 days expiration
-                if age < 604800:
-                    try:
-                        with open(json_path) as f:
-                            data = json.load(f)
-                            for k, v in data.items():
-                                if isinstance(v, dict):
-                                    self._projects[k] = v.get("name", "")
-                                    if "info" in v:
-                                        self._projects_metadata_urls[k] = v["info"]
-                                else:
-                                    self._projects[k] = str(v)
+                try:
+                    with open(json_path) as f:
+                        data = json.load(f)
+                        for k, v in data.items():
+                            if isinstance(v, dict):
+                                self._projects[k] = v.get("name", "")
+                                if "info" in v:
+                                    self._projects_metadata_urls[k] = v["info"]
+                            else:
+                                self._projects[k] = str(v)
 
-                            logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
-                            return
-                    except Exception as e:
-                        logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
+                        logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
+                        return
+                except Exception as e:
+                    logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
 
             # 2. Fetch and Parse HTML
             try:
+                # 7 days expiration for network hit
+                if json_path.exists():
+                    age = time.time() - json_path.stat().st_mtime
+                    if age > 604800:
+                        logger.info(f"NOAA Index cache expired ({age/86400:.1f} days). Refreshing...")
+                    else:
+                        # This should be unreachable due to 'return' in step 1,
+                        # but kept for logic safety if step 1 fails.
+                        pass
+
                 text = self._fetch_index()
                 new_projects = {}
                 new_metadata_urls = {}
@@ -886,8 +927,32 @@ class NoaaTopobathyProvider(Provider):
         if self._active_project_id == project_id and self._tile_index is not None:
             return
 
+        # Use disk-backed caching for the tile index to eliminate S3 directory listings
+        # and redundant downloads for the same project across grid cells.
+        index_cache_dir = self.metadata_dir / "tile_index"
+        index_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Look for local GPKG or other cached index files for this project ID
+        # (We use project_id as filename prefix)
+        cached_indices = list(index_cache_dir.glob(f"{project_id}.*"))
+        if cached_indices:
+            try:
+                # Load the first one found (usually .gpkg or .shp).
+                # Geopandas can read .zip files directly if they contain a shapefile.
+
+                # IMPORTANT: Set active project ID first so the property setter writes to the cache!
+                self._active_project_id = project_id
+                self._tile_index = gpd.read_file(cached_indices[0])
+                logger.debug(f"Topobathy Tile Index Cache Hit (Disk): {project_id}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load cached tile index {cached_indices[0]}: {e}")
+                # Reset if load fails
+                self._active_project_id = None
+
         self._active_project_id = project_id
 
+        # Cache Miss - Identify index file on S3
         # Find tile index in laz/geoid18/{ID}, laz/geoid12b/{ID}, or dem/{FOLDER}/
         # We try geoid18 first, then geoid12b, then fallback to dem/ folder
         candidates = [f"laz/geoid18/{project_id}/", f"laz/geoid12b/{project_id}/"]
@@ -932,8 +997,8 @@ class NoaaTopobathyProvider(Provider):
             logger.warning(f"No tile index found for Project {project_id} in standard locations.")
             return
 
-        # Download Index
-        local_index_path = self.cache_dir / Path(index_file_key).name
+        # Download Index to persistent metadata cache
+        local_index_path = index_cache_dir / f"{project_id}{Path(index_file_key).suffix}"
         if not local_index_path.exists():
             logger.info(f"Downloading Tile Index: {index_file_key}")
             try:
@@ -944,7 +1009,6 @@ class NoaaTopobathyProvider(Provider):
 
         try:
             self._tile_index = gpd.read_file(local_index_path)
-            # Ensure CRS?
         except Exception as e:
             logger.error(f"Failed to load tile index {local_index_path}: {e}")
             self._tile_index = None
