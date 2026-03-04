@@ -21,6 +21,7 @@ from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
 from ..quality import QualityClass
+from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
@@ -368,7 +369,7 @@ class CUDEMProvider(Provider):
                 if da_final.size > 0:
                     da_final = da_final.chunk({"y": 1024, "x": 1024})
                     da_final.name = "elevation"
-                    da_final.to_zarr(zarr_path, mode="w", consolidated=True)
+                    da_final.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
                     return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
             except Exception as e:
                 logger.warning(f"Zarr cache write failed: {e}")

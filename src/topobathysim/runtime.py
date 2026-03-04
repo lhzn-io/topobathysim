@@ -7,6 +7,7 @@ This module executes fusion policies to generate topobathymetric datasets.
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +25,16 @@ from topobathysim.providers.base import ProviderNoDataError
 from topobathysim.providers.registry import registry
 
 logger = logging.getLogger(__name__)
+
+
+def should_consolidate() -> bool:
+    """
+    Check if Zarr consolidation should be enabled based on environment variables.
+    Defaults to True for performance, but can be disabled via TOPOBATHY_ZARR_CONSOLIDATED=0/false
+    to support non-Python Zarr readers like Zarr.jl.
+    """
+    val = os.environ.get("TOPOBATHY_ZARR_CONSOLIDATED", "true").lower()
+    return val in ("true", "1", "yes", "on")
 
 
 def _get_grid_cells(
@@ -361,6 +372,38 @@ def _run_cell(
     return cast(xr.Dataset, ds)
 
 
+def get_fused_cache_path(
+    policy_path: str,
+    bbox: tuple[float, float, float, float],
+    resolution: float = 30.0,
+) -> Path:
+    """Returns the expected Path to a fused Zarr cache file for a given policy, bbox, and resolution."""
+    import hashlib
+    import json
+    import os
+
+    policy = load_policy(policy_path)
+    target_crs = policy.crs
+
+    default_cache = "~/.cache/topobathysim/fused_zarr"
+    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
+    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
+        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
+    else:
+        cache_dir = Path(cache_dir_str).expanduser()
+
+    key_dict = {
+        "policy": policy.model_dump_json(),  # type: ignore
+        "cell": [round(x, 6) for x in bbox],
+        "res": resolution,
+        "crs": target_crs,
+    }
+    key_str = json.dumps(key_dict, sort_keys=True, default=str)
+    key_hash = hashlib.md5(key_str.encode()).hexdigest()
+
+    return cache_dir / f"{key_hash}.zarr"
+
+
 def run(
     policy_path: str,
     bbox: tuple[float, float, float, float],
@@ -507,7 +550,7 @@ def run(
 
                         shutil.rmtree(tmp_path)
 
-                    ds_chunked.to_zarr(tmp_path, mode="w", consolidated=True)
+                    ds_chunked.to_zarr(tmp_path, mode="w", consolidated=should_consolidate())
 
                     if cache_path.exists():
                         import shutil

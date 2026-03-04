@@ -13,6 +13,7 @@ from typing import Any, ClassVar, cast
 import xarray as xr
 from rioxarray.merge import merge_arrays
 
+from ..runtime import should_consolidate
 from .base import Provider
 from .registry import registry
 
@@ -185,11 +186,12 @@ class GEBCO2025Provider(Provider):
                             da_tile = da_tile.rio.write_crs("EPSG:4326")
 
                         # Basic check
-                        if (isinstance(da_tile, xr.Dataset) and da_tile["elevation"].size == 0) or (
-                            not isinstance(da_tile, xr.Dataset) and da_tile.size == 0
+                        if da_tile is not None and (
+                            (isinstance(da_tile, xr.Dataset) and da_tile["elevation"].size == 0)
+                            or (not isinstance(da_tile, xr.Dataset) and da_tile.size == 0)
                         ):
                             da_tile = None
-                        else:
+                        elif da_tile is not None:
                             logger.info(f"GEBCO Zarr Cache Hit: {tile_key}")
                     except Exception as err:
                         logger.warning(f"Corrupt GEBCO Zarr cache {cache_path}: {err}")
@@ -301,9 +303,13 @@ class GEBCO2025Provider(Provider):
                                         # survives the zarr round-trip without needing a patch on load.
                                         ds_to_save = xr.Dataset({"elevation": da_source, "source_id": da_tid})
                                         ds_to_save = ds_to_save.rio.write_crs("EPSG:4326")
-                                        ds_to_save.to_zarr(cache_path, mode="w", consolidated=True)
+                                        ds_to_save.to_zarr(
+                                            cache_path, mode="w", consolidated=should_consolidate()
+                                        )
                                     else:
-                                        da_source.to_zarr(cache_path, mode="w", consolidated=True)
+                                        da_source.to_zarr(
+                                            cache_path, mode="w", consolidated=should_consolidate()
+                                        )
 
                                     with warnings.catch_warnings():
                                         warnings.filterwarnings(

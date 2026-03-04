@@ -21,6 +21,7 @@ import xarray as xr
 from affine import Affine
 
 from ..manifest import OfflineManifest
+from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from .base import Provider, ProviderNoDataError
 from .registry import registry
@@ -316,11 +317,11 @@ class UsgsLidarProvider(Provider):
                 ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 
                 # Check for empty datasets to avoid StopIteration
-                if not ds.data_vars:
+                if ds is not None and not ds.data_vars:
                     ds.close()
                     raise ValueError("Empty Zarr Dataset")
 
-                if "elevation" not in ds:
+                if ds is not None and "elevation" not in ds:
                     var_name = next(iter(ds.data_vars))
                     ds = ds.rename_vars({var_name: "elevation"})
 
@@ -442,7 +443,7 @@ class UsgsLidarProvider(Provider):
 
                     lock_path = zarr_path.with_suffix(".zarr.lock")
                     with FileLock(lock_path):
-                        da.to_zarr(zarr_path, mode="w", consolidated=True)
+                        da.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
                     logger.info(f"Lidar Zarr Cache Created: {zarr_path.name}")
             except Exception as e:
                 logger.error(f"Failed to cache Lidar Zarr: {e}")
@@ -745,7 +746,7 @@ class UsgsLidarProvider(Provider):
 
                         # Chunk for Zarr
                         da_to_cache = p_ds.chunk({"y": 1024, "x": 1024})
-                        da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=True)
+                        da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=should_consolidate())
                         logger.info(f"Cached Streamed Lidar to Zarr: {slice_zarr_path.name}")
 
                         return cast(xr.Dataset, p_ds)

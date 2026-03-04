@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
-from topobathysim.runtime import run
+from topobathysim.runtime import get_fused_cache_path, run, should_consolidate
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
@@ -94,6 +94,31 @@ logger = logging.getLogger("topobathyserve")
 # Default Policy Path
 DEFAULT_POLICY = Path(__file__).resolve().parent.parent.parent / "policies" / "examples" / "wlis.yaml"
 POLICY_PATH: Path | None = None
+
+
+def deg2num(lat_deg: float, lon_deg: float, z: int) -> tuple[int, int]:
+    """Converts WGS84 coordinates to tile coordinates."""
+    lat_rad = math.radians(lat_deg)
+    n = 2.0**z
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return (xtile, ytile)
+
+
+def num2deg(xtile: int, ytile: int, zoom: int) -> tuple[float, float]:
+    """Converts tile coordinates to WGS84 coordinates (top-left)."""
+    n = 2.0**zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
+    lat_deg = math.degrees(lat_rad)
+    return (lat_deg, lon_deg)
+
+
+def tile_bounds_calc(x: int, y: int, z: int) -> dict[str, float]:
+    """Calculates the bounding box for a given tile."""
+    lat_max, lon_min = num2deg(x, y, z)
+    lat_min, lon_max = num2deg(x + 1, y + 1, z)
+    return {"north": lat_max, "south": lat_min, "west": lon_min, "east": lon_max}
 
 
 @asynccontextmanager
@@ -298,9 +323,8 @@ def render_png(
 
         dpi = 100
         fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)
-        ax = plt.Axes(fig, (0.0, 0.0, 1.0, 1.0))
+        ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
         ax.set_axis_off()
-        fig.add_axes(ax)
 
         interval = 10.0
         if zoom >= 14:
@@ -458,9 +482,81 @@ async def get_legend(policy_path: Annotated[Path, Depends(get_policy_path)]) -> 
 
 @app.get("/elevation")
 async def get_elevation(
-    lat: float, lon: float, policy_path: Annotated[Path, Depends(get_policy_path)]
+    lat: float,
+    lon: float,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+    zoom: int | None = Query(None, description="Preferred zoom level/resolution to check in cache"),
 ) -> ElevationResponse:
     try:
+        # Check if we have any cached fused datasets for this coordinate
+        # We start with the requested zoom, or the highest available in the tile cache
+        base_cache_dir = Path(os.environ.get("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
+
+        check_zooms = []
+        if zoom is not None:
+            check_zooms = [zoom]
+        else:
+            # Dynamically discover available zoom levels from the tile data cache
+            tile_data_dir = base_cache_dir / "tiles" / "data"
+            if tile_data_dir.exists():
+                try:
+                    # Collect all zoom level directories (must be numeric)
+                    zooms = []
+                    for d in tile_data_dir.iterdir():
+                        if d.is_dir() and d.name.isdigit():
+                            zooms.append(int(d.name))
+                    # Sort descending for highest resolution first
+                    check_zooms = sorted(zooms, reverse=True)
+                except Exception as e:
+                    logger.debug(f"Failed to scan tile cache for zooms: {e}")
+
+        # Fallback to defaults if no zooms discovered (Z15 is ~4.7m, Z14 is ~9.5m)
+        if not check_zooms:
+            check_zooms = [15, 14, 13, 12]
+
+        for z in check_zooms:
+            try:
+                tx, ty = deg2num(lat, lon, z)
+                bounds = tile_bounds_calc(tx, ty, z)
+                bbox = (bounds["west"], bounds["south"], bounds["east"], bounds["north"])
+
+                # Tile resolution in meters (approx at center Lat)
+                # This MUST match the calculation used in the tile endpoint to generate the cache key
+                center_lat = (bounds["north"] + bounds["south"]) / 2.0
+                res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
+                # Snap to 8 decimal places for consistency with runtime.py rounding if applicable,
+                # but the key should be identical if the float is the same.
+                res_meters = round(res_meters, 8)
+
+                cache_path = get_fused_cache_path(str(policy_path), bbox, resolution=res_meters)
+
+                if cache_path.exists():
+                    logger.debug(f"Elevation Cache Hit (Tile Z{z}): {cache_path.name}")
+                    from filelock import FileLock
+
+                    with FileLock(cache_path.with_suffix(".lock")):
+                        ds = xr.open_dataset(
+                            cache_path,
+                            engine="zarr",
+                            chunks=None,
+                            decode_coords="all",
+                            consolidated=should_consolidate(),
+                        )
+                        ds = ds.load()
+
+                    # Sample closest using projected coordinates (EPSG:3857)
+                    earth_r = 6378137.0
+                    x_m = earth_r * math.radians(lon)
+                    y_m = earth_r * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+                    val = ds["elevation"].sel(x=x_m, y=y_m, method="nearest").item()
+                    return ElevationResponse(elevation=float(val) if not np.isnan(val) else None)
+            except Exception as e:
+                logger.debug(f"Failed to check/load tile cache at Z{z}: {e}")
+                continue
+
+        logger.info(f"Elevation Cache Miss for {lat}, {lon} (Zoom {zoom}). Falling back to 10m global run.")
+
         # Request a reasonable area to ensure we catch grid cells (GEBCO is ~450m)
         delta = 0.02  # ~2km buffer
         bbox = (lon - delta, lat - delta, lon + delta, lat + delta)
@@ -549,34 +645,16 @@ def get_tile_coverage(
     Response includes min/max indices and a list of tiles (capped at 100 items).
     """
     try:
-
-        def deg2num(lat_deg: float, lon_deg: float, z: int) -> tuple[int, int]:
-            lat_rad = math.radians(lat_deg)
-            n = 2.0**z
-            xtile = int((lon_deg + 180.0) / 360.0 * n)
-            ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-            return (xtile, ytile)
-
-        def tile_bounds_calc(x: int, y: int, z: int) -> dict[str, float]:
-            n = 2.0**z
-            lon_min = x / n * 360.0 - 180.0
-            lon_max = (x + 1) / n * 360.0 - 180.0
-            lat_rad_n = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
-            lat_max = math.degrees(lat_rad_n)
-            lat_rad_s = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
-            lat_min = math.degrees(lat_rad_s)
-            return {"north": lat_max, "south": lat_min, "west": lon_min, "east": lon_max}
-
         # Get tile coordinates for top-left (NW) and bottom-right (SE)
         # Note: BBox is North, South, West, East
         # In XYZ, y increases southwards
 
         # Valid Latitude Checks to prevent math domain errors
-        north = min(max(north, -85.0511), 85.0511)
-        south = min(max(south, -85.0511), 85.0511)
+        north_clamped = min(max(north, -85.0511), 85.0511)
+        south_clamped = min(max(south, -85.0511), 85.0511)
 
-        min_x, min_y = deg2num(north, west, zoom)
-        max_x, max_y = deg2num(south, east, zoom)
+        min_x, min_y = deg2num(north_clamped, west, zoom)
+        max_x, max_y = deg2num(south_clamped, east, zoom)
 
         # Handle wrap around or ordering if needed, simplistically:
         # Swap if min > max (though deg2num logic should handle standard west<east)
@@ -843,6 +921,7 @@ def get_xyz_tile(
     center_lat = (north + south) / 2.0
     # Web Mercator resolution equation
     res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
+    res_meters = round(res_meters, 8)
 
     # Pad requested bbox to supply surrounding context for PNG Hillshade rendering
     # Ensures Matplotlib 3x3 surface normal calculation interpolates accurately

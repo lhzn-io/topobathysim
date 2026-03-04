@@ -21,6 +21,7 @@ from rioxarray.merge import merge_arrays
 from shapely.geometry import Point, box
 
 from ..quality import QualityClass
+from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
@@ -631,7 +632,7 @@ class NoaaBlueTopoProvider(Provider):
                         ds_to_cache = ds_to_cache.chunk({"y": 1024, "x": 1024})
 
                     logger.info(f"Caching BlueTopo tile to Zarr: {zarr_name}")
-                    ds_to_cache.to_zarr(zarr_path, mode="w", consolidated=True)
+                    ds_to_cache.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
 
                     return xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
 

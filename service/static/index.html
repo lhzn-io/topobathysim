@@ -412,7 +412,13 @@
                 .openOn(map);
 
             // Fetch Elevation
-            fetch(`/elevation?lat=${lat}&lon=${lng}`)
+            var elevationUrl = `/elevation?lat=${lat}&lon=${lng}`;
+            if (zoom >= 13) {
+                // If zoomed in, suggest the current zoom level for cache hit parity
+                elevationUrl += `&zoom=${zoom}`;
+            }
+
+            fetch(elevationUrl)
                 .then(response => {
                     if (!response.ok) throw new Error("No Data");
                     return response.json();

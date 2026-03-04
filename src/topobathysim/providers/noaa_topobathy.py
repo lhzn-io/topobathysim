@@ -14,6 +14,7 @@ import xarray as xr
 from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
+from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
@@ -176,14 +177,14 @@ class NoaaTopobathyProvider(Provider):
                 for t in tiles:
                     try:
                         # Optimization: Pass bbox to fetch_tile to enable "Clip-then-Cache"
-                        da = self.fetch_tile(t, bbox=bbox)
-                        if da is None:
+                        da_fetched = self.fetch_tile(t, bbox=bbox)
+                        if da_fetched is None:
                             continue
 
                         # Optimization: Clip Early
                         try:
                             # Use 4326 clip since index is 4326
-                            da = da.rio.clip_box(
+                            da = da_fetched.rio.clip_box(
                                 minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
                             )
                         except Exception:
@@ -1230,7 +1231,7 @@ class NoaaTopobathyProvider(Provider):
                         logger.warning(f"Clip failed for {local_filename}: {e}. Skipping tile.")
                         return None
 
-                if da_raw.size == 0:
+                if da_raw is None or da_raw.size == 0:
                     logger.debug(f"Empty tile after clip: {local_filename}")
                     return None
 
@@ -1288,7 +1289,7 @@ class NoaaTopobathyProvider(Provider):
                 if "x" in da_raw.dims and "y" in da_raw.dims:
                     da_raw = da_raw.chunk({"y": 1024, "x": 1024})
 
-                da_raw.to_zarr(zarr_path, mode="w", consolidated=True)
+                da_raw.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
                 logger.info(f"Created Zarr Cache: {zarr_path.name}")
 
                 # Return re-opened Zarr

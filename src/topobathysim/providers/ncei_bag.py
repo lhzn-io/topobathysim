@@ -20,6 +20,7 @@ import xarray as xr
 from filelock import FileLock
 from rioxarray.merge import merge_arrays
 
+from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumNoDataError, VDatumResolver
 from .base import Provider, ProviderNoDataError
@@ -189,7 +190,7 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
 
                     # compute() happens during the write.
                     # mode='w' overwrites if exists (safe here as we checked existence above)
-                    elev.to_zarr(zarr_path, mode="w", consolidated=True)
+                    elev.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
                     logger.info(f"BAG Zarr Cache Created: {zarr_path.name}")
 
                     # Re-open from the fresh Zarr to return a consistent Dask-backed object
@@ -798,7 +799,7 @@ class BAGProvider(Provider):
                     logger.debug(f"BAG tile empty after clip (url={url}): {e}")
                     continue
 
-                if da.size == 0:
+                if da is None or da.size == 0:
                     continue
 
                 # --- CLEANING / FILTERING ---
