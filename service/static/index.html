@@ -370,7 +370,16 @@
             return { x: xtile, y: ytile, z: zoom };
         }
 
+        let currentClickController = null;
+
         map.on('click', function (e) {
+            // Cancel any pending requests from the previous click
+            if (currentClickController) {
+                currentClickController.abort();
+            }
+            currentClickController = new AbortController();
+            const signal = currentClickController.signal;
+
             var lat = e.latlng.lat;
             var lng = e.latlng.lng;
             var zoom = map.getZoom();
@@ -383,6 +392,10 @@
             var viewUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}?format=png&style=${currentStyle}`;
             var metaUrl = `/tiles/${tile.z}/${tile.x}/${tile.y}/metadata?style=${currentStyle}`;
 
+            // Unique IDs for this specific click to avoid collisions if clicking same tile twice
+            // using a timestamp or random suffix
+            var clickId = Date.now();
+
             var popupContent = `
                 <div style="font-family: monospace; font-size: 13px; min-width: 260px; max-width: 340px;">
                     <b>Location Info</b><br/>
@@ -390,13 +403,13 @@
                         Lat: <input type="text" value="${lat.toFixed(6)}" style="width: 100px;" onclick="this.select()"><br/>
                         Lon: <input type="text" value="${lng.toFixed(6)}" style="width: 100px;" onclick="this.select()">
                     </div>
-                    <div id="click-elevation-${tile.x}-${tile.y}" style="margin-top:5px; font-weight:bold; color:#0066cc; white-space: nowrap;">
+                    <div id="click-elevation-${clickId}" style="margin-top:5px; font-weight:bold; color:#0066cc; white-space: nowrap;">
                         <i>Loading Elevation...</i>
                     </div>
                     <div style="margin-top:5px">
                         Tile Z/X/Y: <b>${tile.z}/${tile.x}/${tile.y}</b>
                     </div>
-                    <div id="tile-meta-${tile.z}-${tile.x}-${tile.y}" style="margin-top:5px; padding:4px; background:#f0f0f0; border-radius:4px; font-size:11px;">
+                    <div id="tile-meta-${clickId}" style="margin-top:5px; padding:4px; background:#f0f0f0; border-radius:4px; font-size:11px;">
                         <i>Loading metadata...</i>
                     </div>
                     <div style="margin-top:5px; display:flex; gap:5px;">
@@ -418,13 +431,13 @@
                 elevationUrl += `&zoom=${zoom}`;
             }
 
-            fetch(elevationUrl)
+            fetch(elevationUrl, { signal })
                 .then(response => {
                     if (!response.ok) throw new Error("No Data");
                     return response.json();
                 })
                 .then(data => {
-                    var el = document.getElementById(`click-elevation-${tile.x}-${tile.y}`);
+                    var el = document.getElementById(`click-elevation-${clickId}`);
                     if (!el) return;
 
                     var m = data.elevation;
@@ -433,14 +446,15 @@
                     el.innerHTML = `Depth: ${m.toFixed(2)} m (${ft.toFixed(1)} ft)`;
                 })
                 .catch(err => {
-                    var el = document.getElementById(`click-elevation-${tile.x}-${tile.y}`);
+                    if (err.name === 'AbortError') return;
+                    var el = document.getElementById(`click-elevation-${clickId}`);
                     if (el) el.innerHTML = '<span style="color:#999">No Elevation Data</span>';
                 });
 
             // Shared closure so whichever fetch (pixel or metadata) finishes last wins.
             var pixelHtml = null;       // set by pixel fetch
             var metaSlotReady = false;  // set by metadata fetch after DOM slot is written
-            var pixelSlotId = `pixel-source-${tile.z}-${tile.x}-${tile.y}`;
+            var pixelSlotId = `pixel-source-${clickId}`;
 
             function renderPixelSlot() {
                 if (!metaSlotReady || pixelHtml === null) return;
@@ -449,7 +463,7 @@
             }
 
             // Fetch Pixel-Level Source
-            fetch(`/tiles/${tile.z}/${tile.x}/${tile.y}/pixel?lat=${lat}&lon=${lng}&style=${currentStyle}`)
+            fetch(`/tiles/${tile.z}/${tile.x}/${tile.y}/pixel?lat=${lat}&lon=${lng}&style=${currentStyle}`, { signal })
                 .then(response => { if (!response.ok) return null; return response.json(); })
                 .then(data => {
                     if (!data || !data.source) return;
@@ -459,13 +473,13 @@
                     pixelHtml = `<span style="flex-shrink:0; display:inline-block; width:8px; height:8px; background:${colorHex}; border:1px solid #aaa; border-radius:1px;"></span><b style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${srcName}">${srcName}</b>`;
                     renderPixelSlot();
                 })
-                .catch(function() {});
+                .catch(function(err) { if(err.name === 'AbortError') return; });
 
             // Fetch Metadata
-            fetch(metaUrl)
+            fetch(metaUrl, { signal })
                 .then(response => response.json())
                 .then(data => {
-                    var el = document.getElementById(`tile-meta-${tile.z}-${tile.x}-${tile.y}`);
+                    var el = document.getElementById(`tile-meta-${clickId}`);
                     if (!el) return;
 
                     if (data.cache_status === 'miss') {
@@ -489,6 +503,7 @@
                                 var pb = (window.layerPriority && window.layerPriority[b.provider]) || 0;
                                 return pb - pa;
                             });
+                            // Reuse styling from legend
                             sourcesHtml = `<details style="margin-top:2px; cursor:pointer;"><summary style="font-weight:bold;">Tile Sources (${uniqueSources.length})</summary><ul style="margin:2px 0 0 0; padding-left:0; font-size:10px; list-style-type:none;">`;
                             uniqueSources.forEach(function(info) {
                                 var provName = info.provider || 'unknown';
@@ -513,7 +528,8 @@
                     }
                 })
                 .catch(err => {
-                    var el = document.getElementById(`tile-meta-${tile.z}-${tile.x}-${tile.y}`);
+                    if (err.name === 'AbortError') return;
+                    var el = document.getElementById(`tile-meta-${clickId}`);
                     if (el) el.innerHTML = '<span style="color:red">Meta Error</span>';
                 });
         });

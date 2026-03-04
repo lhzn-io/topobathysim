@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
-from topobathysim.runtime import get_fused_cache_path, run, should_consolidate
+from topobathysim.runtime import run, should_consolidate
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
@@ -193,6 +193,10 @@ SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
     "1",
     "yes",
 )
+
+# Tiling Constants
+TILE_SIZE_PX = 512
+TILE_PADDING_PX = 4  # Standard padding to avoid edge artifacts and ensure cache parity
 
 
 # So I can change the signature of render_png to accept an optional 'legend' dict.
@@ -488,6 +492,8 @@ async def get_elevation(
     zoom: int | None = Query(None, description="Preferred zoom level/resolution to check in cache"),
 ) -> ElevationResponse:
     try:
+        logger.info(f"Elevation Lookup: lat={lat}, lon={lon}, zoom={zoom}")
+
         # Check if we have any cached fused datasets for this coordinate
         # We start with the requested zoom, or the highest available in the tile cache
         base_cache_dir = Path(os.environ.get("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
@@ -516,22 +522,35 @@ async def get_elevation(
 
         for z in check_zooms:
             try:
+                # 1. Determine Tile Center Resolution
+                # We must match the resolution used during tile generation,
+                # which is based on the TILE CENTER latitude,
+                # not the specific point latitude.
                 tx, ty = deg2num(lat, lon, z)
                 bounds = tile_bounds_calc(tx, ty, z)
-                bbox = (bounds["west"], bounds["south"], bounds["east"], bounds["north"])
-
-                # Tile resolution in meters (approx at center Lat)
-                # This MUST match the calculation used in the tile endpoint to generate the cache key
                 center_lat = (bounds["north"] + bounds["south"]) / 2.0
-                res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
-                # Snap to 8 decimal places for consistency with runtime.py rounding if applicable,
-                # but the key should be identical if the float is the same.
+
+                n = 2.0**z
+                res_meters = 156543.03 * math.cos(math.radians(center_lat)) / n
                 res_meters = round(res_meters, 8)
 
-                cache_path = get_fused_cache_path(str(policy_path), bbox, resolution=res_meters)
+                # 2. Check Cache for the Standard Grid Cell containing this point
+                # We do NOT use padded_bbox here anymore because run() caches
+                # by standardized grid cells (0.05 deg), not by arbitrary tile bboxes.
+                try:
+                    from topobathysim.runtime import get_cache_info_for_point
+
+                    cache_path, key_hash = get_cache_info_for_point(str(policy_path), lon, lat, res_meters)
+                except ValueError:
+                    continue
+
+                logger.debug(
+                    f"Checking Elevation Cache: Z={z} res={res_meters} "
+                    f"point=({lon:.5f},{lat:.5f}) key={key_hash}"
+                )
 
                 if cache_path.exists():
-                    logger.debug(f"Elevation Cache Hit (Tile Z{z}): {cache_path.name}")
+                    logger.info(f"Elevation Cache Hit (Cell Z{z}): {cache_path.name}")
                     from filelock import FileLock
 
                     with FileLock(cache_path.with_suffix(".lock")):
@@ -551,6 +570,7 @@ async def get_elevation(
 
                     val = ds["elevation"].sel(x=x_m, y=y_m, method="nearest").item()
                     return ElevationResponse(elevation=float(val) if not np.isnan(val) else None)
+
             except Exception as e:
                 logger.debug(f"Failed to check/load tile cache at Z{z}: {e}")
                 continue
@@ -932,12 +952,15 @@ def get_xyz_tile(
 
     # Fetch slightly larger region than strictly necessary to prevent Web Mercator
     # interpolation NaNs at the tile edge
-    fetch_pad = pad_px + 2
+    fetch_pad = TILE_PADDING_PX
     req_west = west - dx_deg * fetch_pad
     req_east = east + dx_deg * fetch_pad
     req_south = south - dy_deg * fetch_pad
     req_north = north + dy_deg * fetch_pad
 
+    logger.info(
+        f"Tile Run Call: z={z} x={x} y={y} res={res_meters} bbox={(req_west, req_south, req_east, req_north)}"
+    )
     # Run Fusion
     try:
         ds = run(
@@ -946,6 +969,8 @@ def get_xyz_tile(
             resolution=res_meters,
             use_cache=True,
         )
+        # Add logging here
+        logger.info(f"Tile Fusion Result: res={res_meters} bbox={(req_west, req_south, req_east, req_north)}")
         logger.debug(f"/tiles run() returned ds with attrs: {ds.attrs}")
     except ValueError as e:
         # CRS Validation Error

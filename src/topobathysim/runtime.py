@@ -372,13 +372,15 @@ def _run_cell(
     return cast(xr.Dataset, ds)
 
 
-def get_fused_cache_path(
+def get_fused_cache_info(
     policy_path: str,
     bbox: tuple[float, float, float, float],
     resolution: float = 30.0,
-) -> Path:
-    """Returns the expected Path to a fused Zarr cache file for a given policy, bbox, and resolution."""
-    import hashlib
+) -> tuple[Path, str]:
+    """
+    Returns the expected Path and the hash key for a fused Zarr cache file.
+    This centralized function ensures metadata parity across all endpoints.
+    """
     import json
     import os
 
@@ -392,16 +394,51 @@ def get_fused_cache_path(
     else:
         cache_dir = Path(cache_dir_str).expanduser()
 
+    # MD5 Hashing logic (Standardized Precision: 8 decimals)
     key_dict = {
         "policy": policy.model_dump_json(),  # type: ignore
-        "cell": [round(x, 6) for x in bbox],
-        "res": resolution,
+        "cell": [round(x, 8) for x in bbox],
+        "res": round(resolution, 8),
         "crs": target_crs,
     }
     key_str = json.dumps(key_dict, sort_keys=True, default=str)
     key_hash = hashlib.md5(key_str.encode()).hexdigest()
 
-    return cache_dir / f"{key_hash}.zarr"
+    return cache_dir / f"{key_hash}.zarr", key_hash
+
+
+def get_cache_info_for_point(
+    policy_path: str,
+    lon: float,
+    lat: float,
+    resolution: float,
+) -> tuple[Path, str]:
+    """
+    Finds the fused cache file corresponding to the standard grid cell containing the point.
+    This ensures alignment with the tiling engine which caches by standard grid cells.
+    """
+    policy = load_policy(policy_path)
+    # Treat point as a degenerate bbox to verify grid cell alignment
+    cells, _ = _get_grid_cells((lon, lat, lon, lat), policy.crs)
+
+    if not cells:
+        # Should be covered by at least one cell if valid
+        # If outside area of use (rarely checked here), fallback
+        raise ValueError(f"Point {lon},{lat} not covered by any '{policy.crs}' grid cell.")
+
+    # There should only be one cell for a point
+    cell_bbox = cells[0]
+    return get_fused_cache_info(policy_path, cell_bbox, resolution)
+
+
+def get_fused_cache_path(
+    policy_path: str,
+    bbox: tuple[float, float, float, float],
+    resolution: float = 30.0,
+) -> Path:
+    """Legacy wrapper for get_fused_cache_info returning only the Path."""
+    path, _ = get_fused_cache_info(policy_path, bbox, resolution)
+    return path
 
 
 def run(
@@ -417,6 +454,31 @@ def run(
     """
     policy = load_policy(policy_path)
     target_crs = policy.crs
+
+    # If the bbox exactly matches a single grid cell, we can bypass the expensive tiling logic
+    # and directly check/write the singular cache entry.
+    # This is critical for /elevation hits because it requests the exact PADDED tile bbox.
+    is_standard_cell = False
+    try:
+        # We check if the requested bbox matches what _get_grid_cells would produce for a single tile
+        cells, _ = _get_grid_cells(bbox, target_crs)
+        if len(cells) == 1:
+            c = cells[0]
+            # Floating point tolerance
+            if all(abs(a - b) < 1e-10 for a, b in zip(bbox, c, strict=False)):
+                is_standard_cell = True
+    except Exception:
+        pass
+
+    if is_standard_cell:
+        # FAST PATH: Single cache-hit check for the whole request
+        cache_path, key_hash = get_fused_cache_info(
+            policy_path, bbox, resolution=resolution if resolution else 30.0
+        )
+        if use_cache and cache_path.exists():
+            logger.info(f"Fast Path Cache Hit: {cache_path.name}")
+            ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+            return ds.load()
 
     start_lon, start_lat, end_lon, end_lat = bbox
 
@@ -462,17 +524,10 @@ def run(
     cell_datasets = []
 
     for cell_bbox in cells:
-        # Generate stable cache key for the cell
-        key_dict = {
-            "policy": policy.model_dump_json(),  # type: ignore
-            "cell": [round(x, 6) for x in cell_bbox],
-            "res": resolution if resolution else 30.0,
-            "crs": target_crs,
-        }
-        key_str = json.dumps(key_dict, sort_keys=True, default=str)
-        key_hash = hashlib.md5(key_str.encode()).hexdigest()
-
-        cache_path = cache_dir / f"{key_hash}.zarr"
+        # Use centralized cache helper to ensure metadata parity across all endpoints
+        cache_path, key_hash = get_fused_cache_info(
+            policy_path, cell_bbox, resolution=resolution if resolution else 30.0
+        )
 
         ds_cell = None
         if use_cache and cache_path.exists():
