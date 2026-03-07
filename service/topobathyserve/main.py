@@ -1192,6 +1192,17 @@ def get_xyz_tile(
     return Response(content=data, media_type=media_type)
 
 
+@app.get("/policy/reload")
+async def reload_policy_cache() -> dict[str, object]:
+    from topobathysim.policy.loader import clear_policy_cache
+
+    clear_policy_cache()
+    return {
+        "status": "success",
+        "message": "Policy cache cleared",
+    }
+
+
 @app.post("/cache/clear")
 @app.get("/cache/clear")
 async def clear_cache(type: str = "output") -> dict[str, object]:

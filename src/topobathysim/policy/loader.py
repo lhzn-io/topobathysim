@@ -1,5 +1,6 @@
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ def hash_policy(content: dict[str, Any]) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
+@lru_cache(maxsize=32)
 def load_policy(path: str) -> FusionPolicy:
     """
     Load a policy from a YAML file.
@@ -33,6 +35,11 @@ def load_policy(path: str) -> FusionPolicy:
     policy = FusionPolicy(**content)
 
     return policy
+
+
+def clear_policy_cache() -> None:
+    """Clear the in-memory policy cache."""
+    load_policy.cache_clear()
 
 
 def generate_provider_legend(policy: FusionPolicy) -> dict[int, str]:
