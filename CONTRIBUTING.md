@@ -98,6 +98,20 @@ source .venv/bin/activate
 pip install -e ".[test]"
 ```
 
+## Troubleshooting & Known Issues
+
+### "Too many open files" (Errno 24) on macOS
+
+If you encounter `[Errno 24] Too many open files` when running large fusions or processing many tiles, you may be hitting the operating system's file descriptor limit. This is common when working with Zarr-backed datasets (like `ncei_bag`) which can open many small files simultaneously.
+
+On macOS, the default limit is often low (256). To fix this, increase the limit in your shell:
+
+```bash
+ulimit -n 10240
+```
+
+For a persistent fix, you may need to configure `limit maxfiles` via `launchctl`.
+
 ## Code quality tooling
 
 ### Pre-commit hooks
