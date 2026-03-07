@@ -138,7 +138,7 @@ class GBR100Provider(Provider):
 
             # Clip
             wd, sd, ed, nd = bbox
-            da = da.rio.clip_box(minx=wd, miny=sd, maxx=ed, maxy=nd)
+            da = da.rio.clip_box(minx=wd, miny=sd, maxx=ed, maxy=nd, allow_one_dimensional_raster=True)
             da.name = "elevation"
 
             return cast(xr.DataArray, da)

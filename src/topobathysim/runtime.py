@@ -176,6 +176,8 @@ def _run_cell(
         if variable.background is not None:
             elevation = elevation.fillna(variable.background)
 
+        logger.info(f"Execution order: {[s.provider for s in variable.steps]}")
+
         for step in variable.steps:
             provider_cls = registry.get_provider_class(step.provider)
             provider_instance = provider_cls()
@@ -189,13 +191,14 @@ def _run_cell(
                     filter=step.filter.model_dump() if step.filter else {},
                 )
             except ProviderNoDataError as e:
-                logger.debug(f"Provider {step.provider} has no data for this cell: {e}")
+                logger.info(f"{step.provider}: NoData - {e}")
                 continue
             except Exception as e:
-                logger.error(f"Provider {step.provider} exception: {e}", exc_info=True)
+                logger.error(f"{step.provider}: Failed to fetch - {e}", exc_info=True)
                 continue
 
             if fetched_data is None:
+                logger.info(f"[PROBE-RUNTIME] Provider {step.provider} returned None.")
                 continue
 
             # Extract per-provider source provenance from Dataset
@@ -251,15 +254,13 @@ def _run_cell(
                         fetched_data = fetched_data.drop_duplicates(dim=dim)
 
                 aligned_data = fetched_data.rio.reproject_match(elevation)
+
             except Exception as e:
                 logger.error(f"Reprojection/Index Alignment failed for {step.provider}: {e}")
                 # Try dropping duplicates forcefully again? Or continue
                 continue
 
             new_data_mask = aligned_data.notnull()
-
-            if not new_data_mask.any():
-                continue
 
             aligned_source_id = None
             if provider_source_id_da is not None:
@@ -277,6 +278,13 @@ def _run_cell(
                 except Exception as e:
                     logger.warning(f"Failed to reproject source_id mask for {step.provider}: {e}")
 
+            # Use provider data wherever elevation is valid. Source IDs may be missing after
+            # reprojection, so we can fall back to provider-level IDs for attribution.
+            provider_valid_mask = new_data_mask
+
+            if not provider_valid_mask.any():
+                continue
+
             # 4. Generate Provider Legend & IDs
             legend = generate_provider_legend(policy)
             provider_to_id = {v: k for k, v in legend.items()}
@@ -285,7 +293,7 @@ def _run_cell(
 
             # --- Pairwise Logic ---
             # 1. Initialize mask of pixels to be processed by default rule
-            remaining_mask = new_data_mask.copy()
+            remaining_mask = provider_valid_mask.copy()
 
             # Apply Transitions (Specific Overrides)
             for rule in step.transitions:
@@ -294,7 +302,7 @@ def _run_cell(
                     continue
 
                 # Identify overlap: Valid New Data AND Underlying Source == TargetID
-                transition_mask = new_data_mask & (source_elevation == target_id)
+                transition_mask = provider_valid_mask & (source_elevation == target_id)
 
                 if not transition_mask.any():
                     continue
@@ -329,9 +337,18 @@ def _run_cell(
 
             # Update Provenance (Global update for all valid pixels)
             if aligned_source_id is not None:
-                source_elevation = xr.where(new_data_mask, aligned_source_id, source_elevation)  # type: ignore
+                source_detail_mask = (
+                    provider_valid_mask & aligned_source_id.notnull() & (aligned_source_id > 0)
+                )
+                source_elevation = xr.where(
+                    source_detail_mask,
+                    aligned_source_id,
+                    source_elevation,  # type: ignore
+                )
+                source_fallback_mask = provider_valid_mask & (~source_detail_mask)
+                source_elevation = xr.where(source_fallback_mask, provider_id, source_elevation)  # type: ignore
             else:
-                source_elevation = xr.where(new_data_mask, provider_id, source_elevation)  # type: ignore
+                source_elevation = xr.where(provider_valid_mask, provider_id, source_elevation)  # type: ignore
             # Enforce 2D — xr.where can reintroduce a band dim from aligned_source_id
             if "band" in source_elevation.dims:
                 source_elevation = source_elevation.squeeze("band", drop=True)
@@ -655,9 +672,23 @@ def run(
         req_min_x, req_min_y = start_lon, start_lat
         req_max_x, req_max_y = end_lon, end_lat
 
-    epsilon = (merged_ds.x[1] - merged_ds.x[0]).values * 0.1
-    if epsilon < 0:
-        epsilon = -epsilon
+    # Use item access for coordinates to avoid potential AttributeError on property access
+    # if dataset structure is irregular
+    x_coords = merged_ds["x"]
+    # Fallback for single pixel or malformed grids
+    epsilon = float(abs((x_coords[1] - x_coords[0]).values * 0.1)) if len(x_coords) > 1 else 0.0001
+
+    # Ensure strictly python floats for slicing
+    req_min_x = float(req_min_x)
+    req_max_x = float(req_max_x)
+    req_min_y = float(req_min_y)
+    req_max_y = float(req_max_y)
+
+    # Re-verify numeric index to prevent slicing errors
+    from pandas.api.types import is_numeric_dtype
+
+    if not is_numeric_dtype(merged_ds.indexes["x"].dtype):
+        logger.warning(f"X Index is not numeric: {merged_ds.indexes['x'].dtype}. Slicing may fail.")
 
     merged_ds = merged_ds.sel(x=slice(req_min_x - epsilon, req_max_x + epsilon))
     if len(merged_ds.y) > 0 and merged_ds.y[0] > merged_ds.y[-1]:
@@ -683,5 +714,9 @@ def run(
         "mosaiced_from_cells": len(cells),
         "provenance_dict": global_provenance,
     }
-
-    return cast(xr.Dataset, merged_ds)
+    # PROBE FINAL RESULT
+    m_elev = merged_ds["elevation"]
+    m_nans = int(np.isnan(m_elev).sum())
+    m_total = m_elev.size
+    logger.info(f"[PROBE] Final: Shape={m_elev.shape}, NaNs={m_nans}/{m_total} ({100.0*m_nans/m_total:.1f}%)")
+    return merged_ds

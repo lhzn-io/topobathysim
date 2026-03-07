@@ -25,7 +25,6 @@ from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
 from .base import Provider, ProviderNoDataError
 from .registry import registry
-from .source_classifier import classify_source_provider
 
 logger = logging.getLogger(__name__)
 
@@ -137,15 +136,8 @@ class NoaaBlueTopoProvider(Provider):
                             survey_id = self.get_source_survey_id(mid_lat, mid_lon)
 
                         if survey_id:
-                            # Dynamic deduplication via classifier rubric
-                            preferred_provider = classify_source_provider(survey_id)
-                            if preferred_provider:
-                                logger.warning(
-                                    f"Skipping BlueTopo source '{survey_id}' "
-                                    f"(likely covered by Tier integration: {preferred_provider})"
-                                )
-                                continue
-
+                            # Keep BlueTopo data available as a resilient fallback.
+                            # Runtime fusion order resolves final precedence.
                             survey_id = survey_id.strip()
 
                         name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}_{pval_int}"
@@ -167,22 +159,27 @@ class NoaaBlueTopoProvider(Provider):
                     mid_lon = (west + east) / 2
                     survey_id = self.get_source_survey_id(mid_lat, mid_lon)
 
-                    # NEW LOGIC HERE: (Dynamic Deduplication)
                     if survey_id:
-                        preferred_provider = classify_source_provider(survey_id)
-                        if preferred_provider:
-                            logger.warning(
-                                f"Skipping BlueTopo source '{survey_id}' "
-                                f"(likely covered by Tier integration: {preferred_provider})"
-                            )
-                            continue
-
+                        # Keep BlueTopo data available as a resilient fallback.
+                        # Runtime fusion order resolves final precedence.
                         survey_id = survey_id.strip()
 
                     name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}"
+
+                    # Parse local resolution from survey_id (e.g. H13385_MB_50cm_MLLW -> 50cm)
+                    res_str = "4m (Default)"
+                    if survey_id:
+                        import re
+
+                        # Common patterns: _50cm_, _1m_, _2m_, _4m_
+                        match = re.search(r"_(\d+(?:\.\d+)?(?:m|cm))_", survey_id, re.IGNORECASE)
+                        if match:
+                            res_str = match.group(1)
+
                     provenance_dict[project_uid] = {
                         "name": name,
                         "provider": "noaa_bluetopo",
+                        "resolution": res_str,
                     }
                     p_source = xr.where(da_elev.notnull(), project_uid, 0).astype(np.uint32)
 
@@ -221,7 +218,14 @@ class NoaaBlueTopoProvider(Provider):
 
         # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds)
         try:
-            merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            merged = merged.rio.clip_box(
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
+            )
         except Exception as e:
             logger.warning(f"BlueTopo Clip failed (no overlap?): {e}")
             pass
@@ -236,10 +240,20 @@ class NoaaBlueTopoProvider(Provider):
         # Final Exact Clip to exact bbox (cleanup)
         with contextlib.suppress(Exception):
             merged_elev = merged["elevation"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             merged_src = merged["source_id"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             merged = xr.Dataset({"elevation": merged_elev, "source_id": merged_src})
 

@@ -107,6 +107,94 @@ def test_sample_elevation(mock_open_ds: MagicMock, mock_gebco_dataset: xr.Datase
     assert elev == 0.0
 
     # Test error before load
+    # Force reset of Singleton to ensure we get a fresh instance
+    Gebco2025._singleton = None
     gebco_unloaded = Gebco2025()
     with pytest.raises(RuntimeError):
         gebco_unloaded.sample_elevation(0, 0)
+
+
+def test_cache_loading_robustness(tmp_path: Any) -> None:
+    """Test that GEBCO provider correctly loads a cached Zarr file containing a Dataset (multiple vars)."""
+    from pathlib import Path
+
+    if isinstance(tmp_path, str):
+        tmp_path = Path(tmp_path)
+
+    # 1. Setup Cache Directory
+    # Note: GEBCO provider appends "gebco_2025" to the cache_dir provided in init.
+    # So if we pass cache_dir=X, it uses X/gebco_2025.
+    base_cache_dir = tmp_path / "gebco_cache_robust"
+    provider_cache_dir = base_cache_dir / "gebco_2025"
+    zarr_dir = provider_cache_dir / "zarr"
+    zarr_dir.mkdir(parents=True)
+
+    # 2. Create a dummy Multi-Variable Dataset (Simulating a cache saved with TID)
+    # Use distinct coordinates to avoid lock contention with other tests using n0_e0
+    lat = np.linspace(10.5, 11.5, 240)
+    lon = np.linspace(10.5, 11.5, 240)
+
+    da_elev = xr.DataArray(
+        np.random.rand(240, 240),
+        coords={"lat": lat, "lon": lon},
+        dims=("lat", "lon"),
+        name="elevation",
+    )
+    da_elev.rio.write_crs("EPSG:4326", inplace=True)
+
+    da_source_id = xr.DataArray(
+        np.zeros((240, 240), dtype=np.uint8),
+        coords={"lat": lat, "lon": lon},
+        dims=("lat", "lon"),
+        name="source_id",
+    )
+
+    ds_cache = xr.Dataset({"elevation": da_elev, "source_id": da_source_id})
+    ds_cache = ds_cache.rio.write_crs("EPSG:4326")
+
+    # Save as Zarr to the expected path for tile n10_e10
+    tile_key = "gebco_2025_n10_e10"
+    cache_path = zarr_dir / f"{tile_key}.zarr"
+
+    ds_cache.to_zarr(cache_path, mode="w", consolidated=False)
+
+    # 3. Initialize Provider and Fetch
+    # Reset Singleton and class state to ensure we get a fresh instance with our cache_dir
+    # and no lingering mock datasets from previous tests.
+    Gebco2025._singleton = None
+    Gebco2025._ds_remote = None
+    Gebco2025._tid_remote = None
+
+    # Request bounds covering n10_e10
+    provider = Gebco2025(north=11, south=10, west=10, east=11, cache_dir=str(base_cache_dir))
+
+    # Assert path matches
+    expected_path = Path(provider.cache_dir) / "zarr" / f"{tile_key}.zarr"
+    assert cache_path.resolve() == expected_path.resolve(), f"{cache_path} vs {expected_path}"
+    assert cache_path.exists(), "Cache file does not exist!"
+
+    # Mock open_dataset to fail fast if it tries to hit remote URL (starts with dap)
+    # But allow local file reads
+    real_open_dataset = xr.open_dataset
+
+    def side_effect(filename_or_obj: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(filename_or_obj, str) and filename_or_obj.startswith("dap"):
+            # If we get here, it means we missed the cache!
+            raise RuntimeError(f"Attempted remote fetch: {filename_or_obj} - Cache Missed!")
+        return real_open_dataset(filename_or_obj, *args, **kwargs)
+
+    with patch("xarray.open_dataset", side_effect=side_effect):
+        # Should not raise ValueError about "more than one data variable"
+        try:
+            da_fetched = provider.fetch()
+        except ValueError as e:
+            pytest.fail(f"Fetching from multi-variable cache failed: {e}")
+        except RuntimeError as e:
+            pytest.fail(f"{e}")
+
+    assert da_fetched is not None
+    if isinstance(da_fetched, xr.Dataset):
+        assert "elevation" in da_fetched
+        assert "source_id" in da_fetched
+    else:
+        assert da_fetched.name == "elevation"

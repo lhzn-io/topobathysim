@@ -227,9 +227,19 @@ class GEBCO2025Provider(Provider):
                                     "ignore",
                                     message="Variable.s. referenced in grid_mapping not in variables",
                                 )
-                                da_tile = xr.open_dataarray(
-                                    cache_path, engine="zarr", chunks="auto", decode_coords="all"
-                                )
+                                try:
+                                    da_tile = xr.open_dataset(
+                                        cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                    )
+                                    if "elevation" not in da_tile:
+                                        # Fallback to DataArray
+                                        da_tile = xr.open_dataarray(
+                                            cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                        )
+                                except Exception:
+                                    da_tile = xr.open_dataarray(
+                                        cache_path, engine="zarr", chunks="auto", decode_coords="all"
+                                    )
                         else:
                             logger.info(f"GEBCO Zarr Cache Miss: {tile_key}")
                             try:

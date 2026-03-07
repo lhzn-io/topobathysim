@@ -184,8 +184,8 @@ def get_policy_path() -> Path:
 
 
 # Visualization Constants
-GLOBAL_VMIN = -64.0
-GLOBAL_VMAX = 128.0
+GLOBAL_VMIN = -2000.0
+GLOBAL_VMAX = 1200.0
 
 # Feature Flags
 SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
@@ -246,6 +246,11 @@ def render_png(
 
     # Source Visualization Style
     if style == "source":
+        # Safeguard: Ensure source IDs are integers. Floating point noise or NaNs
+        # can cause np.unique() to explode (O(N^2) loop), leading to timeouts/crashes.
+        if not np.issubdtype(vals.dtype, np.integer):
+            vals = np.nan_to_num(vals, nan=0).astype(np.int32)
+
         if pad > 0:
             vals = vals[pad:-pad, pad:-pad]
         h, w = vals.shape
@@ -376,7 +381,14 @@ def render_png(
     norm: mcolors.Normalize | None = None
 
     if style in ["chart", "default"]:
+        # Use standard Blues_r for water, but truncate it before pure white.
+        # Rationale: Standard Blues_r hits pure white at 1.0 (0m).
+        # This washes out shallow texture because hillshading on white is weak.
+        # The standalone "Blues" style looks better because it normalizes VMIN-VMAX linearly,
+        # placing 0m (~60% of range) at a nice pale blue (not white).
+        # We manually emulate this by sampling Blues_r only up to 0.7 for water.
         blues = plt.get_cmap("Blues_r")
+
         land_colors = [
             (0.0, "#F7E5B5"),
             (0.2, "lightgreen"),
@@ -387,7 +399,8 @@ def render_png(
         land_cmap = mcolors.LinearSegmentedColormap.from_list("land_custom", land_colors)
 
         n_bins = 256
-        colors_water = blues(np.linspace(0.0, 1.0, n_bins))
+        # Truncate water colormap at 0.7 to keep shallowest water pale blue (not white)
+        colors_water = blues(np.linspace(0.0, 0.7, n_bins))
         colors_land = land_cmap(np.linspace(0.0, 1.0, n_bins))
 
         colors_combined = np.vstack((colors_water, colors_land))
@@ -1008,7 +1021,11 @@ def get_xyz_tile(
 
             # Add 1x pixel padding specifically for PNG Hillshade rendering to avoid 3x3 kernel edge artifacts
             n_dim = tile_size + 2 * pad_px
-            target_x = np.linspace(min_x_m - dx_m * (pad_px - 0.5), max_x_m + dx_m * (pad_px - 0.5), n_dim)
+            target_x = np.linspace(
+                min_x_m - dx_m * (pad_px - 0.5),
+                max_x_m + dx_m * (pad_px - 0.5),
+                n_dim,
+            )
             target_y = np.linspace(
                 max_y_m + dy_m * (pad_px - 0.5), min_y_m - dy_m * (pad_px - 0.5), n_dim
             )  # North up
@@ -1017,7 +1034,10 @@ def get_xyz_tile(
             ds_attrs = ds.attrs
             ds_elev = ds["elevation"].interp(x=target_x, y=target_y, method="linear")
             if "source_elevation" in ds:
+                # Ensure integer source IDs after interpolation
+                # (nearest maintains values, but NaNs promote to float)
                 ds_src = ds["source_elevation"].interp(x=target_x, y=target_y, method="nearest")
+                ds_src = ds_src.fillna(0).astype("int32")
                 ds = xr.Dataset({"elevation": ds_elev, "source_elevation": ds_src})
             else:
                 ds = xr.Dataset({"elevation": ds_elev})
@@ -1213,6 +1233,29 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
                 if p.exists():
                     shutil.rmtree(p)
                     deleted.append(subdir)
+
+        if type in ["orphaned", "cleanup", "all"]:
+            count_locks = 0
+            count_tmps = 0
+            try:
+                for root, _, files in os.walk(cache_root):
+                    for file in files:
+                        if file.endswith(".lock") or ".tmp" in file:
+                            try:
+                                fp = Path(root) / file
+                                fp.unlink(missing_ok=True)
+                                if file.endswith(".lock"):
+                                    count_locks += 1
+                                else:
+                                    count_tmps += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to delete orphaned file {file}: {e}")
+
+                if count_locks > 0 or count_tmps > 0:
+                    deleted.append(f"orphaned_locks({count_locks})")
+                    deleted.append(f"orphaned_tmps({count_tmps})")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup orphaned files: {e}")
 
         return {
             "status": "success",

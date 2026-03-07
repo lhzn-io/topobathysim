@@ -149,10 +149,20 @@ class CUDEMProvider(Provider):
         # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds) to avoid reprojecting full tile
         try:
             final_elev = merged_ds["elevation"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             final_src = merged_ds["source_id"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
         except Exception as e:
@@ -173,10 +183,20 @@ class CUDEMProvider(Provider):
         # This ensures pixel alignment with the requested window
         with contextlib.suppress(Exception):
             final_elev = merged_ds["elevation"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             final_src = merged_ds["source_id"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
 
@@ -208,30 +228,53 @@ class CUDEMProvider(Provider):
         lock_path = self.index_path.with_suffix(".lock")
 
         with FileLock(lock_path):
-            # 1. Download Index Zip
+            # 1. Download Index Zip (Atomic)
             if not self.index_path.exists():
                 url = f"{self.BASE_S3_URL}/{self.TILE_INDEX_ZIP}"
                 logger.info(f"Downloading CUDEM Tile Index from {url}...")
                 try:
                     r = requests.get(url, stream=True, timeout=60)
                     r.raise_for_status()
-                    with open(self.index_path, "wb") as f:
+                    temp_zip = self.index_path.with_suffix(".tmp")
+                    with open(temp_zip, "wb") as f:
                         for chunk in r.iter_content(chunk_size=8192):
                             f.write(chunk)
+                    temp_zip.rename(self.index_path)
                 except Exception as e:
                     logger.error(f"Failed to download CUDEM Index: {e}")
+                    if self.index_path.exists():  # Cleanup if we somehow left a mess
+                        self.index_path.unlink()
                     return
 
-            # 2. Extract Shapefile
-            if not self.index_shp_dir.exists():
+            # 2. Extract Shapefile (Atomic & Robust)
+            # Check for valid content, not just directory existence
+            has_shapes = False
+            if self.index_shp_dir.exists():
+                has_shapes = any(self.index_shp_dir.rglob("*.shp"))
+
+            if not has_shapes:
+                if self.index_shp_dir.exists():
+                    import shutil
+
+                    shutil.rmtree(self.index_shp_dir)
+
                 try:
+                    temp_extract_dir = self.index_shp_dir.with_name(self.index_shp_dir.name + "_tmp")
+                    if temp_extract_dir.exists():
+                        import shutil
+
+                        shutil.rmtree(temp_extract_dir)
+
                     with zipfile.ZipFile(self.index_path, "r") as z:
-                        z.extractall(self.index_shp_dir)
+                        z.extractall(temp_extract_dir)
+
+                    temp_extract_dir.rename(self.index_shp_dir)
                 except Exception as e:
                     logger.error(f"Failed to unzip CUDEM Index: {e}")
                     return
 
         # 3. Load GDF
+
         try:
             shps = list(self.index_shp_dir.glob("*.shp"))
             if not shps:
@@ -303,9 +346,14 @@ class CUDEMProvider(Provider):
                     logger.warning(f"CUDEM Tile 404/Error: {url}")
                     return None
 
-                with open(local_path, "wb") as f:
+                # Write to temp file first for atomicity
+                temp_path = local_path.with_suffix(".tmp")
+                with open(temp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=16384):
                         f.write(chunk)
+
+                # Atomic rename
+                temp_path.rename(local_path)
 
                 Path(lock_path).unlink(missing_ok=True)
                 return local_path
@@ -313,7 +361,7 @@ class CUDEMProvider(Provider):
         except Exception as e:
             logger.error(f"Failed to download CUDEM tile {url}: {e}")
             if local_path.exists():
-                local_path.unlink()
+                local_path.unlink(missing_ok=True)
             return None
 
     def load_tile(self, row: Any, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
@@ -369,10 +417,24 @@ class CUDEMProvider(Provider):
                 if da_final.size > 0:
                     da_final = da_final.chunk({"y": 1024, "x": 1024})
                     da_final.name = "elevation"
-                    da_final.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
+
+                    # Atomic Zarr Write
+                    zarr_temp = zarr_path.with_suffix(".tmp.zarr")
+                    if zarr_temp.exists():
+                        import shutil
+
+                        shutil.rmtree(zarr_temp)
+
+                    da_final.to_zarr(zarr_temp, mode="w", consolidated=should_consolidate())
+                    zarr_temp.rename(zarr_path)
+
                     return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
             except Exception as e:
                 logger.warning(f"Zarr cache write failed: {e}")
+                if zarr_temp.exists():
+                    import shutil
+
+                    shutil.rmtree(zarr_temp)
 
             return da_final
 

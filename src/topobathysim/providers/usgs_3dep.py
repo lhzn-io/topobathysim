@@ -305,7 +305,9 @@ class Usgs3DepProvider(Provider):
                                             f"Retrying with EPSG:4326."
                                         )
 
-                                da = da.rio.clip_box(*clip_bbox, crs=clip_crs)
+                                da = da.rio.clip_box(
+                                    *clip_bbox, crs=clip_crs, allow_one_dimensional_raster=True
+                                )
                             except Exception as e:
                                 # If clip fails (no overlap?), this item is useless for the requested bbox.
                                 # Skip it to avoid downloading huge irrelevant files.

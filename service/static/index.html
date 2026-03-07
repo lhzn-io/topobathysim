@@ -509,7 +509,11 @@
                                 var provName = info.provider || 'unknown';
                                 var colorHex = (window.layerColors && window.layerColors[provName]) ? window.layerColors[provName] : '#808080';
                                 var displayName = info.name || 'Unknown';
-                                sourcesHtml += `<li style="margin-bottom:2px; display:flex; align-items:center; gap:4px;"><span style="flex-shrink:0; display:inline-block; width:8px; height:8px; background-color:${colorHex}; border:1px solid #aaa; border-radius:1px;"></span><span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:240px;" title="${displayName}">${displayName}</span></li>`;
+                                if (info.resolution) {
+                                    displayName += ` (${info.resolution})`;
+                                }
+                                var tooltip = displayName;
+                                sourcesHtml += `<li style="margin-bottom:2px; display:flex; align-items:center; gap:4px;"><span style="flex-shrink:0; display:inline-block; width:8px; height:8px; background-color:${colorHex}; border:1px solid #aaa; border-radius:1px;"></span><span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:240px;" title="${tooltip}">${displayName}</span></li>`;
                             });
                             sourcesHtml += `</ul></details>`;
                         } else {

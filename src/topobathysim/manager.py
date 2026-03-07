@@ -211,6 +211,7 @@ class BathyManager:
                                         maxy=north,
                                         crs="EPSG:4326",
                                         auto_expand=True,
+                                        allow_one_dimensional_raster=True,
                                     )
                                     if d_sliced.size > 0:
                                         return (idx, d_sliced)

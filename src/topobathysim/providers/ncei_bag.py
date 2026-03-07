@@ -9,6 +9,7 @@ downloading, caching, and reading of BAG files.
 import contextlib
 import json
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any, ClassVar, cast
 
 import numpy as np  # Added numpy import
 import requests  # type: ignore
+import rioxarray as rxr
 import xarray as xr
 from filelock import FileLock
 from rioxarray.merge import merge_arrays
@@ -31,6 +33,10 @@ logger = logging.getLogger(__name__)
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (HTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+# Discovery requests are expensive immediately after cache purges.
+# Allow a longer read timeout and make it tunable via env.
+BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT", "60"))
 
 
 @concurrent_lru_cache()
@@ -78,12 +84,53 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
 
             logger.info(f"BAG Zarr Cache Miss: {zarr_path.name}")
 
-            import rioxarray as rxr
-
             # Use chunks to initiate Delayed/Lazy loading via Dask.
             # Prevents OOM crashes when reading large BAG files.
             with ignore_specific_gdal_warnings("cornerPoints not consistent with resolution"):
-                da_raw = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+                da_raw: Any = rxr.open_rasterio(local_path, chunks={"x": 2048, "y": 2048}, masked=True)
+
+                # VR BAG Detection & Handling:
+                # 1. Filename Heuristic: Often contains "_VR_" or "_Variable_Resolution_"
+                # 2. Metadata Heuristic: Contains MIN_RESOLUTION_X tag
+                # 3. Dimension Heuristic: Tiny 256x256 grid for a large >1MB file (GDAL default supergrid)
+
+                is_vr_bag = False
+                fname_lower = local_path.name.lower()
+                if "_vr_" in fname_lower or "_variable_resolution_" in fname_lower:
+                    is_vr_bag = True
+                    logger.info(f"Detected VR BAG by filename pattern: {local_path.name}")
+
+                if not is_vr_bag:
+                    if isinstance(da_raw, list):
+                        pass
+                    else:
+                        # Check attributes (rioxarray loads GDAL metadata into attrs)
+                        attrs = da_raw.attrs
+                        if "MIN_RESOLUTION_X" in attrs or "MAX_RESOLUTION_X" in attrs:
+                            is_vr_bag = True
+                            logger.info(f"Detected VR BAG metadata in {local_path.name}")
+
+                        # Heuristic: Tiny grid implies supergrid if file is large (e.g. >1MB but 256x256)
+                        if not is_vr_bag and hasattr(da_raw, "shape"):
+                            shape = da_raw.shape
+                            is_tiny = len(shape) >= 2 and shape[-1] <= 512 and shape[-2] <= 512
+                            is_large = local_path.stat().st_size > 1_000_000  # > 1MB
+
+                            if is_tiny and is_large:
+                                is_vr_bag = True
+                                logger.info(
+                                    f"Detected potential VR BAG via dimensions {shape} "
+                                    f"for large file {local_path.name}"
+                                )
+
+                if is_vr_bag:
+                    # Re-open VR BAGs with interpolation to merge supergrids (GDAL >= 3.8 feature).
+                    # Prevents sparse "screen door" artifacts from raw supergrid sampling.
+                    logger.info(f"Re-opening VR BAG {local_path.name} with MODE='INTERPOLATED'...")
+                    da_raw = rxr.open_rasterio(
+                        local_path, chunks={"x": 2048, "y": 2048}, masked=True, MODE="INTERPOLATED"
+                    )
+
                 da: xr.DataArray
                 if isinstance(da_raw, list):
                     da = cast(xr.DataArray, da_raw[0])
@@ -210,6 +257,26 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
         return None
 
 
+def _filter_block(block: Any, threshold: float = 50.0) -> Any:
+    """
+    Apply median filter to a block.
+    """
+    if block.size == 0:
+        return block
+
+    from scipy.ndimage import median_filter
+
+    # Apply standard median filter (fast, but NaN propagates)
+    med = median_filter(block, size=3)
+    diff = np.abs(block - med)
+
+    if not np.issubdtype(block.dtype, np.floating):
+        block = block.astype(np.float32)
+
+    # Mask spikes exceeding threshold with NaN
+    return np.where(diff > threshold, np.nan, block)
+
+
 def clean_data_deviation(da: xr.DataArray, threshold: float = 50.0) -> xr.DataArray:
     """
     Apply a 'Deviation from Median' filter to remove spikes.
@@ -223,41 +290,64 @@ def clean_data_deviation(da: xr.DataArray, threshold: float = 50.0) -> xr.DataAr
         xr.DataArray: Filtered data
     """
     try:
-        from scipy.ndimage import median_filter
+        from functools import partial
 
-        def _filter_block(block: Any) -> Any:
-            if block.size == 0:
-                return block
+        logger.debug(f"clean_data_deviation: shape={da.shape}, chunks={da.chunks}, threshold={threshold}")
 
-            # Apply standard median filter (fast, but NaN propagates)
-            med = median_filter(block, size=3)
-            diff = np.abs(block - med)
-
-            if not np.issubdtype(block.dtype, np.floating):
-                block = block.astype(np.float32)
-
-            # Mask spikes exceeding threshold with NaN
-            return np.where(diff > threshold, np.nan, block)
+        filter_func = partial(_filter_block, threshold=threshold)
 
         if da.chunks is not None:
             # Apply via dask map_overlap for chunked processing
+            # Provide meta to avoid auto-computation of the first chunk
+            meta = np.array([], dtype=da.dtype)
+
             cleaned_dask = da.data.map_overlap(
-                _filter_block,
+                filter_func,
                 depth=1,
                 boundary="reflect",
                 dtype=da.dtype,
+                meta=meta,
             )
 
             # Return new DataArray with same coords
             return xr.DataArray(cleaned_dask, coords=da.coords, dims=da.dims, attrs=da.attrs)
         else:
             # Numpy array - Direct application
-            cleaned_np = _filter_block(da.values)
+            # If array is massive, this will block!
+            logger.warning("clean_data_deviation running on eager (numpy) array. This may hang.")
+            cleaned_np = _filter_block(da.values, threshold=threshold)
             return xr.DataArray(cleaned_np, coords=da.coords, dims=da.dims, attrs=da.attrs)
 
     except Exception as e:
-        logger.warning(f"Failed to apply cleaning filter: {e}")
+        logger.warning(f"Failed to apply cleaning filter: {e}", exc_info=True)
         return da
+
+
+def _depth_range_within_threshold(da: xr.DataArray, threshold: float) -> bool:
+    """
+    Cheap guard for spike filtering.
+
+    If the total finite depth range is already within the max deviation threshold,
+    the median-deviation filter cannot remove any values and can be skipped.
+    """
+    if threshold <= 0:
+        return False
+
+    try:
+        min_raw = da.min(skipna=True).values
+        max_raw = da.max(skipna=True).values
+
+        min_val = float(np.asarray(min_raw).squeeze())
+        max_val = float(np.asarray(max_raw).squeeze())
+
+        if not np.isfinite(min_val) or not np.isfinite(max_val):
+            return True
+
+        depth_range = max_val - min_val
+        return depth_range <= threshold
+    except Exception as e:
+        logger.debug(f"Depth range pre-check failed; applying filter conservatively: {e}")
+        return False
 
 
 @contextmanager
@@ -608,6 +698,7 @@ class BAGDiscovery:
 
         logger.debug(f"BAG Discovery Cache Miss: {bbox_key} — querying NCEI ArcGIS API")
         found_urls: list[str] = []
+        query_succeeded = False
         try:
             from pyproj import Transformer
 
@@ -615,6 +706,17 @@ class BAGDiscovery:
             transformer = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
             minx, miny = transformer.transform(swest, ssouth)
             maxx, maxy = transformer.transform(seast, snorth)
+
+            # CRITICAL FIX: Buffer the query envelope to ensure intersections with large,
+            # complex polygons (like W00387) even if the tile is fully interior.
+            # Without this buffer, the ArcGIS API spatial index often fails to return
+            # containment results for small query windows inside search features.
+            # Buffer by ~5km (in EPSG:3857 units).
+            buffer_meters = 5000.0
+            minx -= buffer_meters
+            miny -= buffer_meters
+            maxx += buffer_meters
+            maxy += buffer_meters
 
             headers = {"User-Agent": USER_AGENT}
 
@@ -634,9 +736,15 @@ class BAGDiscovery:
             }
 
             logger.info(f"Querying NCEI by BBox: {swest},{ssouth},{seast},{snorth}")
-            resp = requests.get(cls.QUERY_URL, params=params, headers=headers, timeout=20)
+            resp = requests.get(
+                cls.QUERY_URL,
+                params=params,
+                headers=headers,
+                timeout=(10, BAG_DISCOVERY_TIMEOUT_SECONDS),
+            )
             resp.raise_for_status()
             data = resp.json()
+            query_succeeded = True
 
             if "features" in data:
                 import re
@@ -720,9 +828,13 @@ class BAGDiscovery:
         except Exception as e:
             logger.warning(f"BBox query failed: {e}")
 
-        # 2. Persist to disk (even empty results, to avoid re-querying known-empty bboxes)
-        cls._update_discovery_cache(bbox_key, found_urls)
-        logger.debug(f"BAG Discovery Cache Created: {bbox_key} ({len(found_urls)} urls persisted)")
+        # 2. Persist to disk only when query succeeded.
+        # Avoid caching transient network failures as permanent empty results.
+        if query_succeeded:
+            cls._update_discovery_cache(bbox_key, found_urls)
+            logger.debug(f"BAG Discovery Cache Created: {bbox_key} ({len(found_urls)} urls persisted)")
+        else:
+            logger.debug(f"BAG Discovery Cache Skipped: {bbox_key} (query failed)")
         return found_urls
 
 
@@ -793,7 +905,14 @@ class BAGProvider(Provider):
                 # This drastically reduces memory usage for large surveys
                 try:
                     # Clip using EPSG:4326 bounds. rioxarray handles transformations.
-                    da = da.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+                    da = da.rio.clip_box(
+                        minx=west,
+                        miny=south,
+                        maxx=east,
+                        maxy=north,
+                        crs="EPSG:4326",
+                        allow_one_dimensional_raster=True,
+                    )
                 except Exception as e:
                     # rioxarray.exceptions.NoDataInBounds (or similar) - Skip this tile
                     logger.debug(f"BAG tile empty after clip (url={url}): {e}")
@@ -802,6 +921,27 @@ class BAGProvider(Provider):
                 if da is None or da.size == 0:
                     continue
 
+                da_work: xr.DataArray = cast(xr.DataArray, da)
+
+                # Reproject individual chunk to target CRS
+                # OPTIMIZATION: Reproject (and downsample) BEFORE filtering to reduce data volume
+                if crs and da_work.rio.crs and da_work.rio.crs != crs:
+                    try:
+                        # Optional: Pass resolution if provided to enforce downsampling early
+                        reproj_knn = {}
+                        # If target is projected (meters) and we have input_res (meters)
+                        # Actually EPSG:4326 is degrees, so resolution (meters) needs care,
+                        # but rioxarray handles 'resolution' arg if units match or if it assumes target units.
+                        # Using 'resolution' with 4326 target might yield weird degrees.
+                        # Safer to let rioxarray/gdal handle it or only pass if not 4326.
+                        if resolution and "EPSG:4326" not in crs:
+                            reproj_knn["resolution"] = resolution
+
+                        da_work = cast(xr.DataArray, da_work.rio.reproject(crs, **reproj_knn))
+                    except Exception as e:
+                        logger.warning(f"Reprojection failed for BAG segment: {e}")
+                        continue
+
                 # --- CLEANING / FILTERING ---
                 filter_cfg = kwargs.get("filter", {})
 
@@ -809,42 +949,49 @@ class BAGProvider(Provider):
                 max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
 
                 if max_dev:
-                    logger.info(f"Applying BAG Deviation Filter (Threshold={max_dev}m) to {url}")
-                    da = clean_data_deviation(da, threshold=float(max_dev))
-
-                # Reproject individual chunk to target CRS
-                if crs and da.rio.crs and da.rio.crs != crs:
-                    try:
-                        # Optional: Pass resolution if provided to enforce downsampling early
-                        reproj_knn = {}
-                        # If target is projected (meters) and we have input_res (meters)
-                        if resolution and "EPSG:4326" not in crs:
-                            reproj_knn["resolution"] = resolution
-
-                        da = da.rio.reproject(crs, **reproj_knn)
-                    except Exception as e:
-                        logger.warning(f"Reprojection failed for BAG segment: {e}")
-                        continue
+                    threshold = float(max_dev)
+                    if _depth_range_within_threshold(da_work, threshold):
+                        logger.info(
+                            f"Skipping BAG Deviation Filter (Threshold={threshold}m): "
+                            f"depth range within threshold for {url}"
+                        )
+                    else:
+                        logger.info(f"Applying BAG Deviation Filter (Threshold={threshold}m) to {url}")
+                        da_work = clean_data_deviation(da_work, threshold=threshold)
 
                 import hashlib
 
                 filename = url.split("/")[-1].replace(".bag", "")
                 project_uid = int(hashlib.md5(filename.encode()).hexdigest(), 16) % 100000 + 40000
+
+                # Parse resolution from filename (e.g. H13385_MB_50cm_MLLW -> 50cm)
+                res_str = "Unknown"
+                import re
+
+                # Match 50cm, 0.5m, 1m, 4m
+                m_cm = re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", filename, re.IGNORECASE)
+                m_m = re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", filename, re.IGNORECASE)
+                if m_cm:
+                    res_str = f"{m_cm.group(1)}cm"
+                elif m_m:
+                    res_str = f"{m_m.group(1)}m"
+
                 provenance_dict[project_uid] = {
                     "name": filename,
                     "provider": "ncei_bag",
+                    "resolution": res_str,
                 }
 
-                da.name = "elevation"
-                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+                da_work.name = "elevation"
+                p_source = xr.where(da_work.notnull(), project_uid, 0).astype(np.uint32)
                 p_source.name = "source_id"
                 p_source.rio.write_nodata(0, inplace=True)
                 p_source.attrs["_FillValue"] = 0
 
-                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
-                if da.rio.crs:
-                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
-                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+                p_ds = xr.Dataset({"elevation": da_work, "source_id": p_source})
+                if da_work.rio.crs:
+                    p_ds.rio.write_crs(da_work.rio.crs, inplace=True)
+                p_ds.rio.write_transform(da_work.rio.transform(), inplace=True)
 
                 project_layers.append(p_ds)
 
@@ -891,10 +1038,20 @@ class BAGProvider(Provider):
         # Ensure exact bounds (reprojection might have introduced slight over-run)
         with contextlib.suppress(Exception):
             final_elev = merged_ds["elevation"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             final_src = merged_ds["source_id"].rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
             merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
 

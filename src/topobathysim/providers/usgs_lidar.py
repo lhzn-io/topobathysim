@@ -329,7 +329,7 @@ class UsgsLidarProvider(Provider):
                 if bounds:
                     try:
                         # Use EPSG:4326 for clipping bounds
-                        ds = ds.rio.clip_box(*bounds, crs="EPSG:4326")
+                        ds = ds.rio.clip_box(*bounds, crs="EPSG:4326", allow_one_dimensional_raster=True)
                     except Exception as clip_err:
                         logger.debug(
                             f"Lidar Zarr {zarr_path.name} does not intersect requested bounds: {clip_err}"
@@ -451,7 +451,7 @@ class UsgsLidarProvider(Provider):
             # Return filtered
             if bounds:
                 # Use EPSG:4326 for clipping bounds (which are passed as WGS84)
-                da = da.rio.clip_box(*bounds, crs="EPSG:4326")
+                da = da.rio.clip_box(*bounds, crs="EPSG:4326", allow_one_dimensional_raster=True)
 
             # Create provenance Dataset
             import hashlib

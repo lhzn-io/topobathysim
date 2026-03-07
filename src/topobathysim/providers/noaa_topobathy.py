@@ -185,7 +185,12 @@ class NoaaTopobathyProvider(Provider):
                         try:
                             # Use 4326 clip since index is 4326
                             da = da_fetched.rio.clip_box(
-                                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                                minx=west,
+                                miny=south,
+                                maxx=east,
+                                maxy=north,
+                                crs="EPSG:4326",
+                                allow_one_dimensional_raster=True,
                             )
                         except Exception:
                             # Empty after clip
@@ -224,9 +229,30 @@ class NoaaTopobathyProvider(Provider):
                             project_uid = int(hashlib.md5(pid.encode()).hexdigest(), 16) % 100000 + 10000
 
                         project_name = self._projects.get(pid, f"Project {pid}")
+
+                        # Try to find resolution in spatial index
+                        res_str = "Unknown"
+                        if (
+                            self._spatial_index is not None
+                            and "resolution_meters" in self._spatial_index.columns
+                        ):
+                            try:
+                                project_ids = self._spatial_index["project_id"].astype(str)
+                                row = self._spatial_index[project_ids == str(pid)]
+                                if not row.empty:
+                                    val = row.iloc[0]["resolution_meters"]
+                                    if val is not None:
+                                        import numpy as np
+
+                                        if not np.isnan(val):
+                                            res_str = f"{float(val):.2f}m"
+                            except Exception:
+                                pass
+
                         provenance_dict[project_uid] = {
                             "name": project_name,
                             "provider": "noaa_topobathy",
+                            "resolution": res_str,
                         }
 
                         p_merged.name = "elevation"
@@ -264,9 +290,21 @@ class NoaaTopobathyProvider(Provider):
         # 4. Final Clip
         with contextlib.suppress(Exception):
             final_elev = final_elev.rio.clip_box(
-                minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326"
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
             )
-            final_src = final_src.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north, crs="EPSG:4326")
+            final_src = final_src.rio.clip_box(
+                minx=west,
+                miny=south,
+                maxx=east,
+                maxy=north,
+                crs="EPSG:4326",
+                allow_one_dimensional_raster=True,
+            )
 
         final_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
         # Ensure CRS is maintained after merge and clip
@@ -816,11 +854,23 @@ class NoaaTopobathyProvider(Provider):
                 # If the index has 'is_topobathy' column
                 if "is_topobathy" in self._spatial_index.columns:
                     if target_type == "topobathy":
-                        # Candidates must be True
-                        candidates = candidates[candidates["is_topobathy"]]
+                        # Candidates must be True OR have "topobathy"/"bathymetry" in the project name
+                        # This fallback is crucial for datasets where XML metadata parsing missed the
+                        # 'is_topobathy' flag but the project name clearly indicates it.
+                        is_flagged = candidates["is_topobathy"].fillna(False).astype(bool)
+
+                        # Case-insensitive name check
+                        name_match = (
+                            candidates["project_name"]
+                            .astype(str)
+                            .str.contains("topobathy|bathymetr", case=False, regex=True)
+                        )
+
+                        candidates = candidates[is_flagged | name_match]
                     else:
                         # Candidates must be False or NaN (using ~ for inversion of True,
                         # but handling NaNs carefully)
+
                         # We treat NaN as False (Topographic)
                         mask = ~candidates["is_topobathy"].fillna(False).astype(bool)
                         candidates = candidates[mask]
@@ -1145,7 +1195,7 @@ class NoaaTopobathyProvider(Provider):
                 da = xr.open_dataarray(full_zarr_path, engine="zarr", chunks="auto", decode_coords="all")
                 logger.debug(f"Topobathy Zarr Cache Hit (Full Tile Proxy for BBox): {full_zarr_name}")
                 # Clip it in memory and return immediately (no need to write a micro-zarr to disk)
-                da = da.rio.clip_box(*bbox)
+                da = da.rio.clip_box(*bbox, allow_one_dimensional_raster=True)
 
                 return cast(xr.DataArray, da)
             except Exception as e:
@@ -1226,6 +1276,7 @@ class NoaaTopobathyProvider(Provider):
                             maxx=clip_bbox[2],
                             maxy=clip_bbox[3],
                             crs=clip_crs,
+                            allow_one_dimensional_raster=True,
                         )
                     except Exception as e:
                         logger.warning(f"Clip failed for {local_filename}: {e}. Skipping tile.")

@@ -539,9 +539,9 @@ class _StatusData:
     # zoom -> {"count": int, "bytes": int, "lon_min/max": float, "lat_min/max": float}
     fused_by_zoom: dict[int, dict] = field(default_factory=dict)
     # Tier 3 - provider zarr
-    provider_zarr: list[tuple[str, int, int, float]] = field(
+    provider_zarr: list[tuple[str, int, int, float, float]] = field(
         default_factory=list
-    )  # (prov, count, bytes, mtime)
+    )  # (prov, count, bytes, newest, oldest)
     # Tier 4 - discovery
     discovery: list[tuple[str, bool, int, int, float]] = field(
         default_factory=list
@@ -551,7 +551,9 @@ class _StatusData:
     bluetopo_sidecars: tuple[int, int, int, float] = (0, 0, 0, 0.0)  # (ok_count, failed_count, bytes, mtime)
     topobathy_zips: tuple[int, int, float] = (0, 0, 0.0)  # (count, bytes, newest_mtime)
     # Tier 5 - raw files (download providers only; streaming providers never write raw files)
-    raw_files: list[tuple[str, int, int, float]] = field(default_factory=list)  # (prov, count, bytes, mtime)
+    raw_files: list[tuple[str, int, int, float, float]] = field(
+        default_factory=list
+    )  # (prov, count, bytes, newest, oldest)
 
 
 def _gather_status_data() -> _StatusData:
@@ -619,12 +621,17 @@ def _gather_status_data() -> _StatusData:
         for z_root in [CACHE_ROOT / provider / "zarr", CACHE_ROOT / provider]:
             if z_root.exists():
                 zarrs.extend(z_root.glob("*.zarr"))
+        newest: float = 0.0
+        oldest: float = 0.0
         if zarrs:
             sz = sum(_dir_size_bytes(z) for z in zarrs)
-            newest = max(z.stat().st_mtime for z in zarrs)
+            mtimes = [float(z.stat().st_mtime) for z in zarrs]
+            if mtimes:
+                newest = float(max(mtimes))
+                oldest = float(min(mtimes))
         else:
-            sz = newest = 0
-        d.provider_zarr.append((provider, len(zarrs), sz, newest))
+            sz = 0
+        d.provider_zarr.append((provider, len(zarrs), sz, newest, oldest))
 
     # ── Tier 4: discovery caches ──────────────────────────────────
     for label, path in _DISCOVERY_FILES:
@@ -669,12 +676,18 @@ def _gather_status_data() -> _StatusData:
         if prov_dir.exists():
             for pat in patterns:
                 raw_files.extend(prov_dir.rglob(pat))
+        raw_newest: float = 0.0
+        raw_oldest: float = 0.0
         if raw_files:
-            sz = sum(f.stat().st_size for f in raw_files if f.is_file())
-            newest = max(f.stat().st_mtime for f in raw_files if f.is_file())
+            file_stats = [f.stat() for f in raw_files if f.is_file()]
+            sz = sum(s.st_size for s in file_stats)
+            file_mtimes = [float(s.st_mtime) for s in file_stats]
+            if file_mtimes:
+                raw_newest = float(max(file_mtimes))
+                raw_oldest = float(min(file_mtimes))
         else:
-            sz = newest = 0
-        d.raw_files.append((provider, len(raw_files), sz, newest))
+            sz = 0
+        d.raw_files.append((provider, len(raw_files), sz, raw_newest, raw_oldest))
 
     d.total_bytes = sum(t.size_bytes() for t in TIERS)
     return d
@@ -759,11 +772,24 @@ def _render_status_report(c: Console, d: _StatusData) -> None:
     t.add_column("Zarr stores", justify="right", width=12)
     t.add_column("Size", justify="right", width=10)
     t.add_column("Newest", justify="right", width=12)
-    for prov, count, sz, newest in d.provider_zarr:
+    t.add_column("Oldest", justify="right", width=12)
+    for prov, count, sz, newest, oldest in d.provider_zarr:
         if count == 0:
-            t.add_row(prov, Text("—", style="dim"), Text("—", style="dim"), Text("—", style="dim"))
+            t.add_row(
+                prov,
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+            )
         else:
-            t.add_row(prov, str(count), _fmt_size(sz), _fmt_age(now - newest))
+            t.add_row(
+                prov,
+                str(count),
+                _fmt_size(sz),
+                _fmt_age(now - newest),
+                _fmt_age(now - oldest),
+            )
     c.print(t)
 
     # ── Tier 4 ────────────────────────────────────────────────────
@@ -829,13 +855,26 @@ def _render_status_report(c: Console, d: _StatusData) -> None:
     t.add_column("Files", justify="right", width=8)
     t.add_column("Size", justify="right", width=10)
     t.add_column("Newest", justify="right", width=12)
+    t.add_column("Oldest", justify="right", width=12)
     any_raw = False
-    for prov, count, sz, newest in d.raw_files:
+    for prov, count, sz, newest, oldest in d.raw_files:
         if count == 0:
-            t.add_row(prov, Text("—", style="dim"), Text("—", style="dim"), Text("—", style="dim"))
+            t.add_row(
+                prov,
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
+            )
         else:
             any_raw = True
-            t.add_row(prov, str(count), _fmt_size(sz), _fmt_age(now - newest))
+            t.add_row(
+                prov,
+                str(count),
+                _fmt_size(sz),
+                _fmt_age(now - newest),
+                _fmt_age(now - oldest),
+            )
     c.print(t)
     if not any_raw:
         c.print("  [dim](no raw files cached yet)[/]")
@@ -883,6 +922,8 @@ def _scan_provider_integrity(
     if not p_dir.exists():
         return counts
 
+    # Note: global .lock/.tmp cleanup is handled by _scan_global_orphans,
+    # but we keep this here for provider-scoped checks just in case.
     for t in list(p_dir.glob(".tmp_*")) + list(p_dir.glob("*.lock")):
         age = time.time() - t.stat().st_mtime
         if age > lock_timeout:
@@ -908,6 +949,64 @@ def _scan_provider_integrity(
                     shutil.rmtree(z)
 
     return counts
+
+
+def _scan_global_orphans(clean: bool = False, lock_timeout: int = 3600) -> tuple[int, int]:
+    """Scan and purge orphaned .lock and .tmp_* files across the ENTIRE cache root."""
+    mode = "[bold red]DELETE[/]" if clean else "[bold green]SCAN[/]"
+    console.print(f"\n[bold]Orphaned File {mode} (timeout={lock_timeout}s)...[/]")
+
+    stale_count = 0
+    removed_count = 0
+    failed_count = 0
+    now = time.time()
+
+    # We target:
+    # 1. *.lock anywhere (e.g. tiles/visual/default/13/123/456.lock)
+    # 2. .tmp* (usually directories, sometimes files) anywhere
+    patterns = ["*.lock", ".tmp*", "__temp__*"]
+    candidates: list[Path] = []
+
+    with console.status("Scanning file system (this may take a moment)...", spinner="dots"):
+        for pat in patterns:
+            candidates.extend(CACHE_ROOT.rglob(pat))
+
+    # Filter by age and uniqueness
+    candidates = sorted(list(set(candidates)), key=lambda p: str(p))
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            stat = p.stat()
+            age = now - stat.st_mtime
+            if age > lock_timeout:
+                stale_count += 1
+                try:
+                    rel_path = p.relative_to(CACHE_ROOT)
+                except ValueError:
+                    rel_path = p
+
+                if clean:
+                    if p.is_dir():
+                        shutil.rmtree(p)
+                    else:
+                        p.unlink()
+                    console.print(f"  [green]✓[/] {rel_path}  [dim]({_fmt_age(age)})[/]")
+                    removed_count += 1
+                else:
+                    console.print(f"  [yellow]![/] {rel_path}  [dim]({_fmt_age(age)})[/]")
+        except Exception as e:
+            console.print(f"  [red]✗[/] {p.name}: {e}")
+            failed_count += 1
+
+    if stale_count == 0:
+        console.print("  [dim]No orphaned files found.[/]")
+    else:
+        suffix = f" -> {removed_count} removed" if clean else ""
+        console.print(f"\n  Found {stale_count} orphaned items{suffix}.")
+
+    return stale_count, removed_count
 
 
 def cmd_check(clean: bool = False, lock_timeout: int = 3600) -> None:
@@ -944,6 +1043,8 @@ def cmd_check(clean: bool = False, lock_timeout: int = 3600) -> None:
         progress.advance(task)
 
     console.print(results_table)
+
+    _scan_global_orphans(clean=clean, lock_timeout=lock_timeout)
 
     disco_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", title="Discovery Caches")
     disco_table.add_column("File", min_width=44)
@@ -1074,6 +1175,8 @@ _MAIN_CHOICES = [
     ("Purge tier(s)", "purge"),
     ("Check integrity  (read-only audit)", "check"),
     ("Clean integrity  (delete corrupt/stale)", "clean"),
+    ("List orphaned locks/tmp (fast)", "list-orphans"),
+    ("Clean orphaned locks/tmp (fast)", "clean-orphans"),
     ("Quit", "quit"),
 ]
 
@@ -1226,6 +1329,9 @@ def cmd_interactive(lock_timeout: int = 3600) -> None:
         elif action in ("check", "clean"):
             cmd_check(clean=(action == "clean"), lock_timeout=lock_timeout)
 
+        elif action in ("list-orphans", "clean-orphans"):
+            _scan_global_orphans(clean=(action == "clean-orphans"), lock_timeout=lock_timeout)
+
     console.print()
 
 
@@ -1247,6 +1353,8 @@ def main() -> None:
             "  %(prog)s                       # interactive menu (TTY)\n"
             "  %(prog)s --check               # integrity audit (read-only)\n"
             "  %(prog)s --clean               # delete corrupt/stale files\n"
+            "  %(prog)s --orphans             # list orphaned .lock/.tmp files\n"
+            "  %(prog)s --clean-orphans       # delete orphaned .lock/.tmp files\n"
             "  %(prog)s --purge 1             # purge output tiles\n"
             "  %(prog)s --purge 4             # purge discovery caches\n"
             "  %(prog)s --purge 1 2 4         # purge multiple tiers\n"
@@ -1256,6 +1364,16 @@ def main() -> None:
     )
     parser.add_argument("--check", action="store_true", help="Integrity audit: read-only scan.")
     parser.add_argument("--clean", action="store_true", help="Integrity check + delete corrupt/stale files.")
+    parser.add_argument(
+        "--orphans",
+        action="store_true",
+        help="List orphaned .lock and .tmp* files across the cache.",
+    )
+    parser.add_argument(
+        "--clean-orphans",
+        action="store_true",
+        help="Delete orphaned .lock and .tmp* files across the cache.",
+    )
     parser.add_argument("--purge", nargs="+", metavar="TIER", help="Tier number(s) to purge (1-5) or 'all'.")
     parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation prompts.")
@@ -1269,7 +1387,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.check or args.clean:
+    if args.orphans or args.clean_orphans:
+        _scan_global_orphans(clean=args.clean_orphans, lock_timeout=args.lock_timeout)
+    elif args.check or args.clean:
         cmd_check(clean=args.clean, lock_timeout=args.lock_timeout)
     elif args.purge:
         cmd_purge(args.purge, dry_run=args.dry_run, yes=args.yes)
