@@ -6,8 +6,6 @@ It queries the Microsoft Planetary Computer STAC API for '3dep-seamless', 'cop-d
 and 'nasadem' collections.
 """
 
-import contextlib
-import fcntl
 import logging
 import os
 import random
@@ -53,8 +51,6 @@ class Usgs3DepProvider(Provider):
         """
         if self._initialized:
             return
-
-        import os
 
         if cache_dir == "~/.cache/topobathysim":
             cache_dir = os.environ.get("TOPOBATHYSIM_CACHE_DIR", cache_dir)
@@ -150,74 +146,84 @@ class Usgs3DepProvider(Provider):
             logger.debug(f"Negative Cache Hit: {collection_id} is known empty for {bbox}")
             return None
 
-        # Global Concurrency Lock
-        lock_file_path = self.cache_dir / "stac_query.lock"
+        # Query-Specific Concurrency Lock
+        import hashlib
+
+        from filelock import FileLock
+
+        query_key = f"{collection_id}_{bbox}"
+        query_hash = hashlib.md5(query_key.encode()).hexdigest()
+        lock_file_path = self.cache_dir / f"stac_query_{query_hash}.lock"
+
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
         max_retries = 4
 
         try:
-            with open(lock_file_path, "w") as lock_file:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-                try:
-                    # Double-Check Negative Cache (in case another worker updated it while we waited)
-                    if self.manifest.has_no_coverage(collection_id, bbox):
-                        return None
+            with FileLock(lock_file_path):
+                # Double-Check Negative Cache (in case another worker updated it while we waited)
+                if self.manifest.has_no_coverage(collection_id, bbox):
+                    return None
 
-                    for attempt in range(max_retries + 1):
-                        try:
-                            logger.debug(
-                                f"Usgs3DepProvider querying {collection_id} "
-                                f"for {bbox} (Attempt {attempt + 1})"
-                            )
+                # Also Double-Check Positive Cache/Manifest?
+                # Ideally yes, but the Manifest is loaded in memory mainly.
+                # If 'manifest.record_search' updates persistent storage, we should reload it.
+                # Assuming manifest handles its own persistence or we rely on the negative cache check.
 
-                            catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-                            search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
-                            items = list(search.items())
+                for attempt in range(max_retries + 1):
+                    try:
+                        logger.debug(
+                            f"Usgs3DepProvider querying {collection_id} "
+                            f"for {bbox} (Attempt {attempt + 1})"
+                        )
 
-                            # Record Search Result (Positive or Negative)
-                            self.manifest.record_search(collection_id, bbox, len(items))
+                        catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+                        search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
+                        items = list(search.items())
 
-                            if not items:
-                                return None
+                        # Record Search Result (Positive or Negative)
+                        self.manifest.record_search(collection_id, bbox, len(items))
 
-                            results = []
-                            for item in items:
-                                # Extract asset href
-                                asset_key = "data"
-                                if asset_key not in item.assets and "elevation" in item.assets:
+                        if not items:
+                            return None
+
+                        results = []
+                        for item in items:
+                            # Extract asset href
+                            asset_key = "data"
+                            if asset_key not in item.assets:
+                                if "elevation" in item.assets:
                                     asset_key = "elevation"
+                                elif "merged" in item.assets:
+                                    asset_key = "merged"
 
-                                if asset_key in item.assets:
-                                    results.append(
-                                        {
-                                            "href": item.assets[asset_key].href,
-                                            "bbox": item.bbox,
-                                            "properties": item.properties,
-                                        }
-                                    )
-                            return results
+                            if asset_key in item.assets:
+                                results.append(
+                                    {
+                                        "href": item.assets[asset_key].href,
+                                        "bbox": item.bbox,
+                                        "properties": item.properties,
+                                    }
+                                )
+                        return results
 
-                        except Exception as e:
-                            # Retry logic
-                            is_last_attempt = attempt == max_retries
-                            log_level = logging.WARNING if not is_last_attempt else logging.ERROR
-                            logger.log(
-                                log_level,
-                                f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
-                            )
+                    except Exception as e:
+                        # Retry logic
+                        is_last_attempt = attempt == max_retries
+                        log_level = logging.WARNING if not is_last_attempt else logging.ERROR
+                        logger.log(
+                            log_level,
+                            f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
+                        )
 
-                            if is_last_attempt:
-                                return None
+                        if is_last_attempt:
+                            return None
 
-                            sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
-                            time.sleep(sleep_time)
-                finally:
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
+                        time.sleep(sleep_time)
 
-        finally:
-            # Best-effort cleanup of lock file
-            with contextlib.suppress(OSError):
-                os.remove(lock_file_path)
+        except Exception as e:
+            logger.error(f"STAC Query Lock/Execution Failed: {e}")
+            return None
 
         return None
 

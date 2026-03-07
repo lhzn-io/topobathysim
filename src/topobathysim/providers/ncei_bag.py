@@ -36,7 +36,7 @@ USER_AGENT = (
 
 # Discovery requests are expensive immediately after cache purges.
 # Allow a longer read timeout and make it tunable via env.
-BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT", "60"))
+BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT", "120"))
 
 
 @concurrent_lru_cache()
@@ -376,10 +376,8 @@ class BAGDiscovery:
     bypass generalized BlueTopo tiles and fetch raw 50cm sonar data.
     """
 
-    # NCEI Hydrodynamic MapServer
-    QUERY_URL = (
-        "https://gis.ngdc.noaa.gov/arcgis/rest/services/web_mercator/nos_hydro_dynamic/MapServer/0/query"
-    )
+    # NCEI Hydrodynamic Survey Service (NOAA GeoPlatform)
+    QUERY_URL = "https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOS_Hydro_Surveys/FeatureServer/0/query"
 
     # Persistent Cache for Redirects (HTML Landing Page -> .bag URL)
     # Stored in ~/.cache/topobathysim/metadata/ncei_bag_redirects.json
@@ -581,7 +579,7 @@ class BAGDiscovery:
                 logger.info(f"Cleaned Survey ID: {survey_id} -> {clean_id}")
 
         params = {
-            "text": clean_id,
+            "where": f"SURVEY_ID='{clean_id}' AND BAGS_EXIST='Y'",
             "outFields": "SURVEY_ID,DOWNLOAD_URL",
             "returnGeometry": "false",
             "f": "json",
@@ -640,6 +638,7 @@ class BAGDiscovery:
                 "geometry": geo_json,
                 "geometryType": "esriGeometryPoint",
                 "spatialRel": "esriSpatialRelIntersects",
+                "where": "BAGS_EXIST='Y'",
                 "outFields": "SURVEY_ID,DOWNLOAD_URL",
                 "returnGeometry": "false",
                 "f": "json",
@@ -690,17 +689,33 @@ class BAGDiscovery:
         crs_tag = crs.replace(":", "_")
         bbox_key = f"{round(swest, 4)}_{round(ssouth, 4)}_{round(seast, 4)}_{round(snorth, 4)}_{crs_tag}"
 
-        # 1. Check disk cache (survives server restarts and process recycling)
+        # 1. Check disk cache (survives server restarts and process recycling) (Fast Path)
         cached = cls._get_from_discovery_cache(bbox_key)
         if cached is not None:
             logger.debug(f"BAG Discovery Cache Hit: {bbox_key} ({len(cached)} urls)")
             return cached
 
-        logger.debug(f"BAG Discovery Cache Miss: {bbox_key} — querying NCEI ArcGIS API")
+        # 2. Cache Miss - Synchronization Barrier
+        # Use a granular file lock to prevent cache stampedes query the same bbox simultaneously.
+        lock_dir = cls.DISCOVERY_CACHE_PATH.parent / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{bbox_key}.lock"
+
         found_urls: list[str] = []
         query_succeeded = False
+
         try:
-            from pyproj import Transformer
+            with FileLock(lock_path):
+                # Double-check cache inside lock (in case another process just finished)
+                cached = cls._get_from_discovery_cache(bbox_key)
+                if cached is not None:
+                    logger.debug(f"BAG Discovery Cache Hit (Post-Lock): {bbox_key}")
+                    return cached
+
+                logger.debug(f"BAG Discovery Cache Miss: {bbox_key} — querying NCEI ArcGIS API")
+
+                # ... Network Query Logic ...
+                from pyproj import Transformer
 
             # MapServer expects EPSG:3857 (Web Mercator)
             transformer = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
@@ -730,6 +745,7 @@ class BAGDiscovery:
                 "geometry": geo_json,
                 "geometryType": "esriGeometryEnvelope",
                 "spatialRel": "esriSpatialRelIntersects",
+                "where": "BAGS_EXIST='Y'",
                 "outFields": "SURVEY_ID,DOWNLOAD_URL,SURVEY_YEAR,DATE_SURVEY_END",
                 "returnGeometry": "false",
                 "f": "json",
@@ -831,10 +847,11 @@ class BAGDiscovery:
         # 2. Persist to disk only when query succeeded.
         # Avoid caching transient network failures as permanent empty results.
         if query_succeeded:
+            # Re-acquire lock for writing? No, _update_discovery_cache handles its own locking.
             cls._update_discovery_cache(bbox_key, found_urls)
             logger.debug(f"BAG Discovery Cache Created: {bbox_key} ({len(found_urls)} urls persisted)")
         else:
-            logger.debug(f"BAG Discovery Cache Skipped: {bbox_key} (query failed)")
+            logger.warning(f"BAG Discovery Cache Skipped: {bbox_key} (query failed)")
         return found_urls
 
 

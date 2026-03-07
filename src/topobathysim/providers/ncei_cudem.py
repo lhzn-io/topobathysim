@@ -6,7 +6,6 @@ It handles tile resolution, downloading, caching, and processing of CUDEM data.
 """
 
 import contextlib
-import fcntl
 import logging
 import zipfile
 from pathlib import Path
@@ -329,14 +328,14 @@ class CUDEMProvider(Provider):
         local_path = self.cache_dir / filename
         lock_path = self.cache_dir / f"{filename}.lock"
 
+        from filelock import FileLock
+
         if local_path.exists():
             return local_path
 
         try:
-            with open(lock_path, "w") as lock_file:
-                # Blocking lock
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-
+            with FileLock(lock_path):
+                # Double-check inside lock
                 if local_path.exists():
                     return local_path
 
@@ -348,20 +347,27 @@ class CUDEMProvider(Provider):
 
                 # Write to temp file first for atomicity
                 temp_path = local_path.with_suffix(".tmp")
-                with open(temp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=16384):
-                        f.write(chunk)
 
-                # Atomic rename
-                temp_path.rename(local_path)
+                # Ensure clean state
+                if temp_path.exists():
+                    temp_path.unlink()
 
-                Path(lock_path).unlink(missing_ok=True)
-                return local_path
+                try:
+                    with open(temp_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                    temp_path.rename(local_path)
+                    logger.info(f"CUDEM download complete: {filename}")
+                    return local_path
+                except Exception as ex:
+                    logger.error(f"Download write failed: {ex}")
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    return None
 
         except Exception as e:
-            logger.error(f"Failed to download CUDEM tile {url}: {e}")
-            if local_path.exists():
-                local_path.unlink(missing_ok=True)
+            logger.error(f"Failed to acquire lock or download CUDEM tile: {e}")
             return None
 
     def load_tile(self, row: Any, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:

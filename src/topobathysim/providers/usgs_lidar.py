@@ -32,83 +32,109 @@ logger = logging.getLogger(__name__)
 @concurrent_lru_cache()
 def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] | None:
     """
-    Cached STAC query for 3DEP Lidar (In-Memory Only).
+    Cached STAC query for 3DEP Lidar (Persisted & Process-Safe).
     """
     # Use a persistent lock file for STAC query caching
     cache_path = Path("~/.cache/topobathysim/usgs_lidar/stac_discovery_cache.json").expanduser()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_path.with_suffix(".lock")
 
+    # 1. Hashing
     bbox_key = f"{round(bbox[0], 6)}_{round(bbox[1], 6)}_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
 
+    # 2. Fast Path: Read from shared JSON (with short lock)
     from filelock import FileLock
 
-    with FileLock(lock_path):
+    main_lock = FileLock(cache_path.with_suffix(".lock"))
+
+    with main_lock:
         if cache_path.exists():
             try:
                 with open(cache_path) as f:
                     data = json.load(f)
                     if bbox_key in data:
-                        logger.debug(f"STAC Discovery Cache Hit: {bbox_key}")
+                        # logger.debug(f"STAC Discovery Cache Hit: {bbox_key}")
                         return cast(dict[str, Any] | None, data[bbox_key])
             except Exception:
                 pass
 
-    stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
-    import planetary_computer
-    from pystac_client import Client
+    # 3. Slow Path: Network Query (Protected by query-specific lock)
+    # This prevents 50 processes from querying the EXACT SAME bbox simultaneously,
+    # but allows them to query DIFFERENT bboxes in parallel.
+    import hashlib
 
-    try:
-        logger.debug(f"Querying STAC: {stac_url} with bbox {bbox}")
-        # Search without 'limit' (which forces tiny pages)
-        # Use iterator to break early
-        catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-        search = catalog.search(collections=["3dep-lidar-copc"], bbox=bbox)
+    query_hash = hashlib.md5(bbox_key.encode()).hexdigest()
+    query_lock_path = cache_path.parent / f"stac_query_{query_hash}.lock"
 
-        # Taking just the first item without exhausting all pages
-        items = []
-        for item in search.items():
-            items.append(item)
-            break
-
-        result = None
-        if items:
-            # Extract only what we need to return
-            item = items[0]
-            assets = item.assets
-            href = assets["data"].href
-
-            props = item.properties
-            native_epsg = props.get("proj:epsg")
-            projjson = props.get("proj:projjson", {})
-
-            result = {
-                "href": href,
-                "native_epsg": native_epsg,
-                "projjson": projjson,
-                "id": item.id,
-                "bbox": item.bbox,
-                "properties": item.properties,
-            }
-
-        # Persist even None to avoid re-querying empty bboxes
-        with FileLock(lock_path):
-            data = {}
+    with FileLock(query_lock_path):
+        # 3a. Re-check main cache inside the query lock
+        # (Another process might have just finished this exact query)
+        with main_lock:
             if cache_path.exists():
                 try:
                     with open(cache_path) as f:
                         data = json.load(f)
+                        if bbox_key in data:
+                            logger.debug(f"STAC Discovery Cache Hit (after wait): {bbox_key}")
+                            return cast(dict[str, Any] | None, data[bbox_key])
                 except Exception:
                     pass
-            data[bbox_key] = result
-            with open(cache_path, "w") as f:
-                json.dump(data, f, indent=2)
 
-        return cast(dict[str, Any] | None, result)
+        # 3b. Actually Execute Query
+        stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
+        import planetary_computer
+        from pystac_client import Client
 
-    except Exception as e:
-        logger.warning(f"STAC Query Error: {e}")
-        return None
+        try:
+            logger.debug(f"Querying STAC: {stac_url} with bbox {bbox}")
+            # Search without 'limit' (which forces tiny pages)
+            # Use iterator to break early
+            catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+            search = catalog.search(collections=["3dep-lidar-copc"], bbox=bbox)
+
+            # Taking just the first item without exhausting all pages
+            items = []
+            for item in search.items():
+                items.append(item)
+                break
+
+            result = None
+            if items:
+                # Extract only what we need to return
+                item = items[0]
+                assets = item.assets
+                href = assets["data"].href
+
+                props = item.properties
+                native_epsg = props.get("proj:epsg")
+                projjson = props.get("proj:projjson", {})
+
+                result = {
+                    "href": href,
+                    "native_epsg": native_epsg,
+                    "projjson": projjson,
+                    "id": item.id,
+                    "bbox": item.bbox,
+                    "properties": item.properties,
+                }
+
+            # 3c. Write Result to Cache
+            with main_lock:
+                data = {}
+                if cache_path.exists():
+                    try:
+                        with open(cache_path) as f:
+                            data = json.load(f)
+                    except Exception:
+                        pass
+                data[bbox_key] = result
+                with open(cache_path, "w") as f:
+                    json.dump(data, f, indent=2)
+
+            return cast(dict[str, Any] | None, result)
+
+        except Exception as e:
+            logger.warning(f"STAC Query Error: {e}")
+            return None
 
 
 class UsgsLidarProvider(Provider):
@@ -234,9 +260,10 @@ class UsgsLidarProvider(Provider):
         """
         Downloads a file from a URL to the cache directory.
         """
-        import fcntl
         import shutil
         import urllib.request
+
+        from filelock import FileLock
 
         local_path = self._get_cache_path(url)
         lock_path = self.cache_dir / f"{local_path.name}.lock"
@@ -249,47 +276,43 @@ class UsgsLidarProvider(Provider):
             logger.warning(f"Offline Mode: Custom download required but file missing: {local_path.name}")
             return None
 
-        # 2. Acquire Lock
+        # 2. Acquire Lock (Wait if another process is downloading)
         try:
-            with open(lock_path, "w") as lock_file:
-                # Non-blocking lock attempt? No, we want to wait if another process is downloading
-                # But if we are in a background thread, blocking is fine.
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
+            with FileLock(lock_path):
+                # 3. Double Check inside lock
+                if local_path.exists():
+                    return local_path
+
+                logger.info(f"Downloading Lidar asset to {local_path}...")
+
+                # Use temp file
+                temp_path = self.cache_dir / f".tmp_{local_path.name}"
+
+                # Cleanup potential stale temp file
+                if temp_path.exists():
+                    temp_path.unlink()
+
                 try:
-                    # 3. Double Check
-                    if local_path.exists():
-                        return local_path
-
-                    logger.info(f"Downloading Lidar asset to {local_path}...")
-
-                    # Use temp file
-                    temp_path = self.cache_dir / f".tmp_{local_path.name}"
-
                     if url.startswith("s3://"):
                         self.fs.get(url, str(temp_path))
-                        Path(temp_path).rename(local_path)
                     else:
                         with (
                             urllib.request.urlopen(url) as response,
                             open(temp_path, "wb") as out_file,
                         ):
                             shutil.copyfileobj(response, out_file)
-                        Path(temp_path).rename(local_path)
 
+                    Path(temp_path).rename(local_path)
                     logger.info("Background Download complete.")
-
-                    # Cleanup lock on success
-                    lock_path.unlink(missing_ok=True)
-
                     return local_path
-
-                finally:
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                except Exception as down_e:
+                    logger.error(f"Download failed: {down_e}")
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    return None
 
         except Exception as e:
-            logger.error(f"Failed to download Lidar asset: {e}")
-            if "temp_path" in locals() and Path(cast(str, temp_path)).exists():
-                Path(cast(str, temp_path)).unlink()
+            logger.error(f"Failed to download/lock Lidar asset: {e}")
             return None
 
     def _read_laz_file(

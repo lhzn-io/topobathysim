@@ -342,8 +342,7 @@ class NoaaTopobathyProvider(Provider):
         """
         Parses the map of ID -> Project Folder Name.
         Checks local JSON or fetches remote HTML index.
-        Uses a class-level lock so the disk read happens only once per process
-        even when multiple cells are processed concurrently.
+        Uses a FileLock so the disk/network hit happens only once per machine.
         """
         if self._projects:
             logger.debug(f"Topobathy Project Index Cache Hit (in-process): {len(self._projects)} projects")
@@ -356,102 +355,115 @@ class NoaaTopobathyProvider(Provider):
                 return
 
             json_path = self.metadata_dir / "noaa_coastal_lidar.json"
+            lock_path = self.metadata_dir / "noaa_coastal_lidar.json.lock"
             import json
             import time
 
-            # 1. Try Loading JSON
-            if json_path.exists():
-                try:
-                    with open(json_path) as f:
-                        data = json.load(f)
-                        for k, v in data.items():
-                            if isinstance(v, dict):
-                                self._projects[k] = v.get("name", "")
-                                if "info" in v:
-                                    self._projects_metadata_urls[k] = v["info"]
-                            else:
-                                self._projects[k] = str(v)
+            from filelock import FileLock
 
-                        logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
-                        return
-                except Exception as e:
-                    logger.warning(f"Corrupt metadata JSON {json_path}: {e}")
+            with FileLock(str(lock_path)):
+                # Inside the lock, check if we accidentally loaded it
+                # (unlikely in this structure but good practice)
+                # Note: self._projects is cleared/reloaded below.
 
-            # 2. Fetch and Parse HTML
-            try:
-                # 7 days expiration for network hit
+                # 1. Try Loading JSON (if fresh)
+                refresh_needed = True
                 if json_path.exists():
                     age = time.time() - json_path.stat().st_mtime
-                    if age > 604800:
-                        logger.info(f"NOAA Index cache expired ({age/86400:.1f} days). Refreshing...")
+                    if age < 604800:  # 7 days
+                        try:
+                            with open(json_path) as f:
+                                data = json.load(f)
+                                NoaaTopobathyProvider._cls_projects.clear()
+                                NoaaTopobathyProvider._cls_projects_metadata_urls.clear()
+
+                                for k, v in data.items():
+                                    if isinstance(v, dict):
+                                        NoaaTopobathyProvider._cls_projects[k] = v.get("name", "")
+                                        if "info" in v:
+                                            NoaaTopobathyProvider._cls_projects_metadata_urls[k] = v["info"]
+                                    else:
+                                        NoaaTopobathyProvider._cls_projects[k] = str(v)
+
+                                logger.debug(f"Loaded {len(self._projects)} projects from JSON metadata.")
+                                refresh_needed = False
+                        except Exception as e:
+                            logger.warning(f"Corrupt or stale metadata JSON {json_path}: {e}")
                     else:
-                        # This should be unreachable due to 'return' in step 1,
-                        # but kept for logic safety if step 1 fails.
-                        pass
+                        logger.info(f"NOAA Index cache expired ({age/86400:.1f} days).")
 
-                text = self._fetch_index()
-                new_projects = {}
-                new_metadata_urls = {}
+                if not refresh_needed:
+                    return
 
-                lines = text.split("\n")
-                current_folder = None
-
-                for line in lines:
-                    # 1. Find Folder / Bulk Link
-                    folder_match = re.search(r'href=".*dem/([^/]+)/index\.html"', line)
-                    if folder_match:
-                        folder_name = folder_match.group(1)
-                        parts = folder_name.split("_")
-                        if parts and parts[-1].isdigit():
-                            pid = parts[-1]
-                            current_folder = (pid, folder_name)
-                            new_projects[pid] = folder_name
-
-                    # 2. Find InPort Link
-                    if current_folder and "metadata" in line:
-                        pid = current_folder[0]
-                        # Check for metadata link in the SAME line
-                        pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
-                        inport_match = re.search(pattern, line)
-                        if inport_match:
-                            new_metadata_urls[pid] = inport_match.group(1)
-
-                # Use .update() to populate the shared class-level dicts in-place
-                # (rebinding with = would break the reference set in __init__)
-                NoaaTopobathyProvider._cls_projects.update(new_projects)
-                NoaaTopobathyProvider._cls_projects_metadata_urls.update(new_metadata_urls)
-
-                p_count = len(self._projects)
-                m_count = len(self._projects_metadata_urls)
-                logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
-
-                # 3. Save to JSON
-                save_data = {}
-                for pid, folder in self._projects.items():
-                    entry = {"name": folder}
-                    if pid in self._projects_metadata_urls:
-                        entry["info"] = self._projects_metadata_urls[pid]
-                    save_data[pid] = entry
-
+                # 2. Fetch and Parse HTML (if missing or stale)
                 try:
-                    with open(json_path, "w") as f:
-                        json.dump(save_data, f, indent=2)
-                except Exception as e:
-                    logger.warning(f"Failed to write metadata JSON: {e}")
+                    logger.info("Refreshing NOAA Coastal Lidar PDS Index...")
+                    text = self._fetch_index()
+                    new_projects = {}
+                    new_metadata_urls = {}
 
-            except Exception as e:
-                logger.error(f"Failed to load project index: {e}")
-                if json_path.exists():
-                    logger.warning("Using stale metadata JSON as fallback.")
-                    with open(json_path) as f:
-                        data = json.load(f)
-                        for k, v in data.items():
-                            if isinstance(v, dict):
-                                self._projects[k] = v.get("name", "")
-                                if "info" in v:
-                                    self._projects_metadata_urls[k] = v["info"]
-                            else:
-                                self._projects[k] = str(v)
+                    lines = text.split("\n")
+                    current_folder = None
+
+                    for line in lines:
+                        # 1. Find Folder / Bulk Link
+                        folder_match = re.search(r'href=".*dem/([^/]+)/index\.html"', line)
+                        if folder_match:
+                            folder_name = folder_match.group(1)
+                            parts = folder_name.split("_")
+                            if parts and parts[-1].isdigit():
+                                pid = parts[-1]
+                                current_folder = (pid, folder_name)
+                                new_projects[pid] = folder_name
+
+                        # 2. Find InPort Link
+                        if current_folder and "metadata" in line:
+                            pid = current_folder[0]
+                            # Check for metadata link in the SAME line (or associated block)
+                            pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
+                            inport_match = re.search(pattern, line)
+                            if inport_match:
+                                new_metadata_urls[pid] = inport_match.group(1)
+
+                    # Update shared class-level dicts
+                    NoaaTopobathyProvider._cls_projects.update(new_projects)
+                    NoaaTopobathyProvider._cls_projects_metadata_urls.update(new_metadata_urls)
+
+                    p_count = len(self._projects)
+                    m_count = len(self._projects_metadata_urls)
+                    logger.info(f"Discovered {p_count} Projects & {m_count} Metadata Links.")
+
+                    # 3. Save to JSON
+                    save_data = {}
+                    for pid, folder in self._projects.items():
+                        entry = {"name": folder}
+                        if pid in self._projects_metadata_urls:
+                            entry["info"] = self._projects_metadata_urls[pid]
+                        save_data[pid] = entry
+
+                    try:
+                        with open(json_path, "w") as f:
+                            json.dump(save_data, f, indent=2)
+                    except Exception as e:
+                        logger.warning(f"Failed to write metadata JSON: {e}")
+
+                except Exception as e:
+                    logger.error(f"Failed to load project index: {e}")
+                    # Fallback: Try to load stale JSON if it exists
+                    if json_path.exists():
+                        logger.warning("Using stale metadata JSON as fallback.")
+                        try:
+                            with open(json_path) as f:
+                                data = json.load(f)
+                                for k, v in data.items():
+                                    if isinstance(v, dict):
+                                        NoaaTopobathyProvider._cls_projects[k] = v.get("name", "")
+                                        if "info" in v:
+                                            NoaaTopobathyProvider._cls_projects_metadata_urls[k] = v["info"]
+                                    else:
+                                        NoaaTopobathyProvider._cls_projects[k] = str(v)
+                        except Exception as ex:
+                            logger.error(f"Fallback failed: {ex}")
 
     def fetch_inport_metadata(self, project_id: str) -> dict | None:
         """
@@ -1242,106 +1254,115 @@ class NoaaTopobathyProvider(Provider):
                 da_raw = None
 
                 # 4. Open COG (Remote) and Apply Adjustments
-                # 4. Open COG (Remote) and Apply Adjustments
                 logger.info(f"Streaming NOAA Asset: {open_source}")
+
                 # Load lazily with chunks
+                # Use a context manager where possible, or explicit close
+                # Since open_rasterio returns a DataArray, we manage it manually
                 da_raw = cast(
                     xr.DataArray,
                     rioxarray.open_rasterio(open_source, chunks={"x": 2048, "y": 2048}, masked=True),
                 )
 
-                # --- OPTIMIZATION: CLIP BEFORE METADATA/COMPUTE ---
-                if bbox:
-                    try:
-                        from rasterio.warp import transform_bounds
+                try:
+                    # --- OPTIMIZATION: CLIP BEFORE METADATA/COMPUTE ---
+                    if bbox:
+                        try:
+                            from rasterio.warp import transform_bounds
 
-                        source_crs = da_raw.rio.crs
-                        clip_bbox = bbox
-                        clip_crs = "EPSG:4326"
+                            source_crs = da_raw.rio.crs
+                            clip_bbox = bbox
+                            clip_crs = "EPSG:4326"
 
-                        # If source has a CRS and it's not 4326/NAD83-LatLon, reproject explicitly
-                        # This avoids rioxarray clip_box potential failures with on-the-fly reprojection
-                        if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
-                            try:
-                                clip_bbox = transform_bounds("EPSG:4326", source_crs, *bbox)
-                                clip_crs = source_crs
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to reproject bbox to {source_crs}: {e}. Retrying with 4326."
-                                )
+                            # If source has a CRS and it's not 4326/NAD83-LatLon, reproject explicitly
+                            # This avoids rioxarray clip_box potential failures with on-the-fly reprojection
+                            if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
+                                try:
+                                    clip_bbox = transform_bounds("EPSG:4326", source_crs, *bbox)
+                                    clip_crs = source_crs
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to reproject bbox to {source_crs}: {e}. Retrying with 4326."
+                                    )
 
-                        da_raw = da_raw.rio.clip_box(
-                            minx=clip_bbox[0],
-                            miny=clip_bbox[1],
-                            maxx=clip_bbox[2],
-                            maxy=clip_bbox[3],
-                            crs=clip_crs,
-                            allow_one_dimensional_raster=True,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Clip failed for {local_filename}: {e}. Skipping tile.")
+                            da_raw = da_raw.rio.clip_box(
+                                minx=clip_bbox[0],
+                                miny=clip_bbox[1],
+                                maxx=clip_bbox[2],
+                                maxy=clip_bbox[3],
+                                crs=clip_crs,
+                                allow_one_dimensional_raster=True,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Clip failed for {local_filename}: {e}. Skipping tile.")
+                            return None
+
+                    if da_raw is None or da_raw.size == 0:
+                        logger.debug(f"Empty tile after clip: {local_filename}")
                         return None
 
-                if da_raw is None or da_raw.size == 0:
-                    logger.debug(f"Empty tile after clip: {local_filename}")
-                    return None
+                    # Metadata & VDatum Logic
+                    meta = self.fetch_inport_metadata(self._active_project_id) or {}
 
-                # Metadata & VDatum Logic
-                meta = self.fetch_inport_metadata(self._active_project_id) or {}
+                    # --- PROVENANCE METADATA ---
+                    import datetime
 
-                # --- PROVENANCE METADATA ---
-                import datetime
+                    # Core identity
+                    da_raw.attrs["survey_source"] = self._active_project_id
+                    da_raw.attrs["source_url"] = http_url
 
-                # Core identity
-                da_raw.attrs["survey_source"] = self._active_project_id
-                da_raw.attrs["source_url"] = http_url
+                    # Time
+                    da_raw.attrs["date_created"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    da_raw.attrs["start_date"] = meta.get("start_date", "Unknown")
+                    da_raw.attrs["end_date"] = meta.get("end_date", "Unknown")
 
-                # Time
-                da_raw.attrs["date_created"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                da_raw.attrs["start_date"] = meta.get("start_date", "Unknown")
-                da_raw.attrs["end_date"] = meta.get("end_date", "Unknown")
+                    # Vertical Reference
+                    vdatum = meta.get("vertical_datum", "Unknown").lower()
+                    da_raw.attrs["vertical_datum_original"] = vdatum
+                    da_raw.attrs["vertical_datum"] = vdatum  # Current state
 
-                # Vertical Reference
-                vdatum = meta.get("vertical_datum", "Unknown").lower()
-                da_raw.attrs["vertical_datum_original"] = vdatum
-                da_raw.attrs["vertical_datum"] = vdatum  # Current state
+                    # Links
+                    info_url = self._projects_metadata_urls.get(self._active_project_id)
+                    if info_url:
+                        da_raw.attrs["metadata_url"] = info_url
 
-                # Links
-                info_url = self._projects_metadata_urls.get(self._active_project_id)
-                if info_url:
-                    da_raw.attrs["metadata_url"] = info_url
+                    # Apply Correction if Ellipsoid
+                    if "ellipsoid" in vdatum:
+                        try:
+                            from pyproj import Transformer
 
-                # Apply Correction if Ellipsoid
-                if "ellipsoid" in vdatum:
-                    try:
-                        from pyproj import Transformer
+                            bounds = da_raw.rio.bounds()
+                            cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
 
-                        bounds = da_raw.rio.bounds()
-                        cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
+                            crs = da_raw.rio.crs
+                            if crs:
+                                t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                                lon, lat = t.transform(cx, cy)
 
-                        crs = da_raw.rio.crs
-                        if crs:
-                            t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-                            lon, lat = t.transform(cx, cy)
+                                offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
+                                logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
+                                da_raw = da_raw + offset
 
-                            offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
-                            logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
-                            da_raw = da_raw + offset
+                                # Update Attributes post-correction
+                                da_raw.attrs["vertical_datum"] = "NAVD88"
+                                da_raw.attrs["correction_method"] = "VDatum Geoid18"
+                                da_raw.attrs["vdatum_offset"] = offset
+                        except Exception as e:
+                            logger.warning(f"VDatum correction failed: {e}")
 
-                            # Update Attributes post-correction
-                            da_raw.attrs["vertical_datum"] = "NAVD88"
-                            da_raw.attrs["correction_method"] = "VDatum Geoid18"
-                            da_raw.attrs["vdatum_offset"] = offset
-                    except Exception as e:
-                        logger.warning(f"VDatum correction failed: {e}")
+                    # 5. Write to Zarr
+                    # Ensure good chunks for writing
+                    if "x" in da_raw.dims and "y" in da_raw.dims:
+                        da_raw = da_raw.chunk({"y": 1024, "x": 1024})
 
-                # 5. Write to Zarr
-                # Ensure good chunks for writing
-                if "x" in da_raw.dims and "y" in da_raw.dims:
-                    da_raw = da_raw.chunk({"y": 1024, "x": 1024})
-
-                da_raw.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
-                logger.info(f"Created Zarr Cache: {zarr_path.name}")
+                    da_raw.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
+                    logger.info(f"Created Zarr Cache: {zarr_path.name}")
+                finally:
+                    # Explicitly close the file handle for the remote COG
+                    # This prevents accumulation of open HTTP connections/file descriptors
+                    if da_raw is not None:
+                        with contextlib.suppress(Exception):
+                            da_raw.close()
 
                 # Return re-opened Zarr
                 return xr.open_dataarray(zarr_path, engine="zarr", chunks="auto", decode_coords="all")

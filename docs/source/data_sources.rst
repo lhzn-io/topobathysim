@@ -89,3 +89,4 @@ NOAA NCEI - Bathymetric Attributed Grid (BAG)
     *   **Description**: The definitive format for multi-beam sonar surveys. When found, these overwrite all other sources.
     *   **Citation**: NOAA National Centers for Environmental Information. "Bathymetric Attributed Grid (BAG) File Format."
     *   **Access**: `NCEI Bathymetry Data Viewer <https://www.ncei.noaa.gov/maps/bathymetry/>`_
+    *   **Programmatic Access**: `NOAA GeoPlatform Hydrographic Surveys <https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOS_Hydro_Surveys/FeatureServer>`_

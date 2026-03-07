@@ -200,7 +200,29 @@ class NoaaBlueTopoProvider(Provider):
         if not das:
             raise ProviderNoDataError(f"Failed to load any BlueTopo data for bbox {bbox}")
 
-        # 3. Merge
+        # 3. Handle Mixed CRSs (e.g. crossing UTM zones)
+        # If tiles are in different CRSs, merge_arrays will fail or produce garbage.
+        # We must reproject to a common CRS (the requested one, or 4326) before merging.
+        unique_crss = set()
+        for ds in das:
+            if ds.rio.crs:
+                unique_crss.add(ds.rio.crs.to_string())
+
+        if len(unique_crss) > 1:
+            logger.info(f"BlueTopo tiles have mixed CRSs {unique_crss}. Reprojecting to {crs} before merge.")
+            reprojected_das = []
+            for ds in das:
+                try:
+                    # Reproject to target and clip loosely to avoid huge memory usage
+                    # Note: We can't clip easily before reproject if we are in mixed zones.
+                    # Just reprojecting handles it.
+                    reprojected_das.append(ds.rio.reproject(crs))
+                except Exception as e:
+                    logger.warning(f"Failed to reproject BlueTopo tile during merge: {e}")
+                    reprojected_das.append(ds)
+            das = reprojected_das
+
+        # 4. Merge
         if len(das) == 1:
             merged = das[0]
         else:
@@ -217,12 +239,18 @@ class NoaaBlueTopoProvider(Provider):
                 merged = das[0]  # Fallback
 
         # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds)
+        # We add a 10% buffer to the clip bounds. This prevents "rotated swatch" gaps
+        # where the source-CRS clip (axis-aligned in source) becomes a rotated rectangle
+        # in the target CRS that doesn't fully cover the corners of the target bbox.
         try:
+            pad_x = (east - west) * 0.1
+            pad_y = (north - south) * 0.1
+
             merged = merged.rio.clip_box(
-                minx=west,
-                miny=south,
-                maxx=east,
-                maxy=north,
+                minx=west - pad_x,
+                miny=south - pad_y,
+                maxx=east + pad_x,
+                maxy=north + pad_y,
                 crs="EPSG:4326",
                 allow_one_dimensional_raster=True,
             )
@@ -464,39 +492,51 @@ class NoaaBlueTopoProvider(Provider):
             logger.debug(f"BlueTopo tile URL cache hit: {tile_id}")
             return cached_url
 
-        logger.debug(f"BlueTopo tile URL cache miss: {tile_id} — resolving via S3 glob")
-        try:
-            fs = fsspec.filesystem("s3", anon=True)
-            search_pattern = f"{self.BUCKET_BASE}/{tile_id}/*.tiff"
-            files = fs.glob(search_pattern)
+        from filelock import FileLock
 
-            if not files:
-                logger.warning(f"BlueTopo: No files found in S3 for pattern: {search_pattern}")
+        lock_path = self.cache_dir / f"url_resolve_{tile_id}.lock"
+
+        with FileLock(str(lock_path)):
+            # Double-check cache inside lock
+            cached_url = self._get_tile_url_from_cache(tile_id)
+            if cached_url:
+                logger.debug(f"BlueTopo tile URL cache hit (post-lock): {tile_id}")
+                return cached_url
+
+            logger.debug(f"BlueTopo tile URL cache miss: {tile_id} — resolving via S3 glob")
+            try:
+                fs = fsspec.filesystem("s3", anon=True)
+                search_pattern = f"{self.BUCKET_BASE}/{tile_id}/*.tiff"
+                files = fs.glob(search_pattern)
+
+                if not files:
+                    logger.warning(f"BlueTopo: No files found in S3 for pattern: {search_pattern}")
+                    return None
+
+                source_path = files[0]
+                # source_path example:
+                # "noaa-ocs-nationalbathymetry-pds/BlueTopo/TileX/BlueTopo_TileX_2024.tiff"
+
+                # Construct HTTPS URL
+                # BUCKET_BASE = "noaa-ocs-nationalbathymetry-pds/BlueTopo"
+                # We want: https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/BlueTopo/TileX/BlueTopo_TileX_2024.tiff
+
+                # Split bucket from key
+                parts = source_path.split("/", 1)
+                if len(parts) < 2:
+                    return None
+                key = parts[1]
+
+                url = f"https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/{key}"
+
+                # 2. Persist to disk for future calls
+                self._update_tile_url_cache(tile_id, url)
+                logger.debug(f"BlueTopo tile URL cache created: {tile_id} -> {url}")
+                return url
+
+            except Exception as e:
+                logger.error(f"BlueTopo URL Resolve Error: {e}")
                 return None
-
-            source_path = files[0]
-            # source_path is like "noaa-ocs-nationalbathymetry-pds/BlueTopo/TileX/BlueTopo_TileX_2024.tiff"
-
-            # Construct HTTPS URL
-            # BUCKET_BASE = "noaa-ocs-nationalbathymetry-pds/BlueTopo"
-            # We want: https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/BlueTopo/TileX/BlueTopo_TileX_2024.tiff
-
-            # Split bucket from key
-            parts = source_path.split("/", 1)
-            if len(parts) < 2:
-                return None
-            key = parts[1]
-
-            url = f"https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/{key}"
-
-            # 2. Persist to disk for future calls
-            self._update_tile_url_cache(tile_id, url)
-            logger.debug(f"BlueTopo tile URL cache created: {tile_id} -> {url}")
-            return url
-
-        except Exception as e:
-            logger.error(f"BlueTopo URL Resolve Error: {e}")
-            return None
 
     def fetch_elevation(self, lat: float, lon: float) -> float | None:
         """
@@ -604,11 +644,10 @@ class NoaaBlueTopoProvider(Provider):
         logger.info(f"Streaming BlueTopo Asset: {http_url}")
 
         # 3. Stream & Cache to Zarr
+        da_raw = None
         try:
             # Open Streaming
-            da_raw: xr.DataArray = rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048})  # type: ignore[assignment]
-
-            from typing import cast
+            da_raw = cast(xr.DataArray, rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048}))
 
             # BlueTopo: Band 1=Elevation, Band 2=Uncertainty, Band 3=Contributor
             if "band" in da_raw.dims and da_raw.sizes["band"] >= 3:
@@ -653,6 +692,12 @@ class NoaaBlueTopoProvider(Provider):
         except Exception as e:
             logger.error(f"Failed to stream/cache BlueTopo tile {tile_id}: {e}")
             return None
+        finally:
+            if da_raw is not None:
+                with contextlib.suppress(Exception):
+                    da_raw.close()
+
+        return None
 
         return None
 
