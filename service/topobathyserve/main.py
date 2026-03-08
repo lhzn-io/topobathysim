@@ -963,9 +963,10 @@ def get_xyz_tile(
     dx_deg = (east - west) / tile_size
     dy_deg = (north - south) / tile_size
 
-    # Fetch slightly larger region than strictly necessary to prevent Web Mercator
-    # interpolation NaNs at the tile edge
-    fetch_pad = TILE_PADDING_PX
+    # Fetch slightly larger region than strictly necessary to prevent edge artifacts.
+    # For source/data outputs, avoid fetch halo to prevent deterministic seam stripes
+    # from neighboring-tile context leaking into per-tile provenance.
+    fetch_pad = 0 if style == "source" or format in ["npy", "npz"] else TILE_PADDING_PX
     req_west = west - dx_deg * fetch_pad
     req_east = east + dx_deg * fetch_pad
     req_south = south - dy_deg * fetch_pad

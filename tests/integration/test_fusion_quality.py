@@ -1,5 +1,9 @@
 import os
+import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import FrameType
 
 import numpy as np
 import pytest
@@ -23,6 +27,27 @@ CENTER_LAT = 40.8634
 CENTER_LON = -73.7279
 
 
+@contextmanager
+def _time_limit(seconds: int) -> Iterator[None]:
+    """Raise TimeoutError if a block exceeds the given wall-clock seconds."""
+    if not hasattr(signal, "SIGALRM"):
+        # Non-POSIX fallback: no hard timeout available.
+        yield
+        return
+
+    def _handler(signum: int, frame: FrameType | None) -> None:
+        raise TimeoutError(f"Operation exceeded {seconds}s")
+
+    previous = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 @pytest.mark.integration
 def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     """
@@ -31,10 +56,17 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     1. Coverage: % valid pixels in fused output (should be near 100% if sources overlap).
     2. Continuity: Check for cliffs vs smooth transition.
     """
+    if os.getenv("RUN_SLOW_INTEGRATION", "0").lower() not in {"1", "true", "yes"}:
+        pytest.skip("Set RUN_SLOW_INTEGRATION=1 to run long external fusion quality test")
+
     print(f"\n[Test] Fetching Lidar from {LIDAR_URL}...")
     lidar_prov = UsgsLidarProvider(cache_dir=str(persistent_cache_dir))
     # Fetch ~500m box around center
-    lidar_da = lidar_prov.fetch_lidar_from_laz(LIDAR_URL, resolution=4.0)  # 4m grid
+    try:
+        with _time_limit(180):
+            lidar_da = lidar_prov.fetch_lidar_from_laz(LIDAR_URL, resolution=4.0)  # 4m grid
+    except TimeoutError as exc:
+        pytest.skip(f"Skipping integration test: Lidar fetch stalled ({exc})")
 
     assert lidar_da is not None, "Failed to fetch Lidar data."
     lidar_da.load()  # Force load into memory
@@ -57,7 +89,11 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     print(f"[Test] Fetching Bathymetry for bounds: {west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}...")
     manager = BathyManager(cache_dir=str(persistent_cache_dir))
     # Explicitly cast to DataArray as we are not requesting source mask
-    bathy_da_maybe = manager.get_grid(south, north, west, east, target_shape=(128, 128))
+    try:
+        with _time_limit(180):
+            bathy_da_maybe = manager.get_grid(south, north, west, east, target_shape=(128, 128))
+    except TimeoutError as exc:
+        pytest.skip(f"Skipping integration test: Bathymetry fetch stalled ({exc})")
 
     assert bathy_da_maybe is not None, "Failed to fetch Bathymetry."
 

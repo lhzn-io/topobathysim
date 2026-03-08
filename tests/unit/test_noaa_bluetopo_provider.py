@@ -1,0 +1,186 @@
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import numpy as np
+import xarray as xr
+
+from topobathysim.providers.noaa_bluetopo import NoaaBlueTopoProvider
+
+
+def _make_tile_dataset(
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    crs: str,
+    value: float = -5.0,
+    src_id: int = 1,
+) -> xr.Dataset:
+    x = np.linspace(x_min, x_max, 32)
+    y = np.linspace(y_max, y_min, 32)
+
+    elev = xr.DataArray(
+        np.full((32, 32), value, dtype=np.float32),
+        coords={"y": y, "x": x},
+        dims=("y", "x"),
+        name="elevation",
+    )
+    src = xr.DataArray(
+        np.full((32, 32), src_id, dtype=np.uint32),
+        coords={"y": y, "x": x},
+        dims=("y", "x"),
+        name="source_id",
+    )
+
+    elev.rio.write_crs(crs, inplace=True)
+    src.rio.write_crs(crs, inplace=True)
+
+    ds = xr.Dataset({"elevation": elev, "source_id": src})
+    ds.rio.write_crs(crs, inplace=True)
+    ds.rio.write_transform(elev.rio.transform(), inplace=True)
+    return ds
+
+
+def _new_provider(tmp_path: Path) -> NoaaBlueTopoProvider:
+    # Provider is a singleton; reset for test isolation.
+    NoaaBlueTopoProvider._singleton = None
+    provider = NoaaBlueTopoProvider(cache_dir=str(tmp_path / "cache"))
+    return provider
+
+
+def test_validate_geotransform_success_and_failure(tmp_path: Path) -> None:
+    provider = _new_provider(tmp_path)
+
+    valid_ds = _make_tile_dataset(0.0, 10.0, 0.0, 10.0, "EPSG:4326")
+    ok, _ = provider._validate_geotransform(valid_ds, label="valid")
+    assert ok is True
+
+    invalid_ds = xr.Dataset(
+        {
+            "elevation": xr.DataArray(
+                np.ones((4, 4), dtype=np.float32),
+                coords={"y": np.arange(4), "x": np.arange(4)},
+                dims=("y", "x"),
+            )
+        }
+    )
+    ok, msg = provider._validate_geotransform(invalid_ds, label="invalid")
+    assert ok is False
+    assert "missing CRS" in msg
+
+
+def test_check_tile_alignment_detects_mixed_crs(tmp_path: Path) -> None:
+    provider = _new_provider(tmp_path)
+
+    ds_4326 = _make_tile_dataset(-72.0, -71.0, 41.0, 42.0, "EPSG:4326")
+    ds_3857 = _make_tile_dataset(-8100000.0, -8099000.0, 5000000.0, 5001000.0, "EPSG:3857")
+
+    aligned = provider._check_tile_alignment([ds_4326, ds_3857], label="mixed")
+    assert aligned is False
+
+
+def test_fetch_layer_non_4326_bbox_keeps_bluetopo_contribution(tmp_path: Path) -> None:
+    provider = _new_provider(tmp_path)
+
+    tile_ds = _make_tile_dataset(
+        x_min=1_000_000.0,
+        x_max=1_001_000.0,
+        y_min=1_000_000.0,
+        y_max=1_001_000.0,
+        crs="EPSG:3857",
+        value=-8.0,
+        src_id=1,
+    )
+
+    request_bbox = (1_000_050.0, 1_000_050.0, 1_000_950.0, 1_000_950.0)
+
+    with (
+        patch.object(provider, "resolve_tiles_in_bbox", return_value=["TILE_1"]),
+        patch.object(provider, "load_tile_as_da", return_value=tile_ds),
+        patch.object(provider, "_resolve_from_sidecar_rat", return_value=None),
+        patch.object(provider, "get_source_survey_id", return_value="H_TEST"),
+    ):
+        result = provider.fetch_layer(bbox=request_bbox, crs="EPSG:3857")
+
+    assert isinstance(result, xr.Dataset)
+    assert "source_id" in result
+
+    source_vals = result["source_id"].values
+    assert np.nanmax(source_vals) > 0
+    assert np.isfinite(result["elevation"].values).any()
+
+    bounds = result.rio.bounds()
+    # Allow one-cell tolerance because clip bounds snap to raster grid edges.
+    tol = 5.0
+    assert bounds[0] >= request_bbox[0] - tol
+    assert bounds[1] >= request_bbox[1] - tol
+    assert bounds[2] <= request_bbox[2] + tol
+    assert bounds[3] <= request_bbox[3] + tol
+
+
+def test_fetch_layer_reprojects_mixed_crs_tiles(tmp_path: Path) -> None:
+    provider = _new_provider(tmp_path)
+
+    ds_4326 = _make_tile_dataset(-72.0, -71.9, 41.0, 41.1, "EPSG:4326", value=-4.0, src_id=1)
+    ds_3857 = _make_tile_dataset(
+        -8_100_000.0,
+        -8_099_000.0,
+        5_000_000.0,
+        5_001_000.0,
+        "EPSG:3857",
+        value=-6.0,
+        src_id=1,
+    )
+
+    # Return different CRSs for the two tile loads.
+    call_order: dict[str, Any] = {"i": 0}
+
+    def _load_side_effect(_: str, __: tuple[float, float, float, float]) -> xr.Dataset:
+        call_order["i"] += 1
+        return ds_4326 if call_order["i"] == 1 else ds_3857
+
+    with (
+        patch.object(provider, "resolve_tiles_in_bbox", return_value=["TILE_A", "TILE_B"]),
+        patch.object(provider, "load_tile_as_da", side_effect=_load_side_effect),
+        patch.object(provider, "_resolve_from_sidecar_rat", return_value=None),
+        patch.object(provider, "get_source_survey_id", return_value="H_TEST"),
+    ):
+        result = provider.fetch_layer(bbox=(-72.1, 40.9, -71.8, 41.2), crs="EPSG:4326")
+
+    assert isinstance(result, xr.Dataset)
+    assert result.rio.crs is not None
+    assert result.rio.crs.to_string() == "EPSG:4326"
+    assert np.nanmax(result["source_id"].values) > 0
+
+
+def test_fetch_layer_single_projected_tile_reprojects_to_requested_crs(tmp_path: Path) -> None:
+    provider = _new_provider(tmp_path)
+
+    # Single projected tile (no mixed CRS merge path).
+    ds_3857 = _make_tile_dataset(
+        x_min=732_700.0,
+        x_max=739_400.0,
+        y_min=4_553_500.0,
+        y_max=4_562_200.0,
+        crs="EPSG:3857",
+        value=-7.0,
+        src_id=1,
+    )
+
+    with (
+        patch.object(provider, "resolve_tiles_in_bbox", return_value=["TILE_ONLY"]),
+        patch.object(provider, "load_tile_as_da", return_value=ds_3857),
+        patch.object(provider, "_resolve_from_sidecar_rat", return_value=None),
+        patch.object(provider, "get_source_survey_id", return_value="H_TEST"),
+    ):
+        result = provider.fetch_layer(
+            bbox=(-72.158203125, 41.11246878918086, -72.1142578125, 41.14556973100949),
+            crs="EPSG:4326",
+        )
+
+    assert isinstance(result, xr.Dataset)
+    assert result.rio.crs is not None
+    assert result.rio.crs.to_string() == "EPSG:4326"
+    assert np.isfinite(result["elevation"].values).any()
+    assert np.nanmax(result["source_id"].values) > 0

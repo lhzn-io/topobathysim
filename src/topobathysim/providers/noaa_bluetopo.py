@@ -8,6 +8,7 @@ bathymetry from modern surveys. It handles S3 access, tile resolution via RAT, a
 import contextlib
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -16,6 +17,7 @@ import geopandas as gpd
 import requests  # type: ignore
 import rioxarray
 import xarray as xr
+from affine import Affine
 from filelock import FileLock
 from rioxarray.merge import merge_arrays
 from shapely.geometry import Point, box
@@ -58,6 +60,9 @@ class NoaaBlueTopoProvider(Provider):
 
     _singleton: ClassVar["NoaaBlueTopoProvider | None"] = None
     _initialized: bool
+    _CACHE_CRS_ATTR: ClassVar[str] = "_tbs_cache_crs"
+    _TARGET_GRID_PAD_PX: ClassVar[int] = 4
+    _SEAM_FILL_MAX_PX: ClassVar[int] = 4
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "NoaaBlueTopoProvider":
         if cls._singleton is None:
@@ -83,6 +88,348 @@ class NoaaBlueTopoProvider(Provider):
         self._gdf = None
         self._initialized = True
 
+    def _validate_geotransform(self, ds: xr.Dataset | xr.DataArray, label: str = "") -> tuple[bool, str]:
+        """
+        Validates that a dataset has a valid geotransform.
+        Returns (is_valid, diagnostic_message).
+        """
+        try:
+            if not hasattr(ds, "rio"):
+                return False, f"{label} missing rio accessor"
+
+            crs = self._dataset_crs(ds)
+            if not crs:
+                return False, f"{label} missing CRS"
+
+            transform = None
+            with contextlib.suppress(Exception):
+                transform = ds.rio.transform()
+
+            # Some Zarr reads preserve CRS/transform at variable level but not dataset
+            # level. Fall back to elevation transform for validation.
+            if (
+                (transform is None or transform.a == 0 or transform.e == 0)
+                and isinstance(ds, xr.Dataset)
+                and "elevation" in ds
+            ):
+                with contextlib.suppress(Exception):
+                    transform = ds["elevation"].rio.transform()
+
+            if transform is None:
+                return False, f"{label} missing geotransform"
+
+            # Check for NaN or zero scale
+            if (
+                transform.a == 0
+                or transform.e == 0
+                or (transform.a != transform.a)
+                or (transform.e != transform.e)
+            ):  # NaN check
+                return False, f"{label} geotransform scale is zero/NaN: {transform}"
+
+            # Log successful validation
+            logger.debug(
+                f"{label} geotransform valid: CRS={crs}, "
+                f"origin=({transform.c:.6f}, {transform.f:.6f}), "
+                f"scale=({transform.a:.6f}, {transform.e:.6f})"
+            )
+            return True, f"{label} geotransform OK"
+        except Exception as e:
+            return False, f"{label} geotransform validation error: {e}"
+
+    def _dataset_crs(self, ds: xr.Dataset | xr.DataArray) -> Any | None:
+        """Return a reliable CRS for Dataset/DataArray.
+
+        Dataset.rio.crs can be None after merges; in that case we fall back to the
+        elevation variable's CRS when present.
+        """
+        try:
+            if hasattr(ds, "rio") and ds.rio.crs:
+                return ds.rio.crs
+        except Exception:
+            pass
+
+        if isinstance(ds, xr.Dataset) and "elevation" in ds:
+            with contextlib.suppress(Exception):
+                if ds["elevation"].rio.crs:
+                    return ds["elevation"].rio.crs
+        return None
+
+    def _ensure_dataset_spatial_ref(self, ds: xr.Dataset) -> xr.Dataset:
+        """Ensure dataset-level CRS/transform exist, deriving from elevation if needed."""
+        try:
+            if ds.rio.crs:
+                return ds
+        except Exception:
+            pass
+
+        if "elevation" in ds:
+            elev = ds["elevation"]
+            with contextlib.suppress(Exception):
+                if elev.rio.crs:
+                    ds.rio.write_crs(elev.rio.crs, inplace=True)
+            with contextlib.suppress(Exception):
+                ds.rio.write_transform(elev.rio.transform(), inplace=True)
+        return ds
+
+    def _stash_cache_crs(self, ds: xr.Dataset) -> xr.Dataset:
+        """Persist CRS in attrs as a fallback for Zarr round-trips."""
+        crs = self._dataset_crs(ds)
+        if not crs:
+            return ds
+
+        crs_text = crs.to_string() if hasattr(crs, "to_string") else str(crs)
+        ds.attrs[self._CACHE_CRS_ATTR] = crs_text
+        if "elevation" in ds:
+            ds["elevation"].attrs[self._CACHE_CRS_ATTR] = crs_text
+        if "source_id" in ds:
+            ds["source_id"].attrs[self._CACHE_CRS_ATTR] = crs_text
+        return ds
+
+    def _restore_cache_crs(self, ds: xr.Dataset) -> xr.Dataset:
+        """Restore CRS from fallback attrs when rio metadata is absent after read."""
+        if self._dataset_crs(ds):
+            return ds
+
+        crs_text = ds.attrs.get(self._CACHE_CRS_ATTR) or ds.get("elevation", xr.DataArray()).attrs.get(
+            self._CACHE_CRS_ATTR
+        )
+        if not crs_text:
+            return ds
+
+        with contextlib.suppress(Exception):
+            ds.rio.write_crs(crs_text, inplace=True)
+        if "elevation" in ds:
+            with contextlib.suppress(Exception):
+                ds["elevation"].rio.write_crs(crs_text, inplace=True)
+        if "source_id" in ds:
+            with contextlib.suppress(Exception):
+                ds["source_id"].rio.write_crs(crs_text, inplace=True)
+        return ds
+
+    def _check_tile_alignment(self, tiles: list[xr.Dataset], label: str = "") -> bool:
+        """
+        Validates that all tiles in a list have compatible coordinate systems.
+        Returns True if all compatible, False if misaligned.
+        """
+        if not tiles or len(tiles) < 2:
+            return True
+
+        try:
+            ref_ds = tiles[0]
+            ref_crs = ref_ds.rio.crs
+            ref_transform = ref_ds.rio.transform()
+
+            for i, ds in enumerate(tiles[1:], start=1):
+                # Check CRS match
+                if ds.rio.crs != ref_crs:
+                    logger.warning(
+                        f"{label} Tile {i} CRS mismatch: " f"{ds.rio.crs} != {ref_crs}. Will reproject."
+                    )
+                    return False
+
+                # Check geotransform
+                ds_transform = ds.rio.transform()
+                if ds_transform != ref_transform:
+                    logger.warning(
+                        f"{label} Tile {i} geotransform mismatch: " f"{ds_transform} != {ref_transform}"
+                    )
+                    # Small pixel-size differences OK, but warn on major differences
+                    if (
+                        abs(ds_transform.a - ref_transform.a) > 0.001
+                        or abs(ds_transform.e - ref_transform.e) > 0.001
+                    ):
+                        return False
+
+            logger.info(f"{label} All tiles aligned (CRS + geotransform OK)")
+            return True
+        except Exception as e:
+            logger.warning(f"{label} Tile alignment check failed: {e}")
+            return False
+
+    def _align_tiles_to_reference_grid(self, tiles: list[xr.Dataset], label: str = "") -> list[xr.Dataset]:
+        """Align all tiles to the first tile's grid to avoid merge seamline gaps."""
+        if not tiles:
+            return tiles
+
+        try:
+            from rasterio.enums import Resampling
+        except Exception:
+            logger.warning(f"{label} Could not import rasterio Resampling. Skipping grid alignment.")
+            return tiles
+
+        ref = self._ensure_dataset_spatial_ref(tiles[0])
+        aligned: list[xr.Dataset] = [ref]
+
+        for i, ds in enumerate(tiles[1:], start=1):
+            try:
+                ds = self._ensure_dataset_spatial_ref(ds)
+
+                ref_crs = self._dataset_crs(ref)
+                ds_crs = self._dataset_crs(ds)
+                if not ref_crs or not ds_crs or ds_crs.to_string() != ref_crs.to_string():
+                    logger.warning(
+                        f"{label} tile {i} CRS mismatch during reference alignment. Keeping original tile."
+                    )
+                    aligned.append(ds)
+                    continue
+
+                aligned_elev = ds["elevation"].rio.reproject_match(
+                    ref["elevation"], resampling=Resampling.bilinear
+                )
+                aligned_src = ds["source_id"].rio.reproject_match(
+                    ref["source_id"], resampling=Resampling.nearest
+                )
+                aligned_src = aligned_src.fillna(0).astype("uint32")
+
+                aligned_ds = xr.Dataset({"elevation": aligned_elev, "source_id": aligned_src})
+                aligned_ds.rio.write_crs(ref_crs, inplace=True)
+                aligned_ds.rio.write_transform(ref["elevation"].rio.transform(), inplace=True)
+                aligned_ds = self._ensure_dataset_spatial_ref(aligned_ds)
+
+                is_valid, msg = self._validate_geotransform(aligned_ds, label=f"{label}:tile{i}:aligned")
+                if not is_valid:
+                    logger.warning(f"{label} alignment validation failed for tile {i}: {msg}")
+                    aligned.append(ds)
+                else:
+                    aligned.append(aligned_ds)
+            except Exception as e:
+                logger.warning(f"{label} failed to align tile {i} to reference grid: {e}")
+                aligned.append(ds)
+
+        return aligned
+
+    def _align_tiles_to_target_grid(
+        self,
+        tiles: list[xr.Dataset],
+        target_crs: str,
+        bounds: tuple[float, float, float, float],
+        resolution: float,
+        label: str = "",
+    ) -> list[xr.Dataset]:
+        """Reproject all tiles onto an explicit shared grid (most robust)."""
+        if not tiles:
+            return tiles
+
+        try:
+            from rasterio.enums import Resampling
+        except Exception:
+            logger.warning(f"{label} Could not import rasterio Resampling. Skipping grid alignment.")
+            return tiles
+
+        west, south, east, north = bounds
+
+        if target_crs.upper() == "EPSG:4326":
+            mid_lat = (north + south) / 2.0
+            meters_per_deg_lat = 110540.0
+            meters_per_deg_lon = 111320.0 * max(math.cos(math.radians(mid_lat)), 1.0e-6)
+            res_x = resolution / meters_per_deg_lon
+            res_y = resolution / meters_per_deg_lat
+        else:
+            res_x = resolution
+            res_y = resolution
+
+        # Add a padding halo so neighboring reprojected tiles overlap and avoid seam gaps.
+        # Measured seamline gaps in WLIS zoom-13 tiles are typically 4 pixels.
+        pad_px = self._TARGET_GRID_PAD_PX
+        west -= res_x * pad_px
+        east += res_x * pad_px
+        south -= res_y * pad_px
+        north += res_y * pad_px
+
+        width = max(1, math.ceil((east - west) / res_x))
+        height = max(1, math.ceil((north - south) / res_y))
+
+        transform = Affine.translation(west, north) * Affine.scale(res_x, -res_y)
+
+        aligned: list[xr.Dataset] = []
+        for i, ds in enumerate(tiles):
+            try:
+                ds = self._ensure_dataset_spatial_ref(ds)
+
+                aligned_elev = ds["elevation"].rio.reproject(
+                    target_crs,
+                    transform=transform,
+                    shape=(height, width),
+                    resampling=Resampling.bilinear,
+                )
+                aligned_src = ds["source_id"].rio.reproject(
+                    target_crs,
+                    transform=transform,
+                    shape=(height, width),
+                    resampling=Resampling.nearest,
+                )
+                aligned_src = aligned_src.fillna(0).astype("uint32")
+
+                aligned_ds = xr.Dataset({"elevation": aligned_elev, "source_id": aligned_src})
+                aligned_ds.rio.write_crs(target_crs, inplace=True)
+                aligned_ds.rio.write_transform(transform, inplace=True)
+                aligned_ds = self._ensure_dataset_spatial_ref(aligned_ds)
+
+                is_valid, msg = self._validate_geotransform(aligned_ds, label=f"{label}:tile{i}:target-grid")
+                if not is_valid:
+                    logger.warning(f"{label} target-grid validation failed for tile {i}: {msg}")
+                    aligned.append(ds)
+                else:
+                    aligned.append(aligned_ds)
+            except Exception as e:
+                logger.warning(f"{label} failed to reproject tile {i} to target grid: {e}")
+                aligned.append(ds)
+
+        return aligned
+
+    def _fill_small_seams(self, ds: xr.Dataset, label: str = "") -> xr.Dataset:
+        """Fill small seam gaps inside BlueTopo coverage using nearest valid pixels."""
+        if self._SEAM_FILL_MAX_PX <= 0:
+            return ds
+
+        if "elevation" not in ds or "source_id" not in ds:
+            return ds
+
+        try:
+            import numpy as np
+            from scipy.ndimage import distance_transform_edt
+        except Exception as e:
+            logger.warning(f"{label} seam fill unavailable: {e}")
+            return ds
+
+        elev = ds["elevation"].values
+        src = ds["source_id"].values
+
+        valid = np.isfinite(elev) & (src > 0)
+        if not np.any(valid):
+            return ds
+
+        missing = ~valid
+        if not np.any(missing):
+            return ds
+
+        distance, indices = distance_transform_edt(missing, return_indices=True)  # type: ignore[assignment]
+        fill_mask = distance <= self._SEAM_FILL_MAX_PX
+        if not np.any(fill_mask):
+            return ds
+
+        nearest_elev = elev[tuple(indices)]
+        nearest_src = src[tuple(indices)]
+
+        elev_filled = elev.copy()
+        src_filled = src.copy()
+
+        elev_filled[fill_mask] = nearest_elev[fill_mask]
+        src_filled[fill_mask] = nearest_src[fill_mask]
+
+        ds_out = xr.Dataset(
+            {
+                "elevation": (ds["elevation"].dims, elev_filled),
+                "source_id": (ds["source_id"].dims, src_filled.astype("uint32")),
+            },
+            coords=ds.coords,
+            attrs=ds.attrs,
+        )
+        ds_out = self._ensure_dataset_spatial_ref(ds_out)
+        logger.info(f"{label} filled seam pixels: {int(fill_mask.sum())}")
+        return ds_out
+
     def fetch_layer(
         self,
         bbox: tuple[float, float, float, float],
@@ -96,6 +443,12 @@ class NoaaBlueTopoProvider(Provider):
         """
         # Ensure the bbox is in EPSG:4326 for tile resolution and metadata checks
         west, south, east, north = self._normalize_bbox(bbox, crs)
+
+        # Keep request-CRS bounds for final clipping when the caller asks for
+        # a non-4326 output (e.g., web mercator tile requests).
+        req_west, req_south, req_east, req_north = west, south, east, north
+        if crs and str(crs).upper() != "EPSG:4326":
+            req_west, req_south, req_east, req_north = bbox
 
         # 1. Resolve Tiles
         tile_ids = self.resolve_tiles_in_bbox(west, south, east, north)
@@ -194,6 +547,14 @@ class NoaaBlueTopoProvider(Provider):
                 if da_elev.rio.crs:
                     p_ds.rio.write_crs(da_elev.rio.crs, inplace=True)
                 p_ds.rio.write_transform(da_elev.rio.transform(), inplace=True)
+                p_ds = self._ensure_dataset_spatial_ref(p_ds)
+
+                # Validate geotransform immediately after loading
+                is_valid, msg = self._validate_geotransform(p_ds, label=f"Tile {tid}")
+                if not is_valid:
+                    logger.error(f"Geotransform validation failed: {msg}")
+                else:
+                    logger.info(msg)
 
                 das.append(p_ds)
 
@@ -208,82 +569,230 @@ class NoaaBlueTopoProvider(Provider):
             if ds.rio.crs:
                 unique_crss.add(ds.rio.crs.to_string())
 
+        # Validate pre-reproject alignment
+        alignment_ok = self._check_tile_alignment(das, label="BlueTopo:pre-reproject")
+
         if len(unique_crss) > 1:
             logger.info(f"BlueTopo tiles have mixed CRSs {unique_crss}. Reprojecting to {crs} before merge.")
             reprojected_das = []
-            for ds in das:
+            for i, ds in enumerate(das):
                 try:
-                    # Reproject to target and clip loosely to avoid huge memory usage
-                    # Note: We can't clip easily before reproject if we are in mixed zones.
-                    # Just reprojecting handles it.
-                    reprojected_das.append(ds.rio.reproject(crs))
+                    # Log pre-reproject state
+                    pre_transform = ds.rio.transform()
+                    pre_crs = ds.rio.crs
+                    logger.debug(f"BlueTopo tile {i}: pre-reproject CRS={pre_crs}, transform={pre_transform}")
+
+                    # Reproject to target
+                    reprojected_ds = ds.rio.reproject(crs)
+
+                    # Validate post-reproject
+                    is_valid, msg = self._validate_geotransform(
+                        reprojected_ds, label=f"BlueTopo:tile{i}:post-reproject"
+                    )
+                    if not is_valid:
+                        logger.error(f"Post-reproject validation failed: {msg}. Keeping original.")
+                        reprojected_das.append(ds)
+                    else:
+                        # Log post-reproject state
+                        post_transform = reprojected_ds.rio.transform()
+                        logger.debug(
+                            f"BlueTopo tile {i}: post-reproject CRS={reprojected_ds.rio.crs}, "
+                            f"transform={post_transform}"
+                        )
+                        reprojected_das.append(reprojected_ds)
+
                 except Exception as e:
-                    logger.warning(f"Failed to reproject BlueTopo tile during merge: {e}")
+                    logger.warning(f"Failed to reproject BlueTopo tile {i} during merge: {e}")
                     reprojected_das.append(ds)
             das = reprojected_das
+            alignment_ok = self._check_tile_alignment(das, label="BlueTopo:post-reproject")
+
+        # Mixed UTM tiles can reproject to slightly different transforms/resolutions
+        # (e.g., 0.000040 vs 0.000041 deg), creating seamline nodata slivers that
+        # later get filled by lower-priority providers. Normalize to one grid.
+        if len(das) > 1:
+            if resolution:
+                grid_bounds = (west, south, east, north)
+                if crs and str(crs).upper() != "EPSG:4326":
+                    grid_bounds = (req_west, req_south, req_east, req_north)
+                logger.info("BlueTopo: reprojecting tiles to explicit shared grid")
+                das = self._align_tiles_to_target_grid(
+                    das,
+                    target_crs=crs,
+                    bounds=grid_bounds,
+                    resolution=resolution,
+                    label="BlueTopo:target-grid",
+                )
+                alignment_ok = self._check_tile_alignment(das, label="BlueTopo:post-target-grid")
+            elif not alignment_ok:
+                logger.info("BlueTopo: normalizing tiles to a shared reference grid before merge")
+                das = self._align_tiles_to_reference_grid(das, label="BlueTopo:align-ref")
+                alignment_ok = self._check_tile_alignment(das, label="BlueTopo:post-align-ref")
 
         # 4. Merge
         if len(das) == 1:
-            merged = das[0]
+            merged = self._ensure_dataset_spatial_ref(das[0])
         else:
             try:
+                logger.info(
+                    f"BlueTopo: Merging {len(das)} tiles. "
+                    f"Alignment check: {'PASS' if alignment_ok else 'WARN'}"
+                )
+
                 # Merge arrays natively puts last element on top
                 elevs = [ds["elevation"] for ds in das]
                 sources = [ds["source_id"] for ds in das]
 
                 final_elev = merge_arrays(elevs)
                 final_src = merge_arrays(sources)
-                merged = xr.Dataset({"elevation": final_elev, "source_id": final_src})
+
+                # Validate merged result
+                merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
+                merged_ds = self._ensure_dataset_spatial_ref(merged_ds)
+                is_valid, msg = self._validate_geotransform(merged_ds, label="BlueTopo:merged")
+                if not is_valid:
+                    logger.error(f"Post-merge validation failed: {msg}")
+                else:
+                    logger.info(msg)
+
+                merged = merged_ds
             except Exception as e:
                 logger.error(f"Failed to merge BlueTopo tiles: {e}")
                 merged = das[0]  # Fallback
 
-        # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds)
+        # Fill small seam gaps before clipping/reprojection.
+        merged = self._fill_small_seams(merged, label="BlueTopo:seam-fill")
+
+        # OPTIMIZATION: Clip in Source CRS first (using 4326 bounds + 10% buffer)
         # We add a 10% buffer to the clip bounds. This prevents "rotated swatch" gaps
         # where the source-CRS clip (axis-aligned in source) becomes a rotated rectangle
         # in the target CRS that doesn't fully cover the corners of the target bbox.
         try:
             pad_x = (east - west) * 0.1
             pad_y = (north - south) * 0.1
+            merged = self._ensure_dataset_spatial_ref(merged)
 
-            merged = merged.rio.clip_box(
-                minx=west - pad_x,
-                miny=south - pad_y,
-                maxx=east + pad_x,
-                maxy=north + pad_y,
-                crs="EPSG:4326",
-                allow_one_dimensional_raster=True,
-            )
+            # Check current CRS of merged dataset
+            current_crs = self._dataset_crs(merged)
+            clip_crs = "EPSG:4326"  # Define clip bounds in 4326
+
+            # If merged is in a different CRS, we need to reproject bounds or clip in native CRS
+            if current_crs and current_crs.to_string() != clip_crs:
+                logger.debug(
+                    f"BlueTopo: Merged dataset in {current_crs}, clip bounds in {clip_crs}. "
+                    f"Will clip in native CRS."
+                )
+                # Clip uses the current CRS, so we must transform bbox to current CRS
+                from pyproj import Transformer
+
+                transformer = Transformer.from_crs(clip_crs, current_crs, always_xy=True)
+                clip_west, clip_south = transformer.transform(west - pad_x, south - pad_y)
+                clip_east, clip_north = transformer.transform(east + pad_x, north + pad_y)
+
+                merged = merged.rio.clip_box(
+                    minx=min(clip_west, clip_east),
+                    miny=min(clip_south, clip_north),
+                    maxx=max(clip_west, clip_east),
+                    maxy=max(clip_south, clip_north),
+                    crs=current_crs,
+                    allow_one_dimensional_raster=True,
+                )
+            else:
+                merged = merged.rio.clip_box(
+                    minx=west - pad_x,
+                    miny=south - pad_y,
+                    maxx=east + pad_x,
+                    maxy=north + pad_y,
+                    crs=clip_crs,
+                    allow_one_dimensional_raster=True,
+                )
         except Exception as e:
             logger.warning(f"BlueTopo Clip failed (no overlap?): {e}")
             pass
 
         # Reproject to Requested CRS if needed
-        if crs and merged.rio.crs and merged.rio.crs != crs:
+        merged_current_crs = self._dataset_crs(merged)
+        if crs and merged_current_crs and merged_current_crs.to_string() != crs:
             try:
-                merged = merged.rio.reproject(crs)
-            except Exception as e:
-                logger.warning(f"Reprojection failed: {e}")
+                logger.info(f"BlueTopo: Reprojecting merged result to {crs}")
+                pre_final_transform = merged.rio.transform()
+                logger.debug(f"BlueTopo: pre-final-reproject transform={pre_final_transform}")
 
-        # Final Exact Clip to exact bbox (cleanup)
-        with contextlib.suppress(Exception):
-            merged_elev = merged["elevation"].rio.clip_box(
-                minx=west,
-                miny=south,
-                maxx=east,
-                maxy=north,
-                crs="EPSG:4326",
-                allow_one_dimensional_raster=True,
-            )
-            merged_src = merged["source_id"].rio.clip_box(
-                minx=west,
-                miny=south,
-                maxx=east,
-                maxy=north,
-                crs="EPSG:4326",
-                allow_one_dimensional_raster=True,
-            )
+                merged = merged.rio.reproject(crs)
+                merged = self._ensure_dataset_spatial_ref(merged)
+
+                is_valid, msg = self._validate_geotransform(merged, label="BlueTopo:final-reproject")
+                if not is_valid:
+                    logger.error(f"Final reprojection validation failed: {msg}")
+                else:
+                    logger.info(msg)
+
+                post_final_transform = merged.rio.transform()
+                logger.debug(f"BlueTopo: post-final-reproject transform={post_final_transform}")
+            except Exception as e:
+                logger.warning(f"Final reprojection failed: {e}")
+
+        # Final Exact Clip to exact bbox (cleanup, in request CRS)
+        try:
+            merged = self._ensure_dataset_spatial_ref(merged)
+            current_crs = self._dataset_crs(merged)
+            final_clip_crs = crs if crs else "EPSG:4326"
+
+            final_west, final_south, final_east, final_north = west, south, east, north
+            if final_clip_crs and str(final_clip_crs).upper() != "EPSG:4326":
+                final_west, final_south, final_east, final_north = (
+                    req_west,
+                    req_south,
+                    req_east,
+                    req_north,
+                )
+
+            if current_crs and current_crs.to_string() != str(final_clip_crs):
+                # Need to transform bbox to current CRS for final clip
+                from pyproj import Transformer
+
+                transformer = Transformer.from_crs(final_clip_crs, current_crs, always_xy=True)
+                c_west, c_south = transformer.transform(final_west, final_south)
+                c_east, c_north = transformer.transform(final_east, final_north)
+
+                merged_elev = merged["elevation"].rio.clip_box(
+                    minx=min(c_west, c_east),
+                    miny=min(c_south, c_north),
+                    maxx=max(c_west, c_east),
+                    maxy=max(c_south, c_north),
+                    crs=current_crs,
+                    allow_one_dimensional_raster=True,
+                )
+                merged_src = merged["source_id"].rio.clip_box(
+                    minx=min(c_west, c_east),
+                    miny=min(c_south, c_north),
+                    maxx=max(c_west, c_east),
+                    maxy=max(c_south, c_north),
+                    crs=current_crs,
+                    allow_one_dimensional_raster=True,
+                )
+            else:
+                merged_elev = merged["elevation"].rio.clip_box(
+                    minx=final_west,
+                    miny=final_south,
+                    maxx=final_east,
+                    maxy=final_north,
+                    crs=final_clip_crs,
+                    allow_one_dimensional_raster=True,
+                )
+                merged_src = merged["source_id"].rio.clip_box(
+                    minx=final_west,
+                    miny=final_south,
+                    maxx=final_east,
+                    maxy=final_north,
+                    crs=final_clip_crs,
+                    allow_one_dimensional_raster=True,
+                )
+
             merged = xr.Dataset({"elevation": merged_elev, "source_id": merged_src})
+            merged = self._ensure_dataset_spatial_ref(merged)
+        except Exception as e:
+            logger.warning(f"BlueTopo final clip failed: {e}")
 
         merged["elevation"].name = "elevation"
         merged.attrs["provenance_dict"] = provenance_dict
@@ -616,6 +1125,7 @@ class NoaaBlueTopoProvider(Provider):
         Loads the cached tile and clips to bbox (west, south, east, north).
         Uses Streaming Access (VSICURL) to avoid full download.
         Applies caching to Zarr format for faster subsequent reads.
+        Validates geotransform preservation through the caching pipeline.
         """
         # 1. Check Zarr Cache First (Fastest)
         zarr_name = f"{tile_id}.zarr"
@@ -625,10 +1135,37 @@ class NoaaBlueTopoProvider(Provider):
         if zarr_path.exists():
             try:
                 ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                ds = self._restore_cache_crs(ds)
+                ds = self._ensure_dataset_spatial_ref(ds)
                 logger.debug(f"BlueTopo Zarr Cache Hit: {zarr_name}")
-                if "elevation" in ds:
+
+                # Validate cached data has proper spatial info
+                is_valid_elev, _ = self._validate_geotransform(
+                    ds["elevation"], label=f"BlueTopo:zarr_cache:{tile_id}:elevation"
+                )
+                # source_id can legitimately omit CRS attrs while still sharing
+                # georeferenced x/y coordinates with elevation.
+                is_valid_src = "source_id" not in ds or (
+                    ds["source_id"].dims == ds["elevation"].dims
+                    and "x" in ds["source_id"].coords
+                    and "y" in ds["source_id"].coords
+                )
+
+                if not (is_valid_elev and is_valid_src):
+                    logger.warning(
+                        f"Cached BlueTopo tile {tile_id} failed geotransform validation. "
+                        f"Elevation valid={is_valid_elev}, SourceID valid={is_valid_src}. "
+                        f"Will invalidate and re-fetch."
+                    )
+                    import shutil
+
+                    shutil.rmtree(zarr_path)
+                    # Fall through to re-fetch
+                else:
+                    if "elevation" in ds:
+                        return ds
                     return ds
-                return ds
+
             except Exception as e:
                 logger.warning(f"Corrupt BlueTopo Zarr cache {zarr_path}: {e}")
                 import shutil
@@ -648,6 +1185,11 @@ class NoaaBlueTopoProvider(Provider):
         try:
             # Open Streaming
             da_raw = cast(xr.DataArray, rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048}))
+
+            # Log original source geotransform
+            orig_crs = da_raw.rio.crs
+            orig_transform = da_raw.rio.transform()
+            logger.debug(f"BlueTopo tile {tile_id} raw: CRS={orig_crs}, transform={orig_transform}")
 
             # BlueTopo: Band 1=Elevation, Band 2=Uncertainty, Band 3=Contributor
             if "band" in da_raw.dims and da_raw.sizes["band"] >= 3:
@@ -670,24 +1212,82 @@ class NoaaBlueTopoProvider(Provider):
                 da.name = "elevation"
                 ds_to_cache = xr.Dataset({"elevation": da})
 
-            # Cache to Zarr
-            # Lock to prevent race conditions
+            # CRITICAL: Ensure CRS and geotransform are properly set on dataset before caching
+            # rioxarray's .to_zarr() may not preserve spatial metadata, so we add it explicitly
+            if orig_crs:
+                ds_to_cache.rio.write_crs(orig_crs, inplace=True)
+            if orig_transform:
+                ds_to_cache.rio.write_transform(orig_transform, inplace=True)
+            if "source_id" in ds_to_cache:
+                with contextlib.suppress(Exception):
+                    ds_to_cache["source_id"].rio.write_crs(orig_crs, inplace=True)
+                with contextlib.suppress(Exception):
+                    ds_to_cache["source_id"].rio.write_transform(orig_transform, inplace=True)
+            ds_to_cache = self._stash_cache_crs(ds_to_cache)
+            ds_to_cache = self._ensure_dataset_spatial_ref(ds_to_cache)
+
+            # Validate before caching
+            is_valid, msg = self._validate_geotransform(ds_to_cache, label=f"BlueTopo:{tile_id}:pre-zarr")
+            if not is_valid:
+                logger.error(f"Pre-Zarr validation failed: {msg}. Will not cache.")
+                return ds_to_cache  # Return anyway, but don't cache
+
+            # Cache to Zarr with explicit attributes
             from filelock import FileLock
 
             lock_path = zarr_path.with_suffix(".zarr.lock")
 
             with FileLock(lock_path):
                 if zarr_path.exists():
-                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                    cached_ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                    cached_ds = self._restore_cache_crs(cached_ds)
+                    cached_ds = self._ensure_dataset_spatial_ref(cached_ds)
+                    is_valid, msg = self._validate_geotransform(
+                        cached_ds, label=f"BlueTopo:{tile_id}:zarr_cache_exists"
+                    )
+                    if is_valid:
+                        return cached_ds
+                    else:
+                        logger.warning(f"Existing Zarr cache invalid: {msg}. Overwriting.")
+                        import shutil
+
+                        shutil.rmtree(zarr_path)
 
                 if ds_to_cache["elevation"].size > 0:
                     if "y" in ds_to_cache.dims and "x" in ds_to_cache.dims:
                         ds_to_cache = ds_to_cache.chunk({"y": 1024, "x": 1024})
 
                     logger.info(f"Caching BlueTopo tile to Zarr: {zarr_name}")
-                    ds_to_cache.to_zarr(zarr_path, mode="w", consolidated=should_consolidate())
+                    # Write with explicit encoding to preserve spatial metadata
+                    ds_to_cache.to_zarr(
+                        zarr_path,
+                        mode="w",
+                        consolidated=should_consolidate(),
+                        encoding={"elevation": {}, "source_id": {}},
+                    )
 
-                    return xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                    # Verify cache can be read back
+                    cached_ds = xr.open_dataset(zarr_path, engine="zarr", chunks="auto", decode_coords="all")
+                    cached_ds = self._restore_cache_crs(cached_ds)
+                    cached_ds = self._ensure_dataset_spatial_ref(cached_ds)
+                    is_valid, msg = self._validate_geotransform(
+                        cached_ds, label=f"BlueTopo:{tile_id}:post-zarr-write"
+                    )
+                    if not is_valid:
+                        logger.error(
+                            "Post-Zarr validation failed: %s. " "Invalidating cache and using memory copy.",
+                            msg,
+                        )
+                        with contextlib.suppress(Exception):
+                            cached_ds.close()
+                        import shutil
+
+                        if zarr_path.exists():
+                            shutil.rmtree(zarr_path)
+                        return ds_to_cache
+
+                    logger.info(msg)
+                    return cached_ds
 
         except Exception as e:
             logger.error(f"Failed to stream/cache BlueTopo tile {tile_id}: {e}")
@@ -696,8 +1296,6 @@ class NoaaBlueTopoProvider(Provider):
             if da_raw is not None:
                 with contextlib.suppress(Exception):
                     da_raw.close()
-
-        return None
 
         return None
 
