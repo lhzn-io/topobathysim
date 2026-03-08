@@ -2,10 +2,53 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
 import xarray as xr
 from pyproj import Transformer
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_elevation_nodata(
+    da: xr.DataArray,
+    *,
+    extra_sentinels: tuple[float, ...] = (),
+    min_valid: float | None = None,
+    max_valid: float | None = None,
+    abs_valid_limit: float | None = 100000.0,
+) -> xr.DataArray:
+    """Mask nodata sentinels and impossible elevation values as NaN.
+
+    This helper handles common metadata-driven nodata values and optional
+    provider-specific sentinels/ranges.
+    """
+    nodata_candidates: set[float] = set(extra_sentinels)
+    for value in (
+        da.rio.nodata,
+        da.rio.encoded_nodata,
+        da.attrs.get("_FillValue"),
+        da.attrs.get("missing_value"),
+    ):
+        if value is None:
+            continue
+        try:
+            nodata_candidates.add(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    cleaned = da
+    cleaned = cleaned.where(np.isfinite(cleaned))
+    for nodata in nodata_candidates:
+        cleaned = cleaned.where(cleaned != nodata)
+
+    if abs_valid_limit is not None:
+        cleaned = cleaned.where(np.abs(cleaned) < abs_valid_limit)
+    if min_valid is not None:
+        cleaned = cleaned.where(cleaned > min_valid)
+    if max_valid is not None:
+        cleaned = cleaned.where(cleaned < max_valid)
+
+    return cleaned
 
 
 class ProviderNoDataError(LookupError):

@@ -16,7 +16,7 @@ from shapely.geometry import box
 
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from .base import Provider, ProviderNoDataError
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -103,28 +103,15 @@ class NoaaTopobathyProvider(Provider):
     @staticmethod
     def _sanitize_nodata_values(da: xr.DataArray) -> xr.DataArray:
         """Mask known NOAA nodata sentinels so they cannot leak into fusion outputs."""
-        nodata_candidates: list[float] = []
-        for value in (
-            da.rio.nodata,
-            da.rio.encoded_nodata,
-            da.attrs.get("_FillValue"),
-            da.attrs.get("missing_value"),
-        ):
-            if value is None:
-                continue
-            try:
-                nodata_candidates.append(float(value))
-            except (TypeError, ValueError):
-                continue
-
-        cleaned = da
-        for nodata in nodata_candidates:
-            cleaned = cleaned.where(cleaned != nodata)
-
-        # NOAA topobathy COGs have been observed with -999999 nodata leakage.
-        # Keep this broad threshold to catch stale cache artifacts and bad metadata.
-        cleaned = cleaned.where(cleaned > -999000)
-        return cast(xr.DataArray, cleaned)
+        return cast(
+            xr.DataArray,
+            sanitize_elevation_nodata(
+                da,
+                extra_sentinels=(-999999.0,),
+                min_valid=-999000,
+                abs_valid_limit=1000000.0,
+            ),
+        )
 
     @property
     def _tile_index(self) -> "gpd.GeoDataFrame | None":

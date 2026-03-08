@@ -14,7 +14,7 @@ import xarray as xr
 from rioxarray.merge import merge_arrays
 
 from ..runtime import should_consolidate
-from .base import Provider
+from .base import Provider, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -283,6 +283,7 @@ class GEBCO2025Provider(Provider):
                                     continue
 
                                 da_source = da_source.load()
+                                da_source = sanitize_elevation_nodata(da_source, abs_valid_limit=100000.0)
                                 if da_source.rio.crs is None:
                                     da_source.rio.write_crs("EPSG:4326", inplace=True)
 
@@ -415,6 +416,7 @@ class GEBCO2025Provider(Provider):
                 ]
 
                 final_elev = merge_arrays(elevs)
+                final_elev = sanitize_elevation_nodata(final_elev, abs_valid_limit=100000.0)
 
                 if sources:
                     final_src = merge_arrays(sources)
@@ -454,6 +456,7 @@ class GEBCO2025Provider(Provider):
         logger.debug("Found GEBCO 2025 Coverage")
         # Ensure consistent naming
         merged_ds["elevation"].name = "elevation"
+        merged_ds["elevation"] = sanitize_elevation_nodata(merged_ds["elevation"], abs_valid_limit=100000.0)
         merged_ds.attrs["provenance_dict"] = provenance_dict
 
         # Rename lat/lon to y/x so rioxarray can identify spatial dimensions

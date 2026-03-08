@@ -20,7 +20,7 @@ from pystac_client import Client
 from rioxarray.merge import merge_arrays
 
 from ..manifest import OfflineManifest
-from .base import Provider, ProviderNoDataError
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -288,6 +288,12 @@ class Usgs3DepProvider(Provider):
                         if "band" in da.dims:
                             da = da.isel(band=0).drop_vars("band")
 
+                        da = sanitize_elevation_nodata(
+                            da,
+                            extra_sentinels=(-9999.0,),
+                            abs_valid_limit=100000.0,
+                        )
+
                         # --- WRITE TO ZARR CACHE ---
                         # We stream the specific item to a local Zarr to avoid re-streaming
                         if True:  # Was try/except, but we handle errors internally now
@@ -423,6 +429,11 @@ class Usgs3DepProvider(Provider):
                 }
 
                 da.name = "elevation"
+                da = sanitize_elevation_nodata(
+                    da,
+                    extra_sentinels=(-9999.0,),
+                    abs_valid_limit=100000.0,
+                )
                 p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
                 p_source.name = "source_id"
                 p_source.rio.write_nodata(0, inplace=True)
@@ -444,6 +455,11 @@ class Usgs3DepProvider(Provider):
                     sources = [ds["source_id"] for ds in p_das]
 
                     final_elev = merge_arrays(elevs)
+                    final_elev = sanitize_elevation_nodata(
+                        final_elev,
+                        extra_sentinels=(-9999.0,),
+                        abs_valid_limit=100000.0,
+                    )
                     final_src = merge_arrays(sources)
                     merged = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:

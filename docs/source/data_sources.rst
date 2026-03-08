@@ -90,3 +90,52 @@ NOAA NCEI - Bathymetric Attributed Grid (BAG)
     *   **Citation**: NOAA National Centers for Environmental Information. "Bathymetric Attributed Grid (BAG) File Format."
     *   **Access**: `NCEI Bathymetry Data Viewer <https://www.ncei.noaa.gov/maps/bathymetry/>`_
     *   **Programmatic Access**: `NOAA GeoPlatform Hydrographic Surveys <https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOS_Hydro_Surveys/FeatureServer>`_
+
+NoData Sentinel Evidence Matrix
+-------------------------------
+
+TopoBathySim treats NoData handling as a provider-specific ingest concern and a
+merge-boundary safety concern. The table below records currently implemented,
+evidence-backed handling:
+
+.. list-table:: Provider NoData handling (evidence-backed)
+     :header-rows: 1
+     :widths: 20 22 34 24
+
+     * - Provider
+         - Observed/Declared NoData
+         - Evidence
+         - Runtime Handling
+     * - NOAA Topobathy
+         - ``-999999``
+         - Confirmed cached leakage and downstream contamination (Issue #31)
+         - Explicit sentinel + metadata masking at ingest, fetch, and merge boundaries
+     * - NOAA BlueTopo
+         - ``-999999`` (defensive)
+         - Operational parity with NOAA topobathy COG family and observed coastal COG conventions
+         - Metadata masking + explicit ``-999999`` fallback at ingest and merged output
+     * - NCEI BAG
+         - ``-1000000`` / ``1000000``
+         - Existing BAG XML/GDAL leakage handling in provider comments and prior fixes
+         - Explicit sentinel masking plus generic metadata-driven masking
+     * - USGS Lidar (PDAL rasterization)
+         - ``-9999``
+         - Provider explicitly writes ``nodata=-9999`` in PDAL writer config
+         - Explicit ``-9999`` + metadata masking before provenance and merge
+     * - USGS 3DEP / CopDEM / NASADEM
+         - metadata-dependent, plus ``-9999`` fallback
+         - Mixed collection assets with tokenized COGs; robust safety needed at merge boundaries
+         - Metadata-driven masking with explicit ``-9999`` defensive fallback
+     * - NCEI CUDEM
+         - metadata-dependent
+         - Provider reads GeoTIFF nodata metadata from source/cache tiles
+         - Shared metadata-driven masking at ingest and post-merge
+     * - GEBCO 2025
+         - metadata-dependent
+         - OPeNDAP grid values are generally well-formed; masking still applied as safety net
+         - Shared metadata-driven masking on tile ingest and final merged elevation
+
+Implementation Note:
+
+Shared sanitization is centralized in ``topobathysim.providers.base.sanitize_elevation_nodata``.
+This keeps provider behavior consistent while still allowing provider-specific sentinel overrides.

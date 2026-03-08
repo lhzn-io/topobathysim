@@ -25,7 +25,7 @@ from shapely.geometry import Point, box
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from .base import Provider, ProviderNoDataError
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -469,7 +469,7 @@ class NoaaBlueTopoProvider(Provider):
 
                 import numpy as np
 
-                da_elev = ds["elevation"]
+                da_elev = sanitize_elevation_nodata(ds["elevation"], abs_valid_limit=100000.0)
 
                 if "source_id" in ds:
                     da_src = ds["source_id"]
@@ -644,6 +644,7 @@ class NoaaBlueTopoProvider(Provider):
                 sources = [ds["source_id"] for ds in das]
 
                 final_elev = merge_arrays(elevs)
+                final_elev = sanitize_elevation_nodata(final_elev, abs_valid_limit=100000.0)
                 final_src = merge_arrays(sources)
 
                 # Validate merged result
@@ -1194,6 +1195,11 @@ class NoaaBlueTopoProvider(Provider):
             # BlueTopo: Band 1=Elevation, Band 2=Uncertainty, Band 3=Contributor
             if "band" in da_raw.dims and da_raw.sizes["band"] >= 3:
                 da_elev = da_raw.isel(band=0).drop_vars("band")
+                da_elev = sanitize_elevation_nodata(
+                    cast(xr.DataArray, da_elev),
+                    extra_sentinels=(-999999.0,),
+                    abs_valid_limit=100000.0,
+                )
                 da_elev.name = "elevation"
                 da_src = da_raw.isel(band=2).drop_vars("band")
                 da_src.name = "source_id"
@@ -1209,6 +1215,11 @@ class NoaaBlueTopoProvider(Provider):
                 if "band" in da.dims:
                     da = da.isel(band=0).drop_vars("band")
                 da = cast(xr.DataArray, da)
+                da = sanitize_elevation_nodata(
+                    da,
+                    extra_sentinels=(-999999.0,),
+                    abs_valid_limit=100000.0,
+                )
                 da.name = "elevation"
                 ds_to_cache = xr.Dataset({"elevation": da})
 

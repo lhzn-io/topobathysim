@@ -198,3 +198,46 @@ def test_cache_loading_robustness(tmp_path: Any) -> None:
         assert "source_id" in da_fetched
     else:
         assert da_fetched.name == "elevation"
+
+
+def test_fetch_masks_gebco_sentinel_values(tmp_path: Any) -> None:
+    lat = np.linspace(0, 1, 20)
+    lon = np.linspace(0, 1, 20)
+
+    raw = np.zeros((20, 20), dtype=float)
+    raw[5, 5] = -999999.0
+
+    ds_remote = xr.Dataset(
+        {
+            "sub_ice_topo_bathymetry": xr.DataArray(
+                raw,
+                coords={"lat": lat, "lon": lon},
+                dims=("lat", "lon"),
+            ),
+        }
+    )
+    ds_remote.rio.write_crs("EPSG:4326", inplace=True)
+
+    ds_tid = xr.Dataset(
+        {
+            "tid": xr.DataArray(
+                np.ones((20, 20), dtype=int),
+                coords={"lat": lat, "lon": lon},
+                dims=("lat", "lon"),
+            )
+        }
+    )
+    ds_tid.rio.write_crs("EPSG:4326", inplace=True)
+
+    Gebco2025._singleton = None
+    Gebco2025._ds_remote = ds_remote
+    Gebco2025._tid_remote = ds_tid
+
+    cache_dir = tmp_path / "gebco_cache_sentinel"
+    provider = Gebco2025(north=1, south=0, west=0, east=1, cache_dir=str(cache_dir))
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=PerformanceWarning)
+        fetched = provider.fetch()
+
+    assert np.isnan(fetched["elevation"].values).any()

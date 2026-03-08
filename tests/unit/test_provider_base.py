@@ -1,6 +1,10 @@
 from typing import Any
 
-from topobathysim.providers.base import Provider
+import numpy as np
+import pytest
+import xarray as xr
+
+from topobathysim.providers.base import Provider, sanitize_elevation_nodata
 
 
 class DummyProvider(Provider):
@@ -42,3 +46,32 @@ def test_normalize_bbox_3857() -> None:
     # Specific check: -8238000 is approx -74 lon
     assert -74.5 < result[0] < -73.5
     assert 40.0 < result[1] < 41.0
+
+
+def test_sanitize_elevation_nodata_masks_metadata_nodata() -> None:
+    da = xr.DataArray(np.array([[3.0, -999999.0], [1.0, -2.0]]), dims=("y", "x"))
+    da.rio.write_nodata(-999999.0, inplace=True)
+
+    cleaned = sanitize_elevation_nodata(da)
+
+    assert np.isnan(cleaned.values[0, 1])
+    assert cleaned.values[1, 1] == pytest.approx(-2.0)
+
+
+def test_sanitize_elevation_nodata_applies_custom_bounds() -> None:
+    da = xr.DataArray(np.array([[4.0, -999500.0], [2.0, 7.0]]), dims=("y", "x"))
+
+    cleaned = sanitize_elevation_nodata(da, min_valid=-999000, max_valid=6.0)
+
+    assert np.isnan(cleaned.values[0, 1])
+    assert np.isnan(cleaned.values[1, 1])
+    assert cleaned.values[0, 0] == pytest.approx(4.0)
+
+
+def test_sanitize_elevation_nodata_masks_extra_sentinels() -> None:
+    da = xr.DataArray(np.array([[3.2, -9999.0], [0.0, 1.0]]), dims=("y", "x"))
+
+    cleaned = sanitize_elevation_nodata(da, extra_sentinels=(-9999.0,))
+
+    assert np.isnan(cleaned.values[0, 1])
+    assert cleaned.values[0, 0] == pytest.approx(3.2)

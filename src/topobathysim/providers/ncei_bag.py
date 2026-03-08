@@ -25,7 +25,7 @@ from rioxarray.merge import merge_arrays
 from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumNoDataError, VDatumResolver
-from .base import Provider, ProviderNoDataError
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,11 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
             # MASK SUSPICIOUS VALUES
             # Mask standard BAG NoData values (1,000,000 or -1,000,000).
             # These can leak through if GDAL doesn't parse the BAG XML correctly.
-            elev = elev.where((elev > -100000.0) & (elev < 100000.0))
+            elev = sanitize_elevation_nodata(
+                elev,
+                extra_sentinels=(1_000_000.0, -1_000_000.0),
+                abs_valid_limit=100000.0,
+            )
 
             # Note: Additional dynamic filtering (e.g., configurable spike removal or NoData masking)
             # is deferred to `fetch_layer` where policy configuration (`kwargs`) is available.

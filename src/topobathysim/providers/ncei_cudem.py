@@ -22,7 +22,7 @@ from shapely.geometry import box
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from .base import Provider, ProviderNoDataError
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,7 @@ class CUDEMProvider(Provider):
                 }
 
                 da.name = "elevation"
+                da = sanitize_elevation_nodata(da, abs_valid_limit=100000.0)
                 p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
                 p_source.name = "source_id"
                 p_source.rio.write_nodata(0, inplace=True)
@@ -139,6 +140,7 @@ class CUDEMProvider(Provider):
                 sources = [ds["source_id"] for ds in project_layers]
 
                 final_elev = merge_arrays(elevs)
+                final_elev = sanitize_elevation_nodata(final_elev, abs_valid_limit=100000.0)
                 final_src = merge_arrays(sources)
                 merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
             except Exception as e:
@@ -411,8 +413,7 @@ class CUDEMProvider(Provider):
 
             if "band" in da_final.dims:
                 da_final = da_final.isel(band=0).drop_vars("band")
-            if da_final.rio.nodata is not None:
-                da_final = da_final.where(da_final != da_final.rio.nodata)
+            da_final = sanitize_elevation_nodata(da_final, abs_valid_limit=100000.0)
 
             # Robust CRS
             if da_final.rio.crs is None:
