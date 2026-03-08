@@ -1,9 +1,11 @@
+import json
 import logging
 import math
 import os
 import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from datetime import datetime, timezone
 
 # Set Matplotlib Backend to Agg (Non-Interactive) for Server Use
 import matplotlib
@@ -13,6 +15,7 @@ matplotlib.use("Agg")
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Any
 
 import numpy as np
@@ -121,6 +124,86 @@ def tile_bounds_calc(x: int, y: int, z: int) -> dict[str, float]:
     return {"north": lat_max, "south": lat_min, "west": lon_min, "east": lon_max}
 
 
+def _parse_bbox_params(
+    bbox: str | None,
+    west: float | None,
+    south: float | None,
+    east: float | None,
+    north: float | None,
+) -> tuple[float, float, float, float]:
+    if bbox:
+        parts = [p.strip() for p in bbox.split(",") if p.strip()]
+        if len(parts) != 4:
+            raise HTTPException(
+                status_code=400,
+                detail="bbox must be 'west,south,east,north' with 4 comma-separated values",
+            )
+        try:
+            west, south, east, north = (float(p) for p in parts)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="bbox values must be numeric") from exc
+
+    if west is None or south is None or east is None or north is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide bbox or west/south/east/north query parameters",
+        )
+
+    if west >= east or south >= north:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid bbox ordering (expected west < east and south < north)",
+        )
+
+    return west, south, east, north
+
+
+def _normalize_output_format(format_raw: str) -> str:
+    fmt = format_raw.strip().lower()
+    if fmt in {"geotiff", "tiff", "tif"}:
+        return "geotiff"
+    if fmt in {"zarr", "zip"}:
+        return "zarr"
+    raise HTTPException(status_code=400, detail=f"Unsupported format '{format_raw}'")
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_zarr_attrs(
+    ds: xr.Dataset,
+    bbox: tuple[float, float, float, float],
+    resolution: float,
+    policy_name: str,
+) -> dict[str, Any]:
+    crs = None
+    if hasattr(ds, "rio") and ds.rio.crs:
+        crs = ds.rio.crs.to_string()
+
+    provenance = ds.attrs.get("provenance_dict", {})
+    providers_used: list[str] = []
+    for entry in provenance.values():
+        if isinstance(entry, dict):
+            provider = entry.get("provider")
+            if provider:
+                providers_used.append(str(provider))
+
+    return {
+        "crs": crs or "EPSG:4326",
+        "bbox": [float(v) for v in bbox],
+        "resolution_m": float(resolution),
+        "vertical_datum": ds.attrs.get("vertical_datum", "Unknown"),
+        "policy": policy_name,
+        "providers_used": sorted(set(providers_used)),
+        "created": datetime.now(timezone.utc).isoformat(),
+        "provenance_dict": _json_safe(provenance) if provenance else {},
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Load .env (Resolve from topobathysim root)
@@ -181,6 +264,62 @@ def get_policy_path() -> Path:
     if POLICY_PATH is None or not POLICY_PATH.exists():
         raise HTTPException(status_code=503, detail="Policy path not initialized")
     return POLICY_PATH
+
+
+@app.get("/fuse")
+def fuse(
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+    bbox: str | None = Query(
+        None,
+        description="Bounding box as 'west,south,east,north'",
+    ),
+    west: float | None = Query(None, description="Bounding box west (lon)"),
+    south: float | None = Query(None, description="Bounding box south (lat)"),
+    east: float | None = Query(None, description="Bounding box east (lon)"),
+    north: float | None = Query(None, description="Bounding box north (lat)"),
+    resolution: float = Query(30.0, description="Output resolution in meters"),
+    format: str = Query("geotiff", description="Output format: geotiff or zarr"),
+) -> Response:
+    bbox_tuple = _parse_bbox_params(bbox, west, south, east, north)
+    fmt = _normalize_output_format(format)
+
+    try:
+        ds = run(str(policy_path), bbox_tuple, resolution=resolution, use_cache=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"/fuse failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if "elevation" not in ds or ds["elevation"].size == 0:
+        raise HTTPException(status_code=404, detail="Fusion returned no elevation data")
+
+    if fmt == "zarr":
+        import zarr
+
+        ds_out = ds.copy()
+        keep_vars = ["elevation"]
+        if "source_elevation" in ds_out:
+            keep_vars.append("source_elevation")
+        ds_out = ds_out[keep_vars]
+        ds_out.attrs = _build_zarr_attrs(ds, bbox_tuple, resolution, policy_path.name)
+
+        with TemporaryDirectory() as tmpdir:
+            zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
+            store = zarr.ZipStore(str(zarr_zip_path), mode="w")
+            try:
+                ds_out.to_zarr(store, mode="w")
+            finally:
+                store.close()
+
+            data = zarr_zip_path.read_bytes()
+
+        headers = {"Content-Disposition": "attachment; filename=fused.zarr.zip"}
+        return Response(content=data, media_type="application/zip", headers=headers)
+
+    buf = BytesIO()
+    ds["elevation"].rio.to_raster(buf, driver="GTiff")
+    return Response(content=buf.getvalue(), media_type="image/tiff")
 
 
 # Visualization Constants
