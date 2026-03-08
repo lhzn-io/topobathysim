@@ -2,7 +2,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import geopandas as gpd
+import numpy as np
 import pytest
+import xarray as xr
 from shapely.geometry import box
 
 from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
@@ -90,3 +92,26 @@ def test_find_project_by_box_failure(mock_provider: NoaaTopobathyProvider) -> No
         pytest.raises(RuntimeError, match="NOAA Spatial Index is unavailable"),
     ):
         mock_provider.find_project_by_box(-73.0, 41.0, -72.0, 41.1)
+
+
+def test_sanitize_nodata_values_masks_known_sentinel(mock_provider: NoaaTopobathyProvider) -> None:
+    data = xr.DataArray(np.array([[1.5, -999999.0], [2.0, -3.0]]), dims=("y", "x"))
+    data.rio.write_nodata(-999999.0, inplace=True)
+
+    cleaned = mock_provider._sanitize_nodata_values(data)
+
+    assert np.isnan(cleaned.values[0, 1])
+    assert cleaned.values[0, 0] == pytest.approx(1.5)
+    assert cleaned.values[1, 1] == pytest.approx(-3.0)
+
+
+def test_sanitize_nodata_values_masks_extreme_negative_fallback(
+    mock_provider: NoaaTopobathyProvider,
+) -> None:
+    data = xr.DataArray(np.array([[4.0, -999500.0], [-12.0, 0.0]]), dims=("y", "x"))
+
+    cleaned = mock_provider._sanitize_nodata_values(data)
+
+    assert np.isnan(cleaned.values[0, 1])
+    assert cleaned.values[0, 0] == pytest.approx(4.0)
+    assert cleaned.values[1, 0] == pytest.approx(-12.0)

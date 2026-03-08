@@ -100,6 +100,32 @@ class NoaaTopobathyProvider(Provider):
         self.fs = fsspec.filesystem("s3", anon=True)
         self._initialized = True
 
+    @staticmethod
+    def _sanitize_nodata_values(da: xr.DataArray) -> xr.DataArray:
+        """Mask known NOAA nodata sentinels so they cannot leak into fusion outputs."""
+        nodata_candidates: list[float] = []
+        for value in (
+            da.rio.nodata,
+            da.rio.encoded_nodata,
+            da.attrs.get("_FillValue"),
+            da.attrs.get("missing_value"),
+        ):
+            if value is None:
+                continue
+            try:
+                nodata_candidates.append(float(value))
+            except (TypeError, ValueError):
+                continue
+
+        cleaned = da
+        for nodata in nodata_candidates:
+            cleaned = cleaned.where(cleaned != nodata)
+
+        # NOAA topobathy COGs have been observed with -999999 nodata leakage.
+        # Keep this broad threshold to catch stale cache artifacts and bad metadata.
+        cleaned = cleaned.where(cleaned > -999000)
+        return cast(xr.DataArray, cleaned)
+
     @property
     def _tile_index(self) -> "gpd.GeoDataFrame | None":
         """Transparently reads from the class-level shared tile index cache."""
@@ -181,6 +207,8 @@ class NoaaTopobathyProvider(Provider):
                         if da_fetched is None:
                             continue
 
+                        da_fetched = self._sanitize_nodata_values(da_fetched)
+
                         # Optimization: Clip Early
                         try:
                             # Use 4326 clip since index is 4326
@@ -219,6 +247,7 @@ class NoaaTopobathyProvider(Provider):
                     # Default is last-on-top, but for a single project tiles shouldn't overlap much
                     try:
                         p_merged = merge_arrays(project_das)
+                        p_merged = self._sanitize_nodata_values(p_merged)
 
                         # Extract Provenance info
                         try:
@@ -285,6 +314,7 @@ class NoaaTopobathyProvider(Provider):
         sources = [ds["source_id"] for ds in project_layers[::-1]]
 
         final_elev = merge_arrays(elevs)
+        final_elev = self._sanitize_nodata_values(final_elev)
         final_src = merge_arrays(sources)
 
         # 4. Final Clip
@@ -1263,6 +1293,7 @@ class NoaaTopobathyProvider(Provider):
                     xr.DataArray,
                     rioxarray.open_rasterio(open_source, chunks={"x": 2048, "y": 2048}, masked=True),
                 )
+                da_raw = self._sanitize_nodata_values(da_raw)
 
                 try:
                     # --- OPTIMIZATION: CLIP BEFORE METADATA/COMPUTE ---
