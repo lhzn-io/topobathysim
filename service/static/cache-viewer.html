@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TopoBathySim | Cache Manager</title>
+    <!-- Modern Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="cache-viewer.css">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar glass-panel">
+            <div class="brand">
+                <div class="logo">
+                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+                </div>
+                <h1>TopoBathy<span>Sim</span></h1>
+            </div>
+            <nav>
+                <a href="#" class="active" data-view="inventory">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+                    Data Inventory
+                </a>
+                <a href="#" data-view="check">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                    Integrity Check
+                </a>
+                <a href="#" data-view="orphans">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                    Orphan Cleanup
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <p>Status: <span class="status-indicator online"></span> Online</p>
+                <p class="version">Cache v1.0.0</p>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header>
+                <div class="header-left">
+                     <h2>Cache Inventory</h2>
+                     <div class="cache-root-badge" id="cacheRootPath">...</div>
+                </div>
+
+                <div class="actions">
+                    <div class="stats-pill">
+                        <span id="totalSize">0 MB</span>
+                        <span class="divider">|</span>
+                        <span id="lastUpdated">Never</span>
+                    </div>
+
+                    <button id="refreshBtn" class="btn btn-secondary" title="Sync Cache">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                    </button>
+
+                    <button id="purgeBtn" class="btn btn-danger">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                        Purge...
+                    </button>
+                </div>
+            </header>
+
+            <div class="dashboard-grid">
+                <!-- Tiers Column -->
+                <div class="tiers-column glass-panel">
+                    <div class="list-header">
+                        <h3>Cache Tiers</h3>
+                    </div>
+                    <div id="tierList" class="tier-list">
+                        <!-- Populated via JS -->
+                        <div class="loading-state">
+                            <div class="spinner"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Detail Column -->
+                <div class="detail-column glass-panel">
+                    <div class="detail-header">
+                         <h3 id="detailTitle">Select a tier to view details</h3>
+                    </div>
+
+                    <div id="detailContent" class="detail-content">
+                        <!-- Populated via JS -->
+                        <div class="empty-state">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="1"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                            <p>Detailed statistics and breakdown by provider will appear here.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Purge Modal -->
+    <div id="purgeModal" class="modal-backdrop hidden">
+        <div class="modal glass-panel">
+            <div class="modal-header">
+                <h3>Purge Cache Tiers</h3>
+                <button class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-description">Select tiers to purge. Warning: Tier 5 is destructive.</p>
+                <div id="purgeTierList" class="purge-tier-list">
+                    <!-- Checkboxes -->
+                </div>
+
+                <div class="purge-options">
+                    <label class="toggle">
+                        <input type="checkbox" id="dryRunToggle" checked>
+                        <span class="slider"></span>
+                        <span class="label-text">Dry Run (Simulate)</span>
+                    </label>
+                </div>
+
+                <div id="purgeWarning" class="alert alert-danger hidden">
+                    <strong>Warning:</strong> You are about to delete raw source files (Tier 5).
+                    To confirm, type <strong>PURGE</strong> below.
+                    <input type="text" id="purgeConfirmInput" placeholder="Type PURGE" class="form-input">
+                </div>
+
+                <div id="purgeResults" class="purge-results hidden">
+                    <h4>Pre-flight Check:</h4>
+                    <pre id="purgeLog"></pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary close-btn">Cancel</button>
+                <button id="confirmPurgeBtn" class="btn btn-primary">Run Purge</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="cache-viewer.js"></script>
+</body>
+</html>

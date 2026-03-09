@@ -20,6 +20,7 @@ TopoBathySim
    data_sources
    api
    cli_tools
+   cache_viewer
    performance
 
 Indices and tables

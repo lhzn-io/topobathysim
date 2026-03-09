@@ -28,6 +28,7 @@ from topobathysim.runtime import run, should_consolidate
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
+from .routers import cache_viewer
 
 # Configure Logging
 log_dir = Path("logs")
@@ -230,6 +231,8 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+app.include_router(cache_viewer.router)
 
 
 @app.middleware("http")
