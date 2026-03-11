@@ -10,7 +10,7 @@
   4. **Tier 3 (Regional)**: NOAA BlueTopo.
   5. **Tier 4 (Global Fallback)**: GEBCO 2025.
 - **Microservice**: `service/topobathyserve` is a FastAPI app serving tiles (`/tiles/{z}/{x}/{y}`) and raw NumPy buffers.
-- **Data Flow**: `BathyManager` (in `src/topobathysim/manager.py`) orchestrates data fetching and fusion. It delegates to specific provider classes (e.g., `NoaaBlueTopoProvider`, `UsgsLidarProvider`).
+- **Data Flow**: `Runtime` (in `src/topobathysim/runtime.py`) orchestrates data fetching and fusion based on YAML policies. It uses `Policy` objects to define fusion steps.
 
 ## 🛠️ Tech Stack & Conventions
 

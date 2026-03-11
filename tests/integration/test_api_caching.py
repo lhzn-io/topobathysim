@@ -1,5 +1,9 @@
+import sys
 from collections.abc import Generator
 from pathlib import Path
+
+# Add service to path so we can import topobathyserve
+sys.path.append(str(Path(__file__).parent.parent.parent / "service"))
 
 import pytest
 from fastapi.testclient import TestClient

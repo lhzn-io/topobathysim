@@ -8,7 +8,6 @@ env_path = Path(__file__).resolve().parent.parent.parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
-from .manager import BathyManager  # noqa: E402
 from .providers.registry import registry  # noqa: E402
 from .quality import TIDClassifier, source_report  # noqa: E402
 
@@ -16,7 +15,6 @@ from .quality import TIDClassifier, source_report  # noqa: E402
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
-    "BathyManager",
     "TIDClassifier",
     "registry",
     "source_report",

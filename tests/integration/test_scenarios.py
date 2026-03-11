@@ -1,16 +1,16 @@
 import logging
 import math
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pytest
-import xarray as xr
 
-from topobathysim.manager import BathyManager
+from topobathysim.runtime import run
 
 # Create a custom logger for this test module to ensure we see our own debugs
 logger = logging.getLogger(__name__)
+
+POLICY_PATH = Path(__file__).parent.parent.parent / "policies" / "examples" / "wlis.yaml"
 logger.setLevel(logging.DEBUG)
 
 
@@ -78,32 +78,42 @@ def test_real_world_tile_scenarios(
     Verify specific real-world tiles known to contain specific data types.
     This replaces the ad-hoc scripts in tests/scripts/.
     """
+    import os
+
+    os.environ["TOPOBATHYSIM_CACHE_DIR"] = str(persistent_cache_dir)
+
     west, south, east, north = xyz_to_bounds(z, x, y)
     logger.info(f"Testing Tile Z={z} X={x} Y={y} -> BBox: {west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}")
 
-    manager = BathyManager(
-        use_blue_topo=True, use_cudem=True, use_lidar=True, cache_dir=str(persistent_cache_dir)
-    )
+    # Calculate approximate resolution to match tile zoom level roughly
+    resolution = 10.0
 
-    # Use a smaller shape for speed, but large enough to catch features
-    result = manager.get_grid(south, north, west, east, target_shape=(256, 256))
-    da = result["elevation"] if isinstance(result, xr.Dataset) else cast(xr.DataArray, result)
+    try:
+        ds = run(str(POLICY_PATH), (west, south, east, north), resolution=resolution, use_cache=True)
+    except Exception as e:
+        pytest.fail(f"Runtime execution failed: {e}")
 
-    assert da is not None, "Grid generation failed (returned None)"
-    assert da.shape == (256, 256)
+    da = ds["elevation"]
+    assert da is not None, "Elevation data missing"
 
-    sources = da.attrs.get("source", "Unknown").upper()
-    logger.info(f"Sources found: {sources}")
+    # Check provenance
+    if "provenance_dict" in ds.attrs:
+        provenance = ds.attrs["provenance_dict"]
+        sources_text = " ".join([str(v).upper() for v in provenance.values()])
+    else:
+        sources_text = "UNKNOWN"
+
+    logger.info(f"Sources found: {sources_text}")
 
     # Verification Logic
     if isinstance(expected_source_substr, list):
         # Match ANY of the expected substrings
-        found = any(sub in sources for sub in expected_source_substr)
-        assert found, f"Expected one of {expected_source_substr} in sources, got: {sources}"
+        found = any(sub in sources_text for sub in expected_source_substr)
+        assert found, f"Expected one of {expected_source_substr} in sources, got: {sources_text}"
     else:
         assert (
-            expected_source_substr in sources
-        ), f"Expected {expected_source_substr} in sources, got: {sources}"
+            expected_source_substr.upper() in sources_text
+        ), f"Expected {expected_source_substr} in sources, got: {sources_text}"
 
     # Data content validation
     valid_data = da.values[~np.isnan(da.values)]

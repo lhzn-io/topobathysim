@@ -17,14 +17,15 @@ if "OPEN_TOPOGRAPHY_API_KEY" in os.environ:
     os.environ["OPENTOPOGRAPHY_API_KEY"] = os.environ["OPEN_TOPOGRAPHY_API_KEY"]
 
 from topobathysim.fusion import FusionEngine  # noqa: E402
-from topobathysim.manager import BathyManager  # noqa: E402
 from topobathysim.providers.usgs_lidar import UsgsLidarProvider  # noqa: E402
+from topobathysim.runtime import run  # noqa: E402
 
 # Found via scan_laz.py
 LIDAR_URL = "s3://noaa-nos-coastal-lidar-pds/laz/geoid18/4938/20140403_usgs_ny_li_18TXL060240.copc.laz"
 # Center of the Lidar tile approx
 CENTER_LAT = 40.8634
 CENTER_LON = -73.7279
+POLICY_PATH = Path(__file__).parent.parent.parent / "policies" / "examples" / "wlis.yaml"
 
 
 @contextmanager
@@ -86,21 +87,27 @@ def test_fusion_quality_execution_rocks(persistent_cache_dir: Path) -> None:
     )
 
     # Expand slightly to ensure overlap? Or just use same bounds.
-    print(f"[Test] Fetching Bathymetry for bounds: {west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}...")
-    manager = BathyManager(cache_dir=str(persistent_cache_dir))
-    # Explicitly cast to DataArray as we are not requesting source mask
+    print(
+        f"[Test] Fetching Bathymetry via Runtime for bounds: "
+        f"{west:.4f}, {south:.4f}, {east:.4f}, {north:.4f}..."
+    )
+
+    # Use Runtime Policy
     try:
         with _time_limit(180):
-            bathy_da_maybe = manager.get_grid(south, north, west, east, target_shape=(128, 128))
+            # Target shape is implicit in resolution, we request approx same resolution as lidar (4.0m)
+            # 4.0 meters in degrees approx: 4/111320 ~ 0.000036
+
+            # Using wlis.yaml which includes all relevant layers
+            bbox = (west, south, east, north)
+            ds = run(str(POLICY_PATH), bbox, resolution=4.0, use_cache=True)
+            bathy_da_maybe = ds["elevation"]
+
     except TimeoutError as exc:
-        pytest.skip(f"Skipping integration test: Bathymetry fetch stalled ({exc})")
+        pytest.skip(f"Skipping integration test: Runtime fetch stalled ({exc})")
 
     assert bathy_da_maybe is not None, "Failed to fetch Bathymetry."
-
-    if isinstance(bathy_da_maybe, tuple):
-        bathy_da, _ = bathy_da_maybe
-    else:
-        bathy_da = bathy_da_maybe
+    bathy_da = bathy_da_maybe
 
     if isinstance(bathy_da, xr.Dataset):
         bathy_da = bathy_da["elevation"]
