@@ -133,8 +133,24 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] 
             return cast(dict[str, Any] | None, result)
 
         except Exception as e:
-            logger.warning(f"STAC Query Error: {e}")
+            err_str = str(e)
+            if "NameResolutionError" in err_str or "ConnectionError" in err_str:
+                logger.warning(f"STAC Network Error: {err_str.split('Caused by')[-1].strip()}")
+            else:
+                logger.warning(f"STAC Query Error: {e}")
             return None
+
+
+def _pdal_worker(pipeline_json: str, queue: Any) -> None:
+    """Helper to run PDAL in a separate process purely for crash isolation."""
+    try:
+        import pdal
+
+        pipeline = pdal.Pipeline(pipeline_json)
+        count = pipeline.execute()
+        queue.put({"success": True, "count": count})
+    except Exception as e:
+        queue.put({"success": False, "error": str(e)})
 
 
 class UsgsLidarProvider(Provider):
@@ -522,8 +538,6 @@ class UsgsLidarProvider(Provider):
         import tempfile
         import threading
 
-        import pdal
-
         # MPC STAC Endpoint
         try:
             # Call cached query function
@@ -702,9 +716,40 @@ class UsgsLidarProvider(Provider):
                 # Also force writer bounds
                 pipeline_config["pipeline"][2]["bounds"] = reader_bounds
 
-            # Execute
-            pipeline = pdal.Pipeline(json.dumps(pipeline_config))
-            count = pipeline.execute()
+            # Execute in isolated process to catch libc crashes (e.g. ArbiterError)
+            import multiprocessing
+            import queue
+
+            ctx = multiprocessing.get_context("spawn")
+            q = ctx.Queue()
+
+            p = ctx.Process(
+                target=_pdal_worker,
+                args=(json.dumps(pipeline_config), q),
+            )
+            p.start()
+            p.join(timeout=60)  # Don't hang forever on network issues
+
+            if p.is_alive():
+                logger.warning(f"PDAL Process Timed Out on {href}")
+                p.terminate()
+                return None
+
+            if p.exitcode != 0:
+                logger.warning(f"PDAL Process Crashed (Code {p.exitcode}) on {href}")
+                return None
+
+            try:
+                res = q.get(timeout=2)
+            except queue.Empty:
+                logger.warning(f"PDAL Process returned no result on {href}")
+                return None
+
+            if not res.get("success"):
+                logger.warning(f"PDAL Error: {res.get('error')}")
+                return None
+
+            count = res.get("count", 0)
             logger.debug(f"PDAL executed. Points: {count}")
 
             if Path(output_filename).exists():

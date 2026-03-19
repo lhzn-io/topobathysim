@@ -38,8 +38,11 @@ USER_AGENT = (
 # Allow a longer read timeout and make it tunable via env.
 BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT", "120"))
 
+# Lower LRU Size to prevent "Too Many Open Files" with Zarr chunks
+BAG_CACHE_SIZE = int(os.getenv("TOPOBATHY_BAG_LRU_SIZE", "16"))
 
-@concurrent_lru_cache()
+
+@concurrent_lru_cache(maxsize=BAG_CACHE_SIZE)
 def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     """
     Cached, standalone function to read a single BAG file.

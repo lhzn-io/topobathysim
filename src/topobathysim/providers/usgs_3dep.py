@@ -156,7 +156,7 @@ class Usgs3DepProvider(Provider):
         lock_file_path = self.cache_dir / f"stac_query_{query_hash}.lock"
 
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
-        max_retries = 4
+        max_retries = 2
 
         try:
             with FileLock(lock_file_path):
@@ -209,16 +209,33 @@ class Usgs3DepProvider(Provider):
                     except Exception as e:
                         # Retry logic
                         is_last_attempt = attempt == max_retries
-                        log_level = logging.WARNING if not is_last_attempt else logging.ERROR
-                        logger.log(
-                            log_level,
-                            f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}",
+
+                        # Reduce log noise for common network issues
+                        err_str = str(e)
+                        is_network = any(
+                            x in err_str
+                            for x in ["NameResolutionError", "ConnectionError", "Max retries exceeded"]
                         )
+
+                        if is_network:
+                            msg = (
+                                f"Network Error fetching {collection_id} (Attempt {attempt + 1}): "
+                                f"{err_str.split('Caused by')[-1].strip()}"
+                            )
+                        else:
+                            msg = f"Error fetching {collection_id} (Attempt {attempt + 1}): {e}"
+
+                        log_level = logging.WARNING if not is_last_attempt else logging.ERROR
+                        logger.log(log_level, msg)
 
                         if is_last_attempt:
                             return None
 
+                        # If network error, maybe wait longer?
                         sleep_time = (2**attempt) + random.uniform(0.1, 1.0)
+                        if is_network:
+                            sleep_time += 1.0
+
                         time.sleep(sleep_time)
 
         except Exception as e:
@@ -348,8 +365,22 @@ class Usgs3DepProvider(Provider):
                     except Exception as e:
                         err_msg = str(e)
                         is_403 = "403" in err_msg or "Forbidden" in err_msg or "Access Denied" in err_msg
+                        is_network = any(
+                            x in err_msg
+                            for x in ["NameResolutionError", "ConnectionError", "Max retries exceeded"]
+                        )
 
-                        if is_403 and retry < max_retries:
+                        if is_network:
+                            logger.warning(
+                                f"Network Error streaming {href}: {err_msg.split('Caused by')[-1].strip()}"
+                            )
+                            if retry < max_retries:
+                                time.sleep(1.0)
+                                continue
+                            else:
+                                logger.error(f"Failed to stream {href} after ({max_retries}) retries.")
+
+                        elif is_403 and retry < max_retries:
                             logger.warning(f"403 Forbidden for {href}. Refreshing token and retrying...")
 
                             # 1. Provide Feedback: Remove stale item

@@ -21,6 +21,15 @@ class BoundingBoxRequest(BaseModel):
         return v
 
 
+class HydrateRequest(BaseModel):
+    bbox: tuple[float, float, float, float] = Field(
+        ...,
+        description="Bounding box as (west, south, east, north) in WGS84 decimal degrees",
+        examples=[[-73.82607, 40.75870, -72.85789, 41.20501]],
+    )
+    resolution: float = Field(30.0, description="Output resolution in meters", examples=[30.0])
+
+
 class ElevationResponse(BaseModel):
     elevation: float | None
     unit: str = "meters"

@@ -258,8 +258,8 @@ def _fmt_age(secs: float) -> str:
     return f"{secs / 86400:.1f}d ago"
 
 
-def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float] | None:
-    """Return (x_min, x_max, y_min, y_max) from a zarr store's coordinate arrays."""
+def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float, float] | None:
+    """Return (x_min, x_max, y_min, y_max, resolution) from a zarr store's coordinate arrays."""
     try:
         import zarr  # type: ignore[import]
 
@@ -268,17 +268,32 @@ def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float] | None:
         y_arr = z["y"]
         x0, x1 = float(x_arr[0]), float(x_arr[-1])  # type: ignore[index, arg-type]
         y0, y1 = float(y_arr[0]), float(y_arr[-1])  # type: ignore[index, arg-type]
-        return min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+
+        # Calculate resolution (meters/pixel or degrees/pixel)
+        count = x_arr.shape[0]
+        width = abs(x1 - x0)
+        # Assuming cell centers, span is width. Res is width / (count-1)
+        # If count=1, we can't really know, assume 0 or handle separately
+        res = getattr(x_arr, "attrs", {}).get("resolution")
+        if res is None:
+            res = width / (count - 1) if count > 1 else 0.0
+
+        return min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1), res
     except Exception:
         return None
 
 
 def _proj_to_zoom_and_lonlat(
-    x_min: float, x_max: float, y_min: float, y_max: float
-) -> tuple[int, float, float, float, float]:
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    resolution: float = 0.0,
+) -> tuple[int | float, float, float, float, float]:
     """Return (zoom, lon_min, lon_max, lat_min, lat_max) from coordinate extents.
 
     Detects Web Mercator (|x| > 360) vs. geographic degrees automatically.
+    Returns zoom as float based on resolution if provided, else fallback to width.
     """
     import math
 
@@ -289,14 +304,31 @@ def _proj_to_zoom_and_lonlat(
         lon_max = x_max / 20037508.34 * 180.0
         lat_min = math.degrees(2 * math.atan(math.exp(y_min / earth_r)) - math.pi / 2)
         lat_max = math.degrees(2 * math.atan(math.exp(y_max / earth_r)) - math.pi / 2)
-        x_span = x_max - x_min
-        # Tile width at zoom z = 40075016.686 / 2^z metres
-        z = round(math.log2(40075016.686 / x_span)) if x_span > 0 else 0
+
+        # Calculate zoom from RESOLUTION (meters/pixel), not extent width
+        # Base resolution at z=0 is EarthCircumference / 256 ~= 156543.03392
+        if resolution > 0:
+            flt_z = math.log2(156543.03392 / resolution)
+            z: int | float = round(flt_z)
+            if abs(flt_z - z) > 0.05:
+                z = round(flt_z, 2)
+        else:
+            # Fallback (legacy/single-tile specific logic)
+            x_span = x_max - x_min
+            z = round(math.log2(40075016.686 / x_span)) if x_span > 0 else 0
+
     else:
         # Already in degrees
         lon_min, lon_max, lat_min, lat_max = x_min, x_max, y_min, y_max
-        lon_span = x_max - x_min
-        z = round(math.log2(360.0 / lon_span)) if lon_span > 0 else 0
+        if resolution > 0:
+            # Base resolution at z=0 is 360 / 256 = 1.40625 deg/px
+            flt_z = math.log2(1.40625 / resolution)
+            z = round(flt_z)
+            if abs(flt_z - z) > 0.05:
+                z = round(flt_z, 2)
+        else:
+            lon_span = x_max - x_min
+            z = round(math.log2(360.0 / lon_span)) if lon_span > 0 else 0
 
     return max(0, min(24, z)), lon_min, lon_max, lat_min, lat_max
 
@@ -537,7 +569,7 @@ class _StatusData:
     fused_newest: float = 0.0
     fused_oldest: float = float("inf")
     # zoom -> {"count": int, "bytes": int, "lon_min/max": float, "lat_min/max": float}
-    fused_by_zoom: dict[int, dict] = field(default_factory=dict)
+    fused_by_zoom: dict[int | float, dict] = field(default_factory=dict)
     # Tier 3 - provider zarr
     provider_zarr: list[tuple[str, int, int, float, float]] = field(
         default_factory=list
@@ -595,9 +627,12 @@ def _gather_status_data() -> _StatusData:
             d.fused_total_bytes += sz
             d.fused_newest = max(d.fused_newest, mtime)
             d.fused_oldest = min(d.fused_oldest, mtime)
-            extents = _fused_zarr_extents(item)
-            if extents is not None:
-                zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(*extents)
+            extents_res = _fused_zarr_extents(item)
+            if extents_res is not None:
+                x0, x1, y0, y1, res = extents_res
+                zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(
+                    x0, x1, y0, y1, resolution=res
+                )
                 if zoom not in d.fused_by_zoom:
                     d.fused_by_zoom[zoom] = {
                         "count": 0,

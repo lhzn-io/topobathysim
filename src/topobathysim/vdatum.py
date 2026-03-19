@@ -204,3 +204,51 @@ class VDatumResolver:
         except Exception as e:
             logger.error(f"Datum (EGM2008->NAVD88) conversion failed for ({lat}, {lon}): {e}")
             raise
+
+    @staticmethod
+    def get_robust_mllw_to_navd88_offset(
+        lat: float, lon: float, search_radius: float = 0.05, steps: int = 5
+    ) -> float:
+        """
+        Attempts to find a valid MLLW->NAVD88 offset by searching spirally outward.
+        Useful when the exact point (e.g. tile center) falls on land or a hole in the model.
+        Returns the average of valid points found at the nearest valid radius.
+        """
+        # 1. Try exact point first
+        try:
+            return VDatumResolver.get_mllw_to_navd88_offset(lat, lon)
+        except (VDatumNoDataError, Exception):
+            pass
+
+        # 2. Spiral Search
+        step_deg = search_radius / steps
+        for r in range(1, steps + 1):
+            curr_dist = r * step_deg
+            # Check 8 directions
+            offsets = [
+                (0, 1),
+                (0, -1),
+                (1, 0),
+                (-1, 0),  # Cardinal
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),  # Diagonals
+            ]
+
+            valid_vals = []
+            for dy, dx in offsets:
+                t_lat = lat + (dy * curr_dist)
+                t_lon = lon + (dx * curr_dist)
+                try:
+                    val = VDatumResolver.get_mllw_to_navd88_offset(t_lat, t_lon)
+                    valid_vals.append(val)
+                except (VDatumNoDataError, Exception):
+                    continue
+
+            if valid_vals:
+                # Return average of valid samples at this ring
+                return sum(valid_vals) / len(valid_vals)
+
+        # Fallback for very specific cases or raise
+        raise VDatumNoDataError(f"VDatum robust search failed within {search_radius} deg of ({lat}, {lon})")

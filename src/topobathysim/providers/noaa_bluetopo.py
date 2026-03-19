@@ -1100,7 +1100,7 @@ class NoaaBlueTopoProvider(Provider):
 
                 # VDatum: Convert Raw MLLW to NAVD88
                 # Consistent with tile loading logic
-                offset = self.vdatum.get_mllw_to_navd88_offset(lat, lon)
+                offset = self.vdatum.get_robust_mllw_to_navd88_offset(lat, lon)
                 return float(val_item) + offset
 
         except Exception as e:
@@ -1268,7 +1268,7 @@ class NoaaBlueTopoProvider(Provider):
 
                 # Retrieve offset: NAVD88 = MLLW + Offset
                 # Note: get_mllw_to_navd88_offset is cached and static
-                offset = self.vdatum.get_mllw_to_navd88_offset(lat, lon)
+                offset = self.vdatum.get_robust_mllw_to_navd88_offset(lat, lon)
 
                 # Validate offset is reasonable (e.g. within -100 to 100m)
                 if -100 < offset < 100:

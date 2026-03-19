@@ -21,13 +21,13 @@ from typing import Annotated, Any
 import numpy as np
 import xarray as xr
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
-from topobathysim.runtime import run, should_consolidate
+from topobathysim.runtime import hydrate, run, should_consolidate
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
-from .models import ElevationResponse, TIDReportResponse, TileMetadataResponse
+from .models import ElevationResponse, HydrateRequest, TIDReportResponse, TileMetadataResponse
 from .routers import cache_viewer
 
 # Configure Logging
@@ -233,6 +233,11 @@ app = FastAPI(
 )
 
 app.include_router(cache_viewer.router)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(static_dir / "favicon.ico")
 
 
 @app.middleware("http")
@@ -1419,3 +1424,39 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _hydrate_task(policy_path: str, bbox: tuple[float, float, float, float], resolution: float) -> None:
+    try:
+        logger.info(f"Starting background hydration for {bbox} @ {resolution}m")
+        stats = hydrate(policy_path, bbox, resolution=resolution)
+        logger.info(f"Hydration finished: {stats}")
+    except Exception as e:
+        logger.error(f"Hydration failed: {e}", exc_info=True)
+
+
+@app.post("/hydrate")
+async def trigger_hydrate(
+    request: HydrateRequest,
+    background_tasks: BackgroundTasks,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+) -> dict[str, Any]:
+    """
+    Trigger a background hydration process for the specified bounding box and resolution.
+    This ensures all underlying grid cells are computed and cached.
+    """
+    start_time = datetime.now()
+    background_tasks.add_task(
+        _hydrate_task,
+        str(policy_path),
+        request.bbox,
+        request.resolution,
+    )
+
+    return {
+        "status": "accepted",
+        "message": "Hydration task started in background",
+        "bbox": request.bbox,
+        "resolution": request.resolution,
+        "timestamp": start_time.isoformat(),
+    }

@@ -458,6 +458,123 @@ def get_fused_cache_path(
     return path
 
 
+def hydrate(
+    policy_path: str,
+    bbox: tuple[float, float, float, float],
+    resolution: float | None = None,
+    time: datetime | None = None,
+) -> dict[str, int]:
+    """
+    Hydrate the cache for a given bbox and resolution by processing all covering grid cells.
+    Does not return the fused dataset, only ensures cells are cached.
+    Mocks the behavior of run() but without aggregating results in memory.
+    """
+    import shutil
+
+    policy = load_policy(policy_path)
+    target_crs = policy.crs
+    res = resolution if resolution else 30.0
+
+    # Determine Grid Cells
+    cells, grid_cell_size = _get_grid_cells(bbox, target_crs)
+    legend = generate_provider_legend(policy)
+
+    # Ensure cache dir exists
+    default_cache = "~/.cache/topobathysim/fused_zarr"
+    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
+    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
+        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
+    else:
+        cache_dir = Path(cache_dir_str).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {"total": len(cells), "cached": 0, "processed": 0, "failed": 0}
+
+    logger.info(f"Starting hydration for {len(cells)} cells. BBox: {bbox}, Res: {res}")
+
+    for i, cell_bbox in enumerate(cells, 1):
+        # Use centralized cache helper
+        cache_path, key_hash = get_fused_cache_info(policy_path, cell_bbox, resolution=res)
+
+        is_cached = False
+        if cache_path.exists():
+            try:
+                # Lightweight check: valid Zarr?
+                ds_meta = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+
+                valid_grid = ds_meta.attrs.get("grid_cell_size") == grid_cell_size
+                cached_legend = ds_meta.attrs.get("policy_legend")
+                # If cached legend is missing (old cache), we consider it invalid if we are strict,
+                # but to be safe let's invalidate if explicit mismatch.
+                valid_legend = not (cached_legend and cached_legend != str(legend))
+
+                if valid_grid and valid_legend:
+                    is_cached = True
+                    stats["cached"] += 1
+
+                ds_meta.close()
+            except Exception as e:
+                logger.warning(f"Cache check failed for {cache_path}: {e}")
+
+        if is_cached:
+            if i % 10 == 0:
+                logger.info(f"Hydration progress: {i}/{len(cells)} (Cached)")
+            continue
+
+        logger.info(f"Hydrating cell {i}/{len(cells)}: {cell_bbox} -> {cache_path.name}")
+
+        # Process and Cache
+        try:
+            ds_cell = _run_cell(
+                policy=policy,
+                cell_bbox=cell_bbox,
+                resolution=res,
+                time=time,
+                target_crs=target_crs,
+                halo_pct=0.10,
+            )
+
+            # Metadata
+            new_attrs = {
+                "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
+                "policy_legend": str(legend),
+                "grid_cell_size": grid_cell_size,
+                "crs": target_crs,
+                "created_at": datetime.utcnow().isoformat(),
+                "cell_bbox": list(cell_bbox),
+                "hydrated": "true",
+            }
+            ds_cell.attrs.update(new_attrs)
+            if "provenance_dict" in ds_cell.attrs:
+                ds_cell.attrs["provenance_dict_json"] = json.dumps(ds_cell.attrs["provenance_dict"])
+
+            # Save to Cache
+            ds_chunked = ds_cell.chunk({"y": 2048, "x": 2048})
+            tmp_path = cache_path.with_suffix(f".tmp.{key_hash}.zarr")
+
+            if tmp_path.exists():
+                shutil.rmtree(tmp_path)
+
+            ds_chunked.to_zarr(tmp_path, mode="w", consolidated=should_consolidate())
+
+            if cache_path.exists():
+                shutil.rmtree(cache_path)
+
+            shutil.move(str(tmp_path), str(cache_path))
+
+            stats["processed"] += 1
+
+            ds_cell.close()
+            del ds_cell
+
+        except Exception as e:
+            logger.error(f"Failed to hydrate cell {cell_bbox}: {e}", exc_info=True)
+            stats["failed"] += 1
+
+    logger.info(f"Hydration complete. Stats: {stats}")
+    return stats
+
+
 def run(
     policy_path: str,
     bbox: tuple[float, float, float, float],

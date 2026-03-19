@@ -198,15 +198,32 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderTier2(d) { // Fused
-        const zoomRows = Object.entries(d.by_zoom || {}).map(([z, i]) =>
-            `<tr><td>L${z}</td><td>${i.count}</td><td>${formatBytes(i.bytes)}</td><td>${i.lon_min?.toFixed(2)}, ${i.lat_min?.toFixed(2)}</td></tr>`
-        ).join('');
+        const zoomRows = Object.entries(d.by_zoom || {}).map(([z, i]) => {
+            const resMeters = 156543.03 / Math.pow(2, z);
+
+            // Area Estimate (Bounds)
+            const latDiff = Math.abs(i.lat_max - i.lat_min);
+            const lonDiff = Math.abs(i.lon_max - i.lon_min);
+            const avgLat = (i.lat_max + i.lat_min) / 2;
+            const kmPerDegLat = 111.32;
+            const kmPerDegLon = 111.32 * Math.cos(avgLat * Math.PI / 180);
+            const areaSqKm = (latDiff * kmPerDegLat) * (lonDiff * kmPerDegLon);
+
+            return `<tr>
+                <td><strong>L${z}</strong> <small style="color:#8b949e">~${resMeters.toFixed(1)}m</small></td>
+                <td>${i.count}</td>
+                <td>${formatBytes(i.bytes)}</td>
+                <td>${areaSqKm < 0.1 ? '<0.1' : areaSqKm.toFixed(1)} km²</td>
+                <td style="font-family:monospace; font-size:0.8rem">${i.lon_min?.toFixed(2)}, ${i.lat_min?.toFixed(2)}</td>
+            </tr>`;
+        }).join('');
         return `
             <div class="stats-row" style="margin-bottom:16px;">
-                <span>chunks fused: <strong>${d.count}</strong></span>
+                <span>Total Chunks: <strong>${d.count}</strong></span>
+                <span style="margin-left:16px;">Total Size: <strong>${formatBytes(d.bytes)}</strong></span>
             </div>
-            <div class="detail-section"><h4>Zoom Levels</h4>
-            <table class="detail-table"><thead><tr><th>Zoom</th><th>Count</th><th>Size</th><th>Bounds</th></tr></thead><tbody>${zoomRows}</tbody></table></div>`;
+            <div class="detail-section"><h4>Inventory by Resolution</h4>
+            <table class="detail-table"><thead><tr><th>Zoom / Res</th><th>Chunks</th><th>Size</th><th>Coverage (Est)</th><th>Min Bounds</th></tr></thead><tbody>${zoomRows}</tbody></table></div>`;
     }
 
     function renderTier3(d) { // Providers

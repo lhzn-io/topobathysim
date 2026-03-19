@@ -55,7 +55,7 @@ class Tier2Detail(BaseModel):
     bytes: int
     newest: float
     oldest: float
-    by_zoom: dict[int, ZoomDetail]
+    by_zoom: dict[float, ZoomDetail]
 
 
 class ProviderDetail(BaseModel):

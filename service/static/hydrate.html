@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TopoBathy Cache Hydration</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; background: #f4f6f8; color: #333; }
+        h1 { margin-bottom: 0.5rem; }
+        p { margin-top: 0; color: #666; }
+
+        /* Layout */
+        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+
+        /* Form Elements */
+        label { display: block; margin-top: 15px; font-weight: 600; font-size: 0.9rem; margin-bottom: 5px; }
+        input[type="number"], select { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }
+        input[type="number"]:focus, select:focus { border-color: #007bff; outline: none; }
+
+        .bbox-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+
+        /* Toggle Switch */
+        .toggle-group { display: flex; gap: 20px; background: #f8f9fa; padding: 10px; border-radius: 4px; border: 1px solid #eee; margin-top: 5px; }
+        .toggle-opt { font-weight: normal; margin: 0; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+
+        /* Map */
+        #map { height: 400px; margin-top: 20px; border: 1px solid #ddd; border-radius: 4px; }
+
+        /* Markers */
+        .resize-handle {
+            background-color: #fff;
+            border: 2px solid #3388ff;
+            width: 12px !important;
+            height: 12px !important;
+            margin-left: -6px !important;
+            margin-top: -6px !important;
+            cursor: nwse-resize;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            border-radius: 2px;
+        }
+        .nw-handle {
+            background-color: #3388ff;
+            border: 2px solid #fff;
+            width: 14px !important;
+            height: 14px !important;
+            border-radius: 50%;
+            margin-left: -7px !important;
+            margin-top: -7px !important;
+            cursor: move;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+        }
+
+        /* Estimates Panel */
+        #estimates {
+            margin-top: 20px;
+            padding: 15px;
+            background: #eef2f5;
+            border-radius: 6px;
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 15px;
+            border: 1px solid #dee2e6;
+        }
+        .stat-item { text-align: center; }
+        .stat-label { font-size: 0.75rem; text-transform: uppercase; color: #6c757d; display: block; margin-bottom: 4px; letter-spacing: 0.5px; }
+        .stat-value { font-weight: 700; font-size: 1.1rem; color: #212529; }
+
+        /* Actions */
+        .actions { margin-top: 25px; display: flex; gap: 15px; align-items: center; }
+        button { padding: 10px 24px; font-size: 16px; font-weight: 600; border: none; border-radius: 4px; cursor: pointer; transition: background 0.2s; }
+        button[type="submit"] { background: #007bff; color: white; }
+        button[type="submit"]:hover { background: #0056b3; }
+        button[type="submit"]:disabled { background: #ccc; cursor: not-allowed; }
+
+        #status { margin-left: auto; font-size: 0.9rem; }
+        .success { color: #28a745; font-weight: 500; }
+        .error { color: #dc3545; font-weight: 500; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hydrate Cache</h1>
+        <p>Select a region and resolution to pre-warm the fusion cache.</p>
+
+        <form id="hydrateForm">
+            <label>Bounding Box (West, South, East, North)</label>
+            <div class="bbox-grid">
+                <div class="input-group">
+                    <input type="number" step="any" id="west" placeholder="West" required>
+                </div>
+                <div class="input-group">
+                    <input type="number" step="any" id="south" placeholder="South" required>
+                </div>
+                <div class="input-group">
+                    <input type="number" step="any" id="east" placeholder="East" required>
+                </div>
+                <div class="input-group">
+                    <input type="number" step="any" id="north" placeholder="North" required>
+                </div>
+            </div>
+
+            <label>Target Resolution</label>
+            <div class="toggle-group">
+                <label class="toggle-opt">
+                    <input type="radio" name="resMode" value="zoom" checked>
+                    Zoom Level (Standard)
+                </label>
+                <label class="toggle-opt">
+                    <input type="radio" name="resMode" value="meters">
+                    Meters (Custom)
+                </label>
+            </div>
+
+            <div id="zoomControls">
+                <select id="zoomLevel" style="width: 100%; padding: 8px; margin-top: 5px; font-size:16px;">
+                    <!-- Populated by JS -->
+                </select>
+            </div>
+
+            <div id="meterControls" style="display: none;">
+                <input type="number" step="1.0" id="resolution" value="30.0" placeholder="e.g. 10.0">
+                <div style="font-size: 0.8rem; color: #666; margin-top: 4px; font-style: italic;">
+                    Enter desired pixel resolution in meters.
+                </div>
+            </div>
+
+            <div id="estimates">
+                <div class="stat-item">
+                    <span class="stat-label">Effective Res</span>
+                    <span class="stat-value" id="estRes">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Pixels</span>
+                    <span class="stat-value" id="estPixels">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Est. Time</span>
+                    <span class="stat-value" id="estTime">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Grid Cells</span>
+                    <span class="stat-value" id="estCheckouts">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Area (km²)</span>
+                    <span class="stat-value" id="estArea">-</span>
+                </div>
+            </div>
+
+            <div class="actions">
+                <button type="submit" id="submitBtn">Start Hydration Job</button>
+                <div id="status"></div>
+            </div>
+        </form>
+
+        <div id="map"></div>
+        <p style="font-size: 0.85rem; margin-top: 10px; color: #888;">
+            Tip: Drag the 🔵 top-left handle to move. Drag the ⬜ corner handle to resize. Double-click map to jump box.
+        </p>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const BASE_RES = 156543.03392;
+        const GRID_SIZE = 0.05; // 0.05 degrees per tile index
+
+        // --- Map Initialization ---
+        const map = L.map('map', {
+            doubleClickZoom: false,
+            scrollWheelZoom: 'center'
+        }).setView([40.7, -73.9], 10);
+
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+
+        // --- UI Initialization ---
+        const zoomSelect = document.getElementById('zoomLevel');
+
+        // Populate Zoom Levels (0-23)
+        for(let z=0; z<=23; z++) {
+            const res = BASE_RES / Math.pow(2, z);
+            const opt = document.createElement('option');
+            opt.value = z;
+            // Format nice label
+            const resLabel = res < 1 ? res.toFixed(3) : res.toFixed(1);
+            opt.text = `L${z} (~${resLabel}m)`;
+            if(z === 13) opt.selected = true; // Default to ~19m
+            zoomSelect.appendChild(opt);
+        }
+
+        // --- State Management ---
+        let selectionRect = null;
+        let moveHandle = null;
+        let resizeHandle = null;
+        let dragAnchor = null;
+
+        // --- Core Logic ---
+
+        function getEffectiveResolution() {
+            const mode = document.querySelector('input[name="resMode"]:checked').value;
+            if (mode === 'meters') {
+                let val = parseFloat(document.getElementById('resolution').value);
+                return (!isNaN(val) && val > 0) ? val : 30.0;
+            } else {
+                const z = parseInt(document.getElementById('zoomLevel').value);
+                return BASE_RES / Math.pow(2, z);
+            }
+        }
+
+        function updateEstimates(bounds) {
+            const resMeters = getEffectiveResolution();
+
+            // 1. Effective Res Display
+            const resDisplay = document.getElementById('estRes');
+            if(resDisplay) {
+                resDisplay.innerText = resMeters < 1 ? resMeters.toFixed(3) + 'm' : resMeters.toFixed(1) + 'm';
+            }
+
+            const w = bounds.getWest();
+            const s = bounds.getSouth();
+            const e = bounds.getEast();
+            const n = bounds.getNorth();
+
+            // 2. Grid Cells (Backend Units)
+            const minX = Math.floor(w / GRID_SIZE);
+            const maxX = Math.floor(e / GRID_SIZE);
+            const numCellsX = Math.max(1, maxX - minX + 1);
+
+            const minY = Math.floor(s / GRID_SIZE);
+            const maxY = Math.floor(n / GRID_SIZE);
+            const numCellsY = Math.max(1, maxY - minY + 1);
+
+            const totalCells = numCellsX * numCellsY;
+            const checkoutsEl = document.getElementById('estCheckouts');
+            if(checkoutsEl) checkoutsEl.innerText = totalCells.toLocaleString();
+
+            // 3. Area (Geodesic approximation)
+            const widthDeg = Math.abs(e - w);
+            const heightDeg = Math.abs(n - s);
+            // Approx km per degree at this latitude
+            const latRad = (s + n) / 2 * (Math.PI / 180);
+            const kmPerDegLng = 111.32 * Math.cos(latRad);
+            const kmPerDegLat = 110.57;
+            const areaSqKm = (widthDeg * kmPerDegLng) * (heightDeg * kmPerDegLat);
+
+            const areaEl = document.getElementById('estArea');
+            if(areaEl) areaEl.innerText = areaSqKm < 0.1 ? "<0.1" : areaSqKm.toFixed(1);
+
+            // 4. Time Estimate (Heuristic)
+            // Assume base cost per cell + cost per pixel
+            const pixelsX = (widthDeg * 111320 * Math.cos(latRad)) / resMeters;
+            const pixelsY = (heightDeg * 111320) / resMeters;
+            const totalPixels = pixelsX * pixelsY;
+
+            // Update Pixels UI
+            const pixelsEl = document.getElementById('estPixels');
+            if(pixelsEl) {
+                if(totalPixels > 1000000000) pixelsEl.innerText = (totalPixels / 1000000000).toFixed(1) + "B";
+                else if(totalPixels > 1000000) pixelsEl.innerText = (totalPixels / 1000000).toFixed(1) + "M";
+                else if(totalPixels > 1000) pixelsEl.innerText = (totalPixels / 1000).toFixed(0) + "k";
+                else pixelsEl.innerText = totalPixels.toFixed(0);
+            }
+
+            // Heuristic: 0.1s overhead per cell + 1s per 1M pixels
+            const timeSeconds = (totalCells * 0.1) + (totalPixels / 1_000_000 * 1.5);
+
+            const timeEl = document.getElementById('estTime');
+            if(timeEl) {
+                if (timeSeconds < 60) {
+                     timeEl.innerText = `~${Math.ceil(timeSeconds)}s`;
+                } else if (timeSeconds < 3600) {
+                     timeEl.innerText = `~${(timeSeconds/60).toFixed(1)}m`;
+                } else {
+                     timeEl.innerText = `~${(timeSeconds/3600).toFixed(1)}h`;
+                }
+            }
+        }
+
+        function createSelectionShapes(bounds) {
+            // Cleanup old layers
+            if (selectionRect) map.removeLayer(selectionRect);
+            if (moveHandle) map.removeLayer(moveHandle);
+            if (resizeHandle) map.removeLayer(resizeHandle);
+
+            // 1. Rectangle
+            selectionRect = L.rectangle(bounds, {color: "#007bff", weight: 2, fillOpacity: 0.1}).addTo(map);
+
+            // 2. NW Handle (Move)
+            moveHandle = L.marker(selectionRect.getBounds().getNorthWest(), {
+                draggable: true,
+                icon: L.divIcon({className: 'nw-handle'})
+            }).addTo(map);
+
+            moveHandle.on('drag', (e) => {
+                const newNW = e.target.getLatLng();
+                const currentBounds = selectionRect.getBounds();
+                const oldNW = currentBounds.getNorthWest();
+
+                const latDiff = newNW.lat - oldNW.lat;
+                const lngDiff = newNW.lng - oldNW.lng;
+
+                const newBounds = L.latLngBounds(
+                    [currentBounds.getSouth() + latDiff, currentBounds.getWest() + lngDiff],
+                    [currentBounds.getNorth() + latDiff, currentBounds.getEast() + lngDiff]
+                );
+
+                selectionRect.setBounds(newBounds);
+                // Update resize handle position
+                resizeHandle.setLatLng(newBounds.getSouthEast());
+
+                updateFormInputs(newBounds);
+            });
+
+            // 3. Corner Handle (Resize SE)
+            resizeHandle = L.marker(bounds.getSouthEast(), {
+                draggable: true,
+                icon: L.divIcon({className: 'resize-handle'})
+            }).addTo(map);
+
+            resizeHandle.on('dragstart', () => {
+                // Anchor is opposite corner (NW)
+                dragAnchor = selectionRect.getBounds().getNorthWest();
+            });
+
+            resizeHandle.on('drag', (e) => {
+                 const newSE = e.target.getLatLng();
+                 const anchor = dragAnchor || selectionRect.getBounds().getNorthWest();
+                 const newBounds = L.latLngBounds(anchor, newSE);
+
+                 selectionRect.setBounds(newBounds);
+                 moveHandle.setLatLng(newBounds.getNorthWest());
+                 updateFormInputs(newBounds);
+            });
+
+            updateFormInputs(bounds);
+        }
+
+        function updateUrl() {
+            if (!selectionRect) return;
+            const bounds = selectionRect.getBounds();
+            const params = new URLSearchParams();
+
+            params.set('w', bounds.getWest().toFixed(5));
+            params.set('s', bounds.getSouth().toFixed(5));
+            params.set('e', bounds.getEast().toFixed(5));
+            params.set('n', bounds.getNorth().toFixed(5));
+
+            const mode = document.querySelector('input[name="resMode"]:checked').value;
+            params.set('mode', mode);
+
+            if (mode === 'meters') {
+                params.set('res', document.getElementById('resolution').value);
+            } else {
+                params.set('zoom', document.getElementById('zoomLevel').value);
+            }
+
+            const newUrl = `${window.location.pathname}?${params.toString()}`;
+            window.history.replaceState({}, '', newUrl);
+        }
+
+        function updateFormInputs(bounds) {
+            // Update Number Inputs
+            document.getElementById('west').value = bounds.getWest().toFixed(5);
+            document.getElementById('south').value = bounds.getSouth().toFixed(5);
+            document.getElementById('east').value = bounds.getEast().toFixed(5);
+            document.getElementById('north').value = bounds.getNorth().toFixed(5);
+
+            // Recalculate Estimates
+            updateEstimates(bounds);
+            updateUrl();
+        }
+
+        function updateMapFromInputs() {
+            const w = parseFloat(document.getElementById('west').value);
+            const s = parseFloat(document.getElementById('south').value);
+            const e = parseFloat(document.getElementById('east').value);
+            const n = parseFloat(document.getElementById('north').value);
+
+            if (!isNaN(w) && !isNaN(s) && !isNaN(e) && !isNaN(n)) {
+                // Basic validation
+                if (w < e && s < n) {
+                    const newBounds = L.latLngBounds([[s, w], [n, e]]);
+
+                    // Don't redraw if bounds haven't changed meaningfully to avoid loops?
+                    // For now, just redraw
+                    createSelectionShapes(newBounds);
+                    map.fitBounds(newBounds, {padding: [50, 50]});
+                }
+            }
+        }
+
+        // --- Event Listeners ---
+
+        // Input Changes
+        ['west', 'south', 'east', 'north'].forEach(id => {
+            document.getElementById(id).addEventListener('change', updateMapFromInputs);
+        });
+
+        // Resolution Changes
+        document.querySelectorAll('input[name="resMode"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const isMeters = e.target.value === 'meters';
+                document.getElementById('meterControls').style.display = isMeters ? 'block' : 'none';
+                document.getElementById('zoomControls').style.display = isMeters ? 'none' : 'block';
+                if(selectionRect) {
+                    updateEstimates(selectionRect.getBounds());
+                    updateUrl();
+                }
+            });
+        });
+
+        document.getElementById('resolution').addEventListener('input', () => {
+             if(selectionRect) {
+                 updateEstimates(selectionRect.getBounds());
+                 updateUrl();
+             }
+        });
+        document.getElementById('zoomLevel').addEventListener('change', () => {
+             if(selectionRect) {
+                 updateEstimates(selectionRect.getBounds());
+                 updateUrl();
+             }
+        });
+
+        // Map Interactions
+        map.on('dblclick', (e) => {
+            const currentBounds = selectionRect.getBounds();
+            const width = currentBounds.getEast() - currentBounds.getWest();
+            const height = currentBounds.getNorth() - currentBounds.getSouth();
+
+            // Center box on click
+            const halfW = width / 2;
+            const halfH = height / 2;
+
+            const newBounds = L.latLngBounds(
+                [e.latlng.lat - halfH, e.latlng.lng - halfW],
+                [e.latlng.lat + halfH, e.latlng.lng + halfW]
+            );
+
+            createSelectionShapes(newBounds);
+        });
+
+        // Form Submit
+        document.getElementById('hydrateForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const statusDiv = document.getElementById('status');
+
+            // UI Loading State
+            btn.disabled = true;
+            btn.innerText = "Submitting...";
+            statusDiv.innerHTML = '⏳ Processing...';
+            statusDiv.className = '';
+
+            try {
+                const bounds = selectionRect.getBounds();
+                const payload = {
+                    bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
+                    resolution: getEffectiveResolution(),
+                    force: false
+                };
+
+                const response = await fetch('/hydrate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    statusDiv.innerHTML = `✅ Job Started! <br>ID: <code>${data.job_id}</code>`;
+                    statusDiv.className = 'success';
+                } else {
+                    statusDiv.innerHTML = `❌ Error: ${data.detail || 'Unknown error'}`;
+                    statusDiv.className = 'error';
+                }
+            } catch (err) {
+                statusDiv.innerHTML = `❌ Network Error: ${err.message}`;
+                statusDiv.className = 'error';
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "Start Hydration Job";
+            }
+        });
+
+        // --- Init ---
+        function init() {
+            const params = new URLSearchParams(window.location.search);
+
+            // 1. Initial State from URL
+            let w = parseFloat(params.get('w'));
+            let s = parseFloat(params.get('s'));
+            let e = parseFloat(params.get('e'));
+            let n = parseFloat(params.get('n'));
+
+            // Default Area (NYC) if missing
+            if (isNaN(w) || isNaN(s) || isNaN(e) || isNaN(n)) {
+                w = -74.05; s = 40.65; e = -73.95; n = 40.75;
+            }
+
+            // 2. Resolution Mode
+            const mode = params.get('mode');
+            if (mode === 'meters') {
+                document.querySelector('input[name="resMode"][value="meters"]').checked = true;
+                if(params.get('res')) document.getElementById('resolution').value = params.get('res');
+                document.getElementById('meterControls').style.display = 'block';
+                document.getElementById('zoomControls').style.display = 'none';
+            } else if (params.get('zoom')) {
+                document.querySelector('input[name="resMode"][value="zoom"]').checked = true;
+                document.getElementById('zoomLevel').value = params.get('zoom');
+                // Ensure UI state matches
+                document.getElementById('meterControls').style.display = 'none';
+                document.getElementById('zoomControls').style.display = 'block';
+            }
+
+            const bounds = L.latLngBounds([[s, w], [n, e]]);
+
+            createSelectionShapes(bounds);
+            map.fitBounds(bounds, {padding: [50, 50]});
+
+            // Don't overwrite URL immediately if it's fresh load
+            if(!params.has('w')) updateUrl();
+        }
+
+        init();
+    </script>
+</body>
+</html></html>

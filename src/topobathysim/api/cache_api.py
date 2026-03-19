@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import shutil
 import time
 from pathlib import Path
@@ -38,6 +39,18 @@ except ImportError:
     raise ImportError("Could not import topobathysim.scripts.cache_manager") from None
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Ensure a value is a finite float, returning default if NaN/Inf."""
+    try:
+        f = float(val)
+        if not math.isfinite(f):
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
 
 # Re-export some constants for convenience
 CACHE_ROOT = cm.CACHE_ROOT
@@ -78,27 +91,109 @@ def get_cache_summary(cache_bust: bool = False) -> CacheSummary:
 
     for tier in TIERS:
         # These methods scan the filesystem, hence the caching
-        items = tier.item_count()
-        sz = tier.size_bytes()
+        try:
+            items = int(tier.item_count())
+        except Exception:
+            logger.exception(f"Error getting item count for tier {tier.number}")
+            items = 0
+
+        try:
+            sz = int(tier.size_bytes())
+        except Exception:
+            logger.exception(f"Error getting size bytes for tier {tier.number}")
+            sz = 0
+
         total_bytes += sz
+
+        mb_val = 0.0
+        try:
+            # Check for insane values before division
+            if sz > 1e15:  # 1 PB
+                logger.warning(f"Tier {tier.number} size is massive: {sz}")
+                mb_val = 0.0  # Cap visual display to avoid float overflow in extreme cases
+            else:
+                raw_mb = sz / (1024 * 1024)
+                if not math.isfinite(raw_mb):
+                    logger.warning(f"Tier {tier.number} raw_mb is not finite: {raw_mb}")
+                    mb_val = 0.0
+                else:
+                    mb_val = round(raw_mb, 2)
+        except Exception as e:
+            logger.exception(f"Error calculating MB for tier {tier.number}: {e}")
+            mb_val = 0.0
+
+        if sz > 1e16:  # Trap insane values
+            logger.warning(f"Tier {tier.number} reports insane size: {sz}")
+
         tier_summaries.append(
             CacheTierSummary(
                 number=tier.number,
                 name=tier.name,
                 items=items,
                 bytes=sz,
-                mb=round(sz / (1024 * 1024), 2),
+                mb=mb_val,
                 warning=tier.warning,
             )
         )
 
+    total_mb_val = 0.0
+    try:
+        if total_bytes > 1e15:
+            logger.warning(f"Total size is massive: {total_bytes}")
+            total_mb_val = 0.0
+        else:
+            raw_total_mb = total_bytes / (1024 * 1024)
+            if not math.isfinite(raw_total_mb):
+                logger.warning(f"Total raw_mb is not finite: {raw_total_mb}")
+                total_mb_val = 0.0
+            else:
+                total_mb_val = round(raw_total_mb, 2)
+    except Exception as e:
+        logger.exception(f"Error calculating total MB: {e}")
+        total_mb_val = 0.0
+
     summary = CacheSummary(
         cache_root=str(CACHE_ROOT),
         total_bytes=total_bytes,
-        total_mb=round(total_bytes / (1024 * 1024), 2),
+        total_mb=total_mb_val,
         tiers=tier_summaries,
         last_updated=now,
     )
+
+    # Paranoia check: Validate JSON compliance before returning
+    try:
+        # allow_nan=False is CRITICAL to catch the error that FastAPI/Starlette throws
+        json.dumps(summary.dict(), allow_nan=False)
+    except ValueError as e:
+        logger.error(f"JSON Serialization Check Failed: {e}")
+        logger.error(f"Diagnostics: Total MB={summary.total_mb}, LastUpdated={summary.last_updated}")
+
+        # Check Tiers
+        for t in summary.tiers:
+            if not math.isfinite(t.mb):
+                logger.error(f"Tier {t.number} has BAD MB: {t.mb}")
+                t.mb = 0.0
+
+        # Check Total
+        if not math.isfinite(summary.total_mb):
+            logger.error(f"Total MB is BAD: {summary.total_mb}")
+            summary.total_mb = 0.0
+
+        # Check Timestamp
+        if not math.isfinite(summary.last_updated):
+            logger.error(f"Last Updated is BAD: {summary.last_updated}")
+            summary.last_updated = 0.0
+
+        # Run check again, if it fails, we are doomed but at least we tried
+        try:
+            json.dumps(summary.dict(), allow_nan=False)
+        except ValueError:
+            logger.critical("Failed to sanitize CacheSummary! Returning zeroed fallback.")
+            # Fallback to zeroed summary
+            summary.total_mb = 0.0
+            for t in summary.tiers:
+                t.mb = 0.0
+
     _SUMMARY_CACHE = (now, summary)
     return summary
 
@@ -124,20 +219,20 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
     # Map Tier 2
     by_zoom = {}
     for z, info in d.fused_by_zoom.items():
-        by_zoom[z] = ZoomDetail(
+        by_zoom[float(z)] = ZoomDetail(
             count=info["count"],
             bytes=info["bytes"],
-            lon_min=info["lon_min"],
-            lon_max=info["lon_max"],
-            lat_min=info["lat_min"],
-            lat_max=info["lat_max"],
+            lon_min=_safe_float(info["lon_min"]),
+            lon_max=_safe_float(info["lon_max"]),
+            lat_min=_safe_float(info["lat_min"]),
+            lat_max=_safe_float(info["lat_max"]),
         )
 
     t2 = Tier2Detail(
         count=d.fused_count,
         bytes=d.fused_total_bytes,
-        newest=d.fused_newest,
-        oldest=d.fused_oldest,
+        newest=_safe_float(d.fused_newest),
+        oldest=_safe_float(d.fused_oldest),
         by_zoom=by_zoom,
     )
 
@@ -149,8 +244,8 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
                 name=p,
                 count=count,
                 bytes=sz,
-                newest=newest,
-                oldest=oldest,
+                newest=_safe_float(newest),
+                oldest=_safe_float(oldest),
             )
         )
     t3 = Tier3Detail(providers=providers)
@@ -164,7 +259,7 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
                 ok=ok,
                 bytes=sz,
                 entries=entries,
-                mtime=mtime,
+                mtime=_safe_float(mtime),
             )
         )
 
@@ -173,18 +268,18 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
         bluetopo_scheme={
             "exists": d.bluetopo_scheme[0],
             "bytes": d.bluetopo_scheme[1],
-            "mtime": d.bluetopo_scheme[2],
+            "mtime": _safe_float(d.bluetopo_scheme[2]),
         },
         bluetopo_sidecars={
             "ok_count": d.bluetopo_sidecars[0],
             "failed_count": d.bluetopo_sidecars[1],
             "bytes": d.bluetopo_sidecars[2],
-            "mtime": d.bluetopo_sidecars[3],
+            "mtime": _safe_float(d.bluetopo_sidecars[3]),
         },
         topobathy_zips={
             "count": d.topobathy_zips[0],
             "bytes": d.topobathy_zips[1],
-            "mtime": d.topobathy_zips[2],
+            "mtime": _safe_float(d.topobathy_zips[2]),
         },
     )
 
@@ -196,13 +291,13 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
                 provider=p,
                 count=count,
                 bytes=sz,
-                newest=newest,
-                oldest=oldest,
+                newest=_safe_float(newest),
+                oldest=_safe_float(oldest),
             )
         )
     t5 = Tier5Detail(raw_files=raw_files)
 
-    return CacheDetail(
+    detail = CacheDetail(
         cache_root=str(CACHE_ROOT),
         total_bytes=d.total_bytes,
         tier_1=t1,
@@ -211,6 +306,16 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
         tier_4=t4,
         tier_5=t5,
     )
+
+    # Paranoia check
+    try:
+        json.dumps(detail.dict(), allow_nan=False)
+    except ValueError as e:
+        logger.error(f"JSON Check Failed in get_cache_detail: {e}")
+        # If checks failed, we might crash, but at least we know WHERE.
+        # Since we applied _safe_float above, this should pass.
+
+    return detail
 
 
 def purge_tiers(tiers: list[int], dry_run: bool = True, yes: bool = False) -> PurgeResult:
