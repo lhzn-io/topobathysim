@@ -19,7 +19,12 @@ from affine import Affine
 from pyproj import CRS, Transformer
 
 from topobathysim.operators.blend import metric_feather, overwrite
-from topobathysim.policy.loader import generate_provider_legend, hash_policy, load_policy
+from topobathysim.policy.loader import (
+    generate_provider_legend,
+    hash_policy,
+    load_policy,
+    load_policy_from_str,
+)
 from topobathysim.policy.schema import OperatorType
 from topobathysim.providers.base import ProviderNoDataError
 from topobathysim.providers.registry import registry
@@ -389,19 +394,34 @@ def _run_cell(
     return cast(xr.Dataset, ds)
 
 
+def _resolve_policy(policy_input: str | Path) -> Any:
+    """
+    Resolve policy input to a FusionPolicy object.
+    Accepts a filepath (str/Path) OR a raw YAML string.
+    """
+    # Naive check: if it looks like a path and exists, load it
+    s_input = str(policy_input)
+    if (s_input.endswith(".yaml") or s_input.endswith(".yml")) and os.path.exists(s_input):
+        return load_policy(s_input)
+
+    # Otherwise treat as raw content
+    return load_policy_from_str(s_input)
+
+
 def get_fused_cache_info(
-    policy_path: str,
+    policy_input: str | Path,
     bbox: tuple[float, float, float, float],
     resolution: float = 30.0,
 ) -> tuple[Path, str]:
     """
     Returns the expected Path and the hash key for a fused Zarr cache file.
+    Hashes the POLICY CONTENT + BBOX + RES to create a unique ID.
     This centralized function ensures metadata parity across all endpoints.
     """
     import json
     import os
 
-    policy = load_policy(policy_path)
+    policy = _resolve_policy(policy_input)
     target_crs = policy.crs
 
     default_cache = "~/.cache/topobathysim/fused_zarr"
@@ -412,8 +432,11 @@ def get_fused_cache_info(
         cache_dir = Path(cache_dir_str).expanduser()
 
     # MD5 Hashing logic (Standardized Precision: 8 decimals)
+    # We hash the policy content digest itself to keep the key short but content-addressed
+    policy_content_hash = hash_policy(policy.model_dump())
+
     key_dict = {
-        "policy": policy.model_dump_json(),  # type: ignore
+        "policy_hash": policy_content_hash,
         "cell": [round(x, 8) for x in bbox],
         "res": round(resolution, 8),
         "crs": target_crs,
@@ -449,17 +472,17 @@ def get_cache_info_for_point(
 
 
 def get_fused_cache_path(
-    policy_path: str,
+    policy_input: str | Path,
     bbox: tuple[float, float, float, float],
     resolution: float = 30.0,
 ) -> Path:
     """Legacy wrapper for get_fused_cache_info returning only the Path."""
-    path, _ = get_fused_cache_info(policy_path, bbox, resolution)
+    path, _ = get_fused_cache_info(policy_input, bbox, resolution)
     return path
 
 
 def hydrate(
-    policy_path: str,
+    policy_input: str | Path,
     bbox: tuple[float, float, float, float],
     resolution: float | None = None,
     time: datetime | None = None,
@@ -471,7 +494,7 @@ def hydrate(
     """
     import shutil
 
-    policy = load_policy(policy_path)
+    policy = _resolve_policy(policy_input)
     target_crs = policy.crs
     res = resolution if resolution else 30.0
 
@@ -479,14 +502,10 @@ def hydrate(
     cells, grid_cell_size = _get_grid_cells(bbox, target_crs)
     legend = generate_provider_legend(policy)
 
-    # Ensure cache dir exists
-    default_cache = "~/.cache/topobathysim/fused_zarr"
-    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
-    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
-        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
-    else:
-        cache_dir = Path(cache_dir_str).expanduser()
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Use centralized cache helper to ensure base dir exists
+    # We call get_fused_cache_info just to get the parent dir, though we do it per-cell below
+    # because the hash differs per cell.
+    # We'll just rely on the loop to create dirs.
 
     stats = {"total": len(cells), "cached": 0, "processed": 0, "failed": 0}
 
@@ -494,7 +513,11 @@ def hydrate(
 
     for i, cell_bbox in enumerate(cells, 1):
         # Use centralized cache helper
-        cache_path, key_hash = get_fused_cache_info(policy_path, cell_bbox, resolution=res)
+        cache_path, key_hash = get_fused_cache_info(policy_input, cell_bbox, resolution=res)
+
+        # Ensure parent dir exists (lazy creation)
+        if not cache_path.parent.exists():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
 
         is_cached = False
         if cache_path.exists():
@@ -503,9 +526,9 @@ def hydrate(
                 ds_meta = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
 
                 valid_grid = ds_meta.attrs.get("grid_cell_size") == grid_cell_size
+                # We trust our hash includes policy content, so a hit is a hit on policy content.
+                # But we double check legend just in case of collisions or old data.
                 cached_legend = ds_meta.attrs.get("policy_legend")
-                # If cached legend is missing (old cache), we consider it invalid if we are strict,
-                # but to be safe let's invalidate if explicit mismatch.
                 valid_legend = not (cached_legend and cached_legend != str(legend))
 
                 if valid_grid and valid_legend:
@@ -534,9 +557,8 @@ def hydrate(
                 halo_pct=0.10,
             )
 
-            # Metadata
             new_attrs = {
-                "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
+                "policy_hash": key_hash,
                 "policy_legend": str(legend),
                 "grid_cell_size": grid_cell_size,
                 "crs": target_crs,
@@ -553,19 +575,23 @@ def hydrate(
             tmp_path = cache_path.with_suffix(f".tmp.{key_hash}.zarr")
 
             if tmp_path.exists():
+                import shutil
+
                 shutil.rmtree(tmp_path)
 
             ds_chunked.to_zarr(tmp_path, mode="w", consolidated=should_consolidate())
 
             if cache_path.exists():
+                import shutil
+
                 shutil.rmtree(cache_path)
+
+            import shutil
 
             shutil.move(str(tmp_path), str(cache_path))
 
             stats["processed"] += 1
-
             ds_cell.close()
-            del ds_cell
 
         except Exception as e:
             logger.error(f"Failed to hydrate cell {cell_bbox}: {e}", exc_info=True)
@@ -576,7 +602,7 @@ def hydrate(
 
 
 def run(
-    policy_path: str,
+    policy_input: str | Path,
     bbox: tuple[float, float, float, float],
     resolution: float | None = None,
     time: datetime | None = None,
@@ -586,7 +612,7 @@ def run(
     Execute a fusion policy to generate a topobathymetric dataset.
     This public entrypoint chunks arbitrary bboxes into standard grid cells for caching.
     """
-    policy = load_policy(policy_path)
+    policy = _resolve_policy(policy_input)
     target_crs = policy.crs
 
     # If the bbox exactly matches a single grid cell, we can bypass the expensive tiling logic
@@ -607,12 +633,14 @@ def run(
     if is_standard_cell:
         # FAST PATH: Single cache-hit check for the whole request
         cache_path, key_hash = get_fused_cache_info(
-            policy_path, bbox, resolution=resolution if resolution else 30.0
+            policy_input,
+            bbox,
+            resolution=resolution if resolution else 30.0,
         )
         if use_cache and cache_path.exists():
             logger.info(f"Fast Path Cache Hit: {cache_path.name}")
             ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
-            return ds.load()
+            return cast(xr.Dataset, ds.load())
 
     start_lon, start_lat, end_lon, end_lat = bbox
 
@@ -660,45 +688,37 @@ def run(
     for cell_bbox in cells:
         # Use centralized cache helper to ensure metadata parity across all endpoints
         cache_path, key_hash = get_fused_cache_info(
-            policy_path, cell_bbox, resolution=resolution if resolution else 30.0
+            policy_input,
+            cell_bbox,
+            resolution=resolution if resolution else 30.0,
         )
 
         ds_cell = None
         if use_cache and cache_path.exists():
             try:
-                try:
-                    from filelock import FileLock
+                ds_cell = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+                # Load fully
+                ds_cell = ds_cell.load()
 
-                    with FileLock(cache_path.with_suffix(".lock")):
-                        ds_cell = xr.open_dataset(
-                            cache_path, engine="zarr", chunks="auto", decode_coords="all"
-                        )
-                        # Load into memory fully so we can close the zarr store if needed
-                        ds_cell = ds_cell.load()
-                except ImportError:
-                    ds_cell = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
-                    ds_cell = ds_cell.load()
+                valid_grid = ds_cell.attrs.get("grid_cell_size") == grid_cell_size
+                # If cached grid size doesn't match current logic, invalidate
+                if not valid_grid:
+                    logger.info(f"Cache Grid Mismatch for {cache_path.name}. Invalidating.")
+                    ds_cell = None
+                else:
+                    # Clean up random dimensions
+                    for var in ["elevation", "source_elevation"]:
+                        if var in ds_cell and "band" in ds_cell[var].dims:
+                            ds_cell[var] = ds_cell[var].squeeze("band", drop=True)
+
+                    # Double check legend
+                    cached_legend = ds_cell.attrs.get("policy_legend")
+                    if cached_legend and cached_legend != str(legend):
+                        logger.info(f"Policy Legend Mismatch for {cache_path.name}. Invalidating Cache.")
+                        ds_cell = None
+
             except Exception as e:
                 logger.warning(f"Failed to load cache {cache_path}: {e}")
-
-        if ds_cell is not None and ds_cell.attrs.get("grid_cell_size") != grid_cell_size:
-            logger.info(
-                f"Grid Size Mismatch for {cache_path.name}. "
-                f"Expect {grid_cell_size}, got {ds_cell.attrs.get('grid_cell_size')}"
-            )
-            ds_cell = None
-
-        if ds_cell is not None:
-            # Squeeze any spurious band dimension that may have been saved by older cache writes
-            for var in ["elevation", "source_elevation"]:
-                if var in ds_cell and "band" in ds_cell[var].dims:
-                    ds_cell[var] = ds_cell[var].squeeze("band", drop=True)
-
-            # ATTRS CHECK: If cache was written with a different provider set (new code or different config),
-            # we should invalidate it to ensure provenance IDs match current legend.
-            cached_legend = ds_cell.attrs.get("policy_legend")
-            if cached_legend and cached_legend != str(legend):
-                logger.info(f"Policy Legend Mismatch for {cache_path.name}. Invalidating Cache.")
                 ds_cell = None
 
         if ds_cell is None:
@@ -836,4 +856,4 @@ def run(
     m_nans = int(np.isnan(m_elev).sum())
     m_total = m_elev.size
     logger.info(f"[PROBE] Final: Shape={m_elev.shape}, NaNs={m_nans}/{m_total} ({100.0*m_nans/m_total:.1f}%)")
-    return merged_ds
+    return cast(xr.Dataset, merged_ds)

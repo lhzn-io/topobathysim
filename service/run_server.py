@@ -30,8 +30,8 @@ def main() -> None:
         # Let's default to a sane 8 workers if not specified, or CPU count.
         # Given user's explicit request for parallelism, let's use a good chunk.
         cpu_count = multiprocessing.cpu_count()
-        # Cap default to 8 to avoid OOM if 24 processes load big datasets
-        args.workers = min(cpu_count, 8)
+        # Cap default to 2 to avoid OOM if processes load big datasets
+        args.workers = min(cpu_count, 2)
         print(f"Auto-configured workers: {args.workers} (CPU Count: {cpu_count})")
 
     # If reload is True, workers must be 1 usually, or simple reload logic.

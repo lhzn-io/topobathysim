@@ -270,7 +270,7 @@ def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float, float] 
         y0, y1 = float(y_arr[0]), float(y_arr[-1])  # type: ignore[index, arg-type]
 
         # Calculate resolution (meters/pixel or degrees/pixel)
-        count = x_arr.shape[0]
+        count = x_arr.shape[0]  # type: ignore[union-attr]
         width = abs(x1 - x0)
         # Assuming cell centers, span is width. Res is width / (count-1)
         # If count=1, we can't really know, assume 0 or handle separately

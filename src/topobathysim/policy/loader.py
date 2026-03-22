@@ -37,6 +37,18 @@ def load_policy(path: str) -> FusionPolicy:
     return policy
 
 
+def load_policy_from_str(yaml_content: str) -> FusionPolicy:
+    """
+    Load a policy directly from a YAML string.
+    """
+    content = yaml.safe_load(yaml_content)
+
+    # Validate against schema
+    policy = FusionPolicy(**content)
+
+    return policy
+
+
 def clear_policy_cache() -> None:
     """Clear the in-memory policy cache."""
     load_policy.cache_clear()

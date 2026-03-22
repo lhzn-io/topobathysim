@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import xarray as xr
@@ -48,7 +48,7 @@ def sanitize_elevation_nodata(
     if max_valid is not None:
         cleaned = cleaned.where(cleaned < max_valid)
 
-    return cleaned
+    return cast(xr.DataArray, cleaned)
 
 
 class ProviderNoDataError(LookupError):

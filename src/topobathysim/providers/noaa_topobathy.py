@@ -860,6 +860,17 @@ class NoaaTopobathyProvider(Provider):
                         min_year = int(filter_criteria["min_year"])
                         candidates = candidates[candidates["year_computed"] >= min_year]
 
+                    # 1.5 Project ID Filter (Explicit inclusion)
+                    if "project_id" in filter_criteria:
+                        pid_val = filter_criteria["project_id"]
+                        if isinstance(pid_val, list):
+                            allowed_pids = [str(p) for p in pid_val]
+                        else:
+                            allowed_pids = [str(pid_val)]
+                        candidates = candidates[candidates["project_id"].isin(allowed_pids)]
+                        if not candidates.empty:
+                            logger.info(f"Explicitly filtering to requested project_ids: {allowed_pids}")
+
                     # 2. Resolution Filter
                     if "max_resolution" in filter_criteria and "resolution_meters" in candidates.columns:
                         max_res = float(filter_criteria["max_resolution"])

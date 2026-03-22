@@ -116,14 +116,21 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
 
         mock_get_cls.side_effect = get_cls
 
-        with patch("topobathysim.runtime.load_policy", return_value=mock_policy):
+        # We must patch _resolve_policy because run() calls it now
+        with patch("topobathysim.runtime._resolve_policy", return_value=mock_policy):
             # 1. Test Single Band 3D (1, H, W) -> Should reduce to (H, W)
             # We construct a policy with just that step
             mock_policy.variables[0].steps = [
-                CompositionStep(provider="mock_3d", operation=OperatorType.overwrite)
+                CompositionStep(
+                    provider="mock_3d",
+                    operation=OperatorType.overwrite,
+                    transitions=[],
+                    filter=None,
+                )
             ]
 
-            ds = run("dummy_path", bbox=(0, 0, 1, 1), resolution=10000, use_cache=False)
+            # Use small bbox to avoid processing hundreds of tiles
+            ds = run("dummy_path", bbox=(0, 0, 0.04, 0.04), resolution=10000, use_cache=False)
             elevation = ds["elevation"]
 
             assert elevation.ndim == 2, f"Expected 2D array, got {elevation.ndim}"
@@ -136,7 +143,7 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
                 CompositionStep(provider="mock_multiband", operation=OperatorType.overwrite)
             ]
 
-            ds = run("dummy_path", bbox=(0, 0, 1, 1), resolution=10000, use_cache=False)
+            ds = run("dummy_path", bbox=(0, 0, 0.04, 0.04), resolution=10000, use_cache=False)
             elevation = ds["elevation"]
 
             assert elevation.ndim == 2
@@ -151,7 +158,7 @@ def test_runtime_enforces_2d(mock_policy: FusionPolicy) -> None:
                 CompositionStep(provider="mock_channel_last", operation=OperatorType.overwrite)
             ]
 
-            ds = run("dummy_path", bbox=(0, 0, 1, 1), resolution=10000, use_cache=False)
+            ds = run("dummy_path", bbox=(0, 0, 0.04, 0.04), resolution=10000, use_cache=False)
             elevation = ds["elevation"]
 
             assert elevation.ndim == 2

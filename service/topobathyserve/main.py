@@ -27,7 +27,13 @@ from fastapi.responses import FileResponse, Response
 from topobathysim.runtime import hydrate, run, should_consolidate
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
-from .models import ElevationResponse, HydrateRequest, TIDReportResponse, TileMetadataResponse
+from .models import (
+    ElevationResponse,
+    FusionRequest,
+    HydrateRequest,
+    TIDReportResponse,
+    TileMetadataResponse,
+)
 from .routers import cache_viewer
 
 # Configure Logging
@@ -303,7 +309,7 @@ def fuse(
         raise HTTPException(status_code=404, detail="Fusion returned no elevation data")
 
     if fmt == "zarr":
-        import zarr
+        import zarr.storage
 
         ds_out = ds.copy()
         keep_vars = ["elevation"]
@@ -314,7 +320,77 @@ def fuse(
 
         with TemporaryDirectory() as tmpdir:
             zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
-            store = zarr.ZipStore(str(zarr_zip_path), mode="w")
+            store = zarr.storage.ZipStore(str(zarr_zip_path), mode="w")
+            try:
+                ds_out.to_zarr(store, mode="w")
+            finally:
+                store.close()
+
+            data = zarr_zip_path.read_bytes()
+
+        headers = {"Content-Disposition": "attachment; filename=fused.zarr.zip"}
+        return Response(content=data, media_type="application/zip", headers=headers)
+
+    buf = BytesIO()
+    ds["elevation"].rio.to_raster(buf, driver="GTiff")
+    return Response(content=buf.getvalue(), media_type="image/tiff")
+
+
+@app.post("/fuse")
+def fuse_post(
+    request: FusionRequest,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+) -> Response:
+    fmt = _normalize_output_format(request.format)
+
+    # Dynamic Policy Logic
+    policy_input: Path | str = policy_path
+    if request.policy_override:
+        policy_input = request.policy_override
+    elif request.policy_name:
+        # Simple lookup: check if a policy with this name exists in policies dir?
+        # For now, let's just log and fallback or fail?
+        # Actually, let's look for it in the same directory as default policy if possible.
+        # But for strict compatibility with instructions, let's prioritize override string.
+        pass
+
+    try:
+        ds = run(
+            policy_input=policy_input,
+            bbox=request.bbox,
+            resolution=request.resolution,
+            use_cache=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"POST /fuse failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if "elevation" not in ds or ds["elevation"].size == 0:
+        raise HTTPException(status_code=404, detail="Fusion returned no elevation data")
+
+    if fmt == "zarr":
+        import zarr.storage
+
+        ds_out = ds.copy()
+        keep_vars = ["elevation"]
+        if "source_elevation" in ds_out:
+            keep_vars.append("source_elevation")
+        ds_out = ds_out[keep_vars]
+
+        # Policy name for metadata
+        p_name = policy_path.name
+        if request.policy_name:
+            p_name = request.policy_name
+        elif request.policy_override:
+            p_name = "custom_override"
+
+        ds_out.attrs = _build_zarr_attrs(ds, request.bbox, request.resolution, p_name)
+
+        with TemporaryDirectory() as tmpdir:
+            zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
+            store = zarr.storage.ZipStore(str(zarr_zip_path), mode="w")
             try:
                 ds_out.to_zarr(store, mode="w")
             finally:

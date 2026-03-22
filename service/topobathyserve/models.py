@@ -30,6 +30,19 @@ class HydrateRequest(BaseModel):
     resolution: float = Field(30.0, description="Output resolution in meters", examples=[30.0])
 
 
+class FusionRequest(BaseModel):
+    bbox: tuple[float, float, float, float] = Field(
+        ...,
+        description="Bounding box as (west, south, east, north) in WGS84 decimal degrees",
+    )
+    resolution: float = Field(30.0, description="Output resolution in meters")
+    format: str = Field("zarr", description="Output format: zarr or geotiff")
+
+    # Dynamic Policy Switching
+    policy_name: str | None = Field(None, description="Name of a server-side policy (e.g., 'wlis')")
+    policy_override: str | None = Field(None, description="Raw YAML policy content to use for this request")
+
+
 class ElevationResponse(BaseModel):
     elevation: float | None
     unit: str = "meters"

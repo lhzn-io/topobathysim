@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import xarray as xr
-import zarr
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -163,8 +162,10 @@ class TestFuseEndpoint:
             zarr_path = Path(tmpdir) / "test.zarr.zip"
             zarr_path.write_bytes(response.content)
 
-            store = zarr.ZipStore(str(zarr_path), mode="r")
-            ds_loaded = xr.open_dataset(store, engine="zarr")
+            import zarr.storage
+
+            store = zarr.storage.ZipStore(str(zarr_path), mode="r")
+            ds_loaded = xr.open_dataset(store, engine="zarr")  # type: ignore[arg-type]
 
             assert "elevation" in ds_loaded
             assert ds_loaded.rio.crs.to_string() == "EPSG:4326"
@@ -201,8 +202,10 @@ class TestFuseEndpoint:
             zarr_path = Path(tmpdir) / "test.zarr.zip"
             zarr_path.write_bytes(response.content)
 
-            store = zarr.ZipStore(str(zarr_path), mode="r")
-            ds_loaded = xr.open_dataset(store, engine="zarr")
+            import zarr.storage
+
+            store = zarr.storage.ZipStore(str(zarr_path), mode="r")
+            ds_loaded = xr.open_dataset(store, engine="zarr")  # type: ignore[arg-type]
 
             # Verify metadata
             assert ds_loaded.attrs["crs"] == "EPSG:4326"
