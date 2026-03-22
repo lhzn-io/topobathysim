@@ -40,7 +40,7 @@ class FusionRequest(BaseModel):
 
     # Dynamic Policy Switching
     policy_name: str | None = Field(None, description="Name of a server-side policy (e.g., 'wlis')")
-    policy_override: str | None = Field(None, description="Raw YAML policy content to use for this request")
+    policy_yaml: str | None = Field(None, description="Raw YAML policy content to use for this request")
 
 
 class ElevationResponse(BaseModel):

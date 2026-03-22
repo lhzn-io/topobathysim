@@ -34,8 +34,8 @@ def mock_run_dataset() -> xr.Dataset:
 
 
 @patch("topobathyserve.main.run")
-def test_post_fuse_with_policy_override(mock_run: MagicMock, mock_run_dataset: xr.Dataset) -> None:
-    """Test POST /fuse with policy_override string."""
+def test_post_fuse_with_policy_yaml(mock_run: MagicMock, mock_run_dataset: xr.Dataset) -> None:
+    """Test POST /fuse with policy_yaml string."""
     mock_run.return_value = mock_run_dataset
 
     override_policy = """
@@ -53,7 +53,7 @@ def test_post_fuse_with_policy_override(mock_run: MagicMock, mock_run_dataset: x
         "bbox": [-74.0, 40.0, -73.0, 41.0],
         "resolution": 30.0,
         "format": "geotiff",
-        "policy_override": override_policy,
+        "policy_yaml": override_policy,
     }
 
     response = client.post("/fuse", json=payload)

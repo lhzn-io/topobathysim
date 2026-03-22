@@ -345,8 +345,8 @@ def fuse_post(
 
     # Dynamic Policy Logic
     policy_input: Path | str = policy_path
-    if request.policy_override:
-        policy_input = request.policy_override
+    if request.policy_yaml:
+        policy_input = request.policy_yaml
     elif request.policy_name:
         # Simple lookup: check if a policy with this name exists in policies dir?
         # For now, let's just log and fallback or fail?
@@ -383,7 +383,7 @@ def fuse_post(
         p_name = policy_path.name
         if request.policy_name:
             p_name = request.policy_name
-        elif request.policy_override:
+        elif request.policy_yaml:
             p_name = "custom_override"
 
         ds_out.attrs = _build_zarr_attrs(ds, request.bbox, request.resolution, p_name)
