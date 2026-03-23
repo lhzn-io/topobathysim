@@ -39,7 +39,8 @@ USER_AGENT = (
 BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT", "120"))
 
 # Lower LRU Size to prevent "Too Many Open Files" with Zarr chunks
-BAG_CACHE_SIZE = int(os.getenv("TOPOBATHY_BAG_LRU_SIZE", "16"))
+# and limit peak memory from cached DataArrays held open in memory.
+BAG_CACHE_SIZE = int(os.getenv("TOPOBATHY_BAG_LRU_SIZE", "8"))
 
 
 @concurrent_lru_cache(maxsize=BAG_CACHE_SIZE)

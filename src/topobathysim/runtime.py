@@ -4,6 +4,7 @@ Core Runtime for TopoBathySim.
 This module executes fusion policies to generate topobathymetric datasets.
 """
 
+import gc
 import hashlib
 import json
 import logging
@@ -498,7 +499,7 @@ def hydrate(
     bbox: tuple[float, float, float, float],
     resolution: float | None = None,
     time: datetime | None = None,
-    max_workers: int | None = 4,
+    max_workers: int | None = 2,
     job_id: str | None = None,
     jobs_dict: dict | None = None,
 ) -> dict[str, int]:
@@ -611,7 +612,10 @@ def hydrate(
 
             shutil.move(str(tmp_path), str(cache_path))
 
+            del ds_chunked  # release reference before close
             ds_cell.close()
+            del ds_cell
+            gc.collect()
             return "processed"
 
         except Exception as e:
@@ -620,18 +624,30 @@ def hydrate(
 
     import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_process_cell, i, cb): cb for i, cb in enumerate(cells, 1)}
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            stats[status] += 1
-            if job_id and jobs_dict:
-                if status == "cached":
-                    jobs_dict[job_id]["cached_cells"] += 1
-                elif status == "processed":
-                    jobs_dict[job_id]["processed_cells"] += 1
-                elif status == "failed":
-                    jobs_dict[job_id]["failed_cells"] += 1
+    # Process cells in small batches to limit peak memory.
+    # Without batching, all cells are submitted at once and concurrent threads
+    # can exhaust memory when each loads large provider rasters.
+    batch_size = max(max_workers or 2, 2) * 2  # e.g. 4 for max_workers=2
+    cell_items = list(enumerate(cells, 1))
+
+    for batch_start in range(0, len(cell_items), batch_size):
+        batch = cell_items[batch_start : batch_start + batch_size]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_process_cell, i, cb): cb for i, cb in batch}
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                stats[status] += 1
+                if job_id and jobs_dict:
+                    if status == "cached":
+                        jobs_dict[job_id]["cached_cells"] += 1
+                    elif status == "processed":
+                        jobs_dict[job_id]["processed_cells"] += 1
+                    elif status == "failed":
+                        jobs_dict[job_id]["failed_cells"] += 1
+
+        # Force GC between batches to reclaim memory from completed cells
+        gc.collect()
 
     logger.info(f"Hydration complete. Stats: {stats}")
     return stats

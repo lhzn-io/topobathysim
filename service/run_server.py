@@ -13,6 +13,12 @@ def main() -> None:
     )
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload (dev mode)")
     parser.add_argument("--debug", type=int, default=0, help="Debug level (0=INFO, 1=DEBUG)")
+    parser.add_argument(
+        "--limit-max-requests",
+        type=int,
+        default=200,
+        help="Recycle worker after N requests to reclaim leaked memory (default: 200, 0=disable)",
+    )
 
     args = parser.parse_args()
 
@@ -44,9 +50,10 @@ def main() -> None:
             "topobathyserve.main:app", host=args.host, port=args.port, reload=True, log_level=log_level
         )
     else:
+        limit_max = args.limit_max_requests if args.limit_max_requests > 0 else None
         print(
             f"Starting BathyServe on {args.host}:{args.port} with {args.workers} workers. "
-            f"Log Level: {log_level}"
+            f"Log Level: {log_level}, Worker Recycle After: {limit_max or 'disabled'} requests"
         )
         uvicorn.run(
             "topobathyserve.main:app",
@@ -54,6 +61,7 @@ def main() -> None:
             port=args.port,
             workers=args.workers,
             log_level=log_level,
+            limit_max_requests=limit_max,
         )
 
 

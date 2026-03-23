@@ -231,8 +231,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # clean up logic if needed
 
 
-# Job tracking
+# Job tracking — capped and TTL-cleaned to prevent unbounded memory growth.
 HYDRATION_JOBS: dict[str, dict[str, Any]] = {}
+HYDRATION_JOBS_MAX = 100
+HYDRATION_JOBS_TTL_HOURS = 24
+
+
+def _cleanup_hydration_jobs() -> None:
+    """Remove completed/failed jobs older than TTL, and cap total entries."""
+    now = datetime.now(timezone.utc)
+    expired = []
+    for jid, job in HYDRATION_JOBS.items():
+        if job.get("status") in ("completed", "failed"):
+            submitted = job.get("submitted_at", "")
+            try:
+                submitted_dt = datetime.fromisoformat(submitted)
+                if submitted_dt.tzinfo is None:
+                    submitted_dt = submitted_dt.replace(tzinfo=timezone.utc)
+                age_hours = (now - submitted_dt).total_seconds() / 3600
+                if age_hours > HYDRATION_JOBS_TTL_HOURS:
+                    expired.append(jid)
+            except (ValueError, TypeError):
+                expired.append(jid)
+    for jid in expired:
+        del HYDRATION_JOBS[jid]
+    # Hard cap: remove oldest completed jobs if still over limit
+    while len(HYDRATION_JOBS) > HYDRATION_JOBS_MAX:
+        oldest_completed = None
+        for jid, job in HYDRATION_JOBS.items():
+            if job.get("status") in ("completed", "failed"):
+                oldest_completed = jid
+                break
+        if oldest_completed:
+            del HYDRATION_JOBS[oldest_completed]
+        else:
+            break
+
 
 app = FastAPI(
     title="BathyServe",
@@ -1547,6 +1581,7 @@ async def trigger_hydrate(
     start_time = datetime.now()
     import uuid
 
+    _cleanup_hydration_jobs()
     job_id = str(uuid.uuid4())
 
     HYDRATION_JOBS[job_id] = {
