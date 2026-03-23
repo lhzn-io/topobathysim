@@ -129,6 +129,74 @@ def _dedup_survey_resolutions(urls: list[str], target_resolution: float | None =
     return kept
 
 
+class _EmptyWindowError(Exception):
+    """Raised when a windowed read produces no pixels."""
+
+
+def _windowed_read(
+    da: xr.DataArray,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> xr.DataArray:
+    """Read a spatial subset from a DataArray without Dask.
+
+    Transforms the EPSG:4326 clip bounds to the array's native CRS,
+    computes index slices from the coordinate arrays, and reads only
+    those pixels into a new in-memory DataArray. No Dask task graph
+    is created or materialized.
+
+    Raises _EmptyWindowError if the window has zero pixels.
+    """
+    import numpy as np
+    from pyproj import Transformer
+
+    native_crs = da.rio.crs
+    if native_crs and str(native_crs) != "EPSG:4326":
+        transformer = Transformer.from_crs("EPSG:4326", native_crs, always_xy=True)
+        bx_west, bx_south = transformer.transform(west, south)
+        bx_east, bx_north = transformer.transform(east, north)
+        # Handle axis flips from reprojection
+        bx_west, bx_east = min(bx_west, bx_east), max(bx_west, bx_east)
+        bx_south, bx_north = min(bx_south, bx_north), max(bx_south, bx_north)
+    else:
+        bx_west, bx_south, bx_east, bx_north = west, south, east, north
+
+    # Resolve coordinate arrays (works for both x/y and lon/lat naming)
+    x_dim = da.rio.x_dim
+    y_dim = da.rio.y_dim
+    xs = da[x_dim].values
+    ys = da[y_dim].values
+
+    # Find index range via searchsorted on monotonic coord arrays
+    if xs[0] < xs[-1]:
+        x0 = int(np.searchsorted(xs, bx_west, side="left"))
+        x1 = int(np.searchsorted(xs, bx_east, side="right"))
+    else:
+        x0 = int(len(xs) - np.searchsorted(xs[::-1], bx_east, side="right"))
+        x1 = int(len(xs) - np.searchsorted(xs[::-1], bx_west, side="left"))
+
+    if ys[0] < ys[-1]:
+        y0 = int(np.searchsorted(ys, bx_south, side="left"))
+        y1 = int(np.searchsorted(ys, bx_north, side="right"))
+    else:
+        y0 = int(len(ys) - np.searchsorted(ys[::-1], bx_north, side="right"))
+        y1 = int(len(ys) - np.searchsorted(ys[::-1], bx_south, side="left"))
+
+    # Clamp to valid range
+    x0, x1 = max(0, x0), min(len(xs), x1)
+    y0, y1 = max(0, y0), min(len(ys), y1)
+
+    if x1 <= x0 or y1 <= y0:
+        raise _EmptyWindowError("No overlap")
+
+    # Direct numpy slice — bypasses Dask entirely
+    sliced = da.isel({x_dim: slice(x0, x1), y_dim: slice(y0, y1)})
+    result = cast(xr.DataArray, sliced.load())
+    return result
+
+
 @concurrent_lru_cache(maxsize=BAG_CACHE_SIZE)
 def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     """
@@ -764,13 +832,22 @@ class BAGDiscovery:
 
     @classmethod
     def find_bags_by_bbox(
-        cls, west: float, south: float, east: float, north: float, crs: str = "EPSG:4326"
+        cls,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        crs: str = "EPSG:4326",
+        target_resolution: float | None = None,
     ) -> list[str]:
         """
         Queries NCEI for BAGs intersecting the bounding box.
         Returns list of download URLs.
         Results are persisted to disk so subsequent calls (including across server restarts)
         return immediately without a network round-trip.
+
+        If target_resolution is provided, deduplicates multi-resolution exports
+        of the same survey at the discovery layer, before any files are fetched.
         """
         # OPTIMIZATION: Snap to a 0.01 degree grid to ensure high cache hit rate
         # regardless of small floating point or halo variations.
@@ -946,6 +1023,12 @@ class BAGDiscovery:
             logger.debug(f"BAG Discovery Cache Created: {bbox_key} ({len(found_urls)} urls persisted)")
         else:
             logger.warning(f"BAG Discovery Cache Skipped: {bbox_key} (query failed)")
+
+        # Apply survey dedup at discovery layer so pruned tiles are never
+        # fetched, file-locked, or loaded into memory.
+        if target_resolution and found_urls:
+            found_urls = _dedup_survey_resolutions(found_urls, target_resolution)
+
         return found_urls
 
 
@@ -990,21 +1073,11 @@ class BAGProvider(Provider):
         """
         west, south, east, north = bbox
 
-        # 1. Discover BAGs
-        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north, crs=crs)
+        # 1. Discover BAGs (dedup applied at discovery layer to skip
+        # network/filelock for pruned multi-resolution exports)
+        urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north, crs=crs, target_resolution=resolution)
         if not urls:
             raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
-
-        # Note: BAGDiscovery now returns URLs sorted Best -> Worst (Resolution, then Date).
-        # rioxarray.merge_arrays prioritizes the FIRST array (Top-Down), so this order is correct.
-
-        # OPTIMIZATION: Deduplicate multi-resolution exports of the same survey.
-        # NCEI often provides the same survey at multiple resolutions (e.g.
-        # H12696_MB_50cm, H12696_MB_2m, H12696_MB_4m). These are redundant —
-        # the finer resolution fully supersedes the coarser ones. For each survey,
-        # keep only the version closest to (but not coarser than) the target
-        # resolution. This typically cuts 51 urls down to ~15-20.
-        urls = _dedup_survey_resolutions(urls, target_resolution=resolution)
 
         logger.info(f"BAG fetch: Found {len(urls)} files to process.")
 
@@ -1035,51 +1108,36 @@ class BAGProvider(Provider):
                     logger.warning(f"BAG fetch: Failed to load data from {url}")
                     continue
 
-                # OPTIMIZATION: Clip in native CRS to avoid cross-CRS materialization.
+                # OPTIMIZATION: Windowed read via rasterio instead of Dask clip.
+                # Computes the pixel window from bounds + transform, reads only
+                # those pixels from the zarr-backed array. No Dask task graph,
+                # deterministic memory = output size.
                 try:
-                    native_crs = da.rio.crs
-                    if native_crs and str(native_crs) != "EPSG:4326":
-                        from pyproj import Transformer
-
-                        transformer = Transformer.from_crs("EPSG:4326", native_crs, always_xy=True)
-                        nx_west, nx_south = transformer.transform(west, south)
-                        nx_east, nx_north = transformer.transform(east, north)
-                        da = da.rio.clip_box(
-                            minx=min(nx_west, nx_east),
-                            miny=min(nx_south, nx_north),
-                            maxx=max(nx_west, nx_east),
-                            maxy=max(nx_south, nx_north),
-                            allow_one_dimensional_raster=True,
-                        )
-                    else:
-                        da = da.rio.clip_box(
-                            minx=west,
-                            miny=south,
-                            maxx=east,
-                            maxy=north,
-                            crs="EPSG:4326",
-                            allow_one_dimensional_raster=True,
-                        )
+                    da_work = _windowed_read(da, west, south, east, north)
+                except _EmptyWindowError:
+                    logger.debug(f"BAG tile empty after clip (url={url}): no overlap")
+                    continue
                 except Exception as e:
                     logger.debug(f"BAG tile empty after clip (url={url}): {e}")
                     continue
+                finally:
+                    # Release the Dask-backed DataArray reference immediately
+                    del da
 
-                if da is None or da.size == 0:
+                if da_work is None or da_work.size == 0:
                     continue
-
-                # Materialize the small clipped subset now so the Dask graph
-                # referencing the full backing zarr can be released.
-                da_work = cast(xr.DataArray, da.load())
-                del da
 
                 # Reproject individual chunk to target CRS
                 if crs and da_work.rio.crs and str(da_work.rio.crs) != crs:
                     try:
-                        reproj_knn = {}
+                        reproj_knn: dict[str, Any] = {}
                         if resolution and "EPSG:4326" not in crs:
                             reproj_knn["resolution"] = resolution
 
-                        da_work = cast(xr.DataArray, da_work.rio.reproject(crs, **reproj_knn))
+                        da_work = cast(
+                            xr.DataArray,
+                            da_work.rio.reproject(crs, num_threads=4, **reproj_knn),
+                        )
                     except Exception as e:
                         logger.warning(f"Reprojection failed for BAG segment: {e}")
                         continue

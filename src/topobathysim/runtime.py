@@ -8,6 +8,7 @@ import gc
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 from datetime import datetime
 from pathlib import Path
@@ -621,24 +622,42 @@ def hydrate(
 
     import concurrent.futures
 
-    # Process cells in small batches to limit peak memory.
-    # Without batching, all cells are submitted at once and concurrent threads
-    # can exhaust memory when each loads large provider rasters.
-    batch_size = max(max_workers or 2, 2) * 2  # e.g. 4 for max_workers=2
+    # Process cells in small batches using ProcessPoolExecutor.
+    # Each cell runs in its own subprocess with isolated memory, so:
+    # - A cell that hits MemoryError dies without affecting others
+    # - GC of large provider arrays is guaranteed on process exit
+    # - No GIL contention between cells doing CPU-heavy reprojection
+    # Falls back to ThreadPoolExecutor if fork is unavailable.
+    batch_size = max(max_workers or 2, 2) * 2
     cell_items = list(enumerate(cells, 1))
+
+    try:
+        # ProcessPoolExecutor requires picklable functions. _process_cell is a
+        # closure, so we use fork-based mp context where children inherit state.
+        mp_ctx = multiprocessing.get_context("fork")
+        pool_cls: type = concurrent.futures.ProcessPoolExecutor
+        pool_kwargs: dict[str, Any] = {"max_workers": max_workers, "mp_context": mp_ctx}
+    except ValueError:
+        # "fork" not available (e.g. macOS with spawn-only) — fall back to threads
+        logger.info("ProcessPoolExecutor(fork) unavailable, falling back to threads")
+        pool_cls = concurrent.futures.ThreadPoolExecutor
+        pool_kwargs = {"max_workers": max_workers}
 
     for batch_start in range(0, len(cell_items), batch_size):
         batch = cell_items[batch_start : batch_start + batch_size]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with pool_cls(**pool_kwargs) as executor:
             futures = {executor.submit(_process_cell, i, cb): cb for i, cb in batch}
             for future in concurrent.futures.as_completed(futures):
-                status = future.result()
+                try:
+                    status = future.result()
+                except Exception as e:
+                    logger.error(f"Cell worker crashed: {e}")
+                    status = "failed"
                 stats[status] += 1
                 if on_progress:
                     on_progress(stats)
 
-        # Force GC between batches to reclaim memory from completed cells
         gc.collect()
 
     logger.info(f"Hydration complete. Stats: {stats}")

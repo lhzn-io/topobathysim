@@ -1526,6 +1526,19 @@ def _hydrate_subprocess(
     # Ignore SIGINT in subprocess — let the parent handle Ctrl+C
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    # Set a memory ceiling so the subprocess raises MemoryError instead of
+    # being OOM-killed. Default: 80% of system RAM. Cells that exceed the
+    # limit are marked as failed and the job continues with the next cell.
+    try:
+        import resource
+
+        mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        limit = int(mem_bytes * 0.80)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        logger.info(f"Hydration subprocess memory ceiling: {limit / 1e9:.1f} GB")
+    except Exception as e:
+        logger.warning(f"Could not set memory ceiling: {e}")
+
     state = job_state.read_state(job_id)
     if state is None:
         return
