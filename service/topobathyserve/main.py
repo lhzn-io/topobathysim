@@ -1,9 +1,11 @@
 import json
 import logging
 import math
+import multiprocessing
 import os
 import sys
 import time
+import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime, timezone
 
@@ -21,10 +23,12 @@ from typing import Annotated, Any
 import numpy as np
 import xarray as xr
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 
 from topobathysim.runtime import hydrate, run, should_consolidate
+
+from . import job_state
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import (
@@ -229,43 +233,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
     # clean up logic if needed
-
-
-# Job tracking — capped and TTL-cleaned to prevent unbounded memory growth.
-HYDRATION_JOBS: dict[str, dict[str, Any]] = {}
-HYDRATION_JOBS_MAX = 100
-HYDRATION_JOBS_TTL_HOURS = 24
-
-
-def _cleanup_hydration_jobs() -> None:
-    """Remove completed/failed jobs older than TTL, and cap total entries."""
-    now = datetime.now(timezone.utc)
-    expired = []
-    for jid, job in HYDRATION_JOBS.items():
-        if job.get("status") in ("completed", "failed"):
-            submitted = job.get("submitted_at", "")
-            try:
-                submitted_dt = datetime.fromisoformat(submitted)
-                if submitted_dt.tzinfo is None:
-                    submitted_dt = submitted_dt.replace(tzinfo=timezone.utc)
-                age_hours = (now - submitted_dt).total_seconds() / 3600
-                if age_hours > HYDRATION_JOBS_TTL_HOURS:
-                    expired.append(jid)
-            except (ValueError, TypeError):
-                expired.append(jid)
-    for jid in expired:
-        del HYDRATION_JOBS[jid]
-    # Hard cap: remove oldest completed jobs if still over limit
-    while len(HYDRATION_JOBS) > HYDRATION_JOBS_MAX:
-        oldest_completed = None
-        for jid, job in HYDRATION_JOBS.items():
-            if job.get("status") in ("completed", "failed"):
-                oldest_completed = jid
-                break
-        if oldest_completed:
-            del HYDRATION_JOBS[oldest_completed]
-        else:
-            break
 
 
 app = FastAPI(
@@ -1539,55 +1506,95 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-def _hydrate_task(
+def _hydrate_subprocess(
     job_id: str,
-    policy_path: str,
+    policy_input: str,
     bbox: tuple[float, float, float, float],
     resolution: float,
-    max_workers: int = 4,
+    max_workers: int = 2,
 ) -> None:
+    """
+    Entry point for the hydration subprocess.
+
+    Runs in a separate process (multiprocessing.Process) so that:
+    - OOM kills this process, not the web server
+    - Progress is written atomically to a JSON file readable by any worker
+    - No shared mutable state — all communication via filesystem
+    """
+    import signal
+
+    # Ignore SIGINT in subprocess — let the parent handle Ctrl+C
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    state = job_state.read_state(job_id)
+    if state is None:
+        return
+    state["status"] = "running"
+    state["pid"] = os.getpid()
+    job_state.write_state(job_id, state)
+
+    def _on_progress(stats: dict[str, int]) -> None:
+        s = job_state.read_state(job_id)
+        if s is None:
+            return
+        s["total_cells"] = stats["total"]
+        s["processed_cells"] = stats["processed"]
+        s["cached_cells"] = stats["cached"]
+        s["failed_cells"] = stats["failed"]
+        job_state.write_state(job_id, s)
+
     try:
-        HYDRATION_JOBS[job_id]["status"] = "running"
         logger.info(
-            f"Starting background hydration [{job_id}] for {bbox} @ {resolution}m with {max_workers} workers"
+            f"Hydration subprocess [{job_id}] started (PID {os.getpid()}) "
+            f"for {bbox} @ {resolution}m with {max_workers} workers"
         )
         stats = hydrate(
-            policy_path,
+            policy_input,
             bbox,
             resolution=resolution,
             max_workers=max_workers,
-            job_id=job_id,
-            jobs_dict=HYDRATION_JOBS,
+            on_progress=_on_progress,
         )
-        HYDRATION_JOBS[job_id]["status"] = "completed"
-        HYDRATION_JOBS[job_id]["stats"] = stats
+        state = job_state.read_state(job_id) or state
+        state["status"] = "completed"
+        state["stats"] = stats
+        job_state.write_state(job_id, state)
         logger.info(f"Hydration [{job_id}] finished: {stats}")
     except Exception as e:
-        HYDRATION_JOBS[job_id]["status"] = "failed"
-        HYDRATION_JOBS[job_id]["error"] = str(e)
+        state = job_state.read_state(job_id) or state
+        state["status"] = "failed"
+        state["error"] = str(e)
+        job_state.write_state(job_id, state)
         logger.error(f"Hydration [{job_id}] failed: {e}", exc_info=True)
+
+
+# Keep track of spawned subprocesses so we can join them on shutdown
+_HYDRATE_PROCESSES: dict[str, "multiprocessing.Process"] = {}
 
 
 @app.post("/hydrate")
 async def trigger_hydrate(
     request: HydrateRequest,
-    background_tasks: BackgroundTasks,
     policy_path: Annotated[Path, Depends(get_policy_path)],
 ) -> dict[str, Any]:
     """
     Trigger a background hydration process for the specified bounding box and resolution.
-    This ensures all underlying grid cells are computed and cached.
+    Spawns a dedicated subprocess so OOM cannot kill the web server.
     """
-    start_time = datetime.now()
-    import uuid
+    # Prune old job files
+    job_state.list_jobs(max_age_hours=24)
 
-    _cleanup_hydration_jobs()
+    start_time = datetime.now(timezone.utc)
     job_id = str(uuid.uuid4())
 
-    HYDRATION_JOBS[job_id] = {
+    # Handle custom policy or default to loaded policy
+    policy_input = request.policy_yaml if request.policy_yaml else str(policy_path)
+
+    # Write initial state to disk before spawning
+    initial_state: dict[str, Any] = {
         "id": job_id,
         "status": "pending",
-        "bbox": request.bbox,
+        "bbox": list(request.bbox),
         "resolution": request.resolution,
         "submitted_at": start_time.isoformat(),
         "total_cells": 0,
@@ -1595,24 +1602,32 @@ async def trigger_hydrate(
         "cached_cells": 0,
         "failed_cells": 0,
     }
+    job_state.write_state(job_id, initial_state)
 
-    # Handle custom policy or default to loaded policy
-    policy_input = request.policy_yaml if request.policy_yaml else str(policy_path)
-
-    background_tasks.add_task(
-        _hydrate_task,
-        job_id,
-        policy_input,
-        request.bbox,
-        request.resolution,
-        request.max_workers,
+    # Spawn subprocess
+    proc = multiprocessing.Process(
+        target=_hydrate_subprocess,
+        args=(job_id, policy_input, request.bbox, request.resolution, request.max_workers),
+        daemon=True,
     )
+    proc.start()
+
+    # Track for cleanup, evict dead processes
+    for old_id in list(_HYDRATE_PROCESSES):
+        if not _HYDRATE_PROCESSES[old_id].is_alive():
+            _HYDRATE_PROCESSES[old_id].join(timeout=0)
+            del _HYDRATE_PROCESSES[old_id]
+    _HYDRATE_PROCESSES[job_id] = proc
+
+    logger.info(f"Spawned hydration subprocess PID {proc.pid} for job {job_id}")
 
     return {
         "status": "accepted",
-        "message": "Hydration task started in background",
+        "message": "Hydration task started in subprocess",
         "job_id": job_id,
-        "bbox": request.bbox,
+        "ws": f"ws://{os.environ.get('TOPOBATHY_HOST', 'localhost')}:"
+        f"{os.environ.get('TOPOBATHY_PORT', '9595')}/hydrate/{job_id}/ws",
+        "bbox": list(request.bbox),
         "resolution": request.resolution,
         "timestamp": start_time.isoformat(),
     }
@@ -1620,7 +1635,49 @@ async def trigger_hydrate(
 
 @app.get("/hydrate/{job_id}")
 async def get_hydration_status(job_id: str) -> dict[str, Any]:
-    """Get the status of a specific hydration job."""
-    if job_id not in HYDRATION_JOBS:
+    """Get the status of a hydration job (reads from persistent JSON state file)."""
+    state = job_state.read_state(job_id)
+    if state is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return HYDRATION_JOBS[job_id]
+    return state
+
+
+@app.websocket("/hydrate/{job_id}/ws")
+async def hydrate_ws(websocket: WebSocket, job_id: str) -> None:
+    """
+    WebSocket endpoint for live hydration progress.
+
+    Streams JSON state updates every second until the job completes or fails.
+    Client receives the same payload as GET /hydrate/{job_id} but in real time.
+    """
+    import asyncio
+
+    await websocket.accept()
+    try:
+        prev_snapshot = ""
+        while True:
+            state = job_state.read_state(job_id)
+            if state is None:
+                await websocket.send_json({"error": "Job not found", "status": "failed"})
+                break
+
+            # Only send when state has changed to reduce noise
+            snapshot = json.dumps(state, sort_keys=True)
+            if snapshot != prev_snapshot:
+                await websocket.send_json(state)
+                prev_snapshot = snapshot
+
+            if state.get("status") in ("completed", "failed"):
+                break
+
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"WebSocket error for job {job_id}: {e}")
+
+
+@app.get("/hydrate")
+async def list_hydration_jobs() -> list[dict[str, Any]]:
+    """List recent hydration jobs."""
+    return job_state.list_jobs(max_age_hours=24)

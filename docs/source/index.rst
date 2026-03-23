@@ -18,6 +18,8 @@ TopoBathySim
    policy_walkthrough
    runtime_architecture
    data_sources
+   fuse_endpoint
+   hydration
    api
    cli_tools
    cache_viewer

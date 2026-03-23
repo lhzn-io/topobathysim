@@ -43,6 +43,92 @@ BAG_DISCOVERY_TIMEOUT_SECONDS = int(os.getenv("TOPOBATHY_BAG_DISCOVERY_TIMEOUT",
 BAG_CACHE_SIZE = int(os.getenv("TOPOBATHY_BAG_LRU_SIZE", "8"))
 
 
+def _parse_bag_resolution(filename: str) -> float:
+    """Parse resolution in meters from a BAG filename. Returns 999.0 if unknown."""
+    import re
+
+    fname = filename.lower()
+    m_cm = re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", fname)
+    m_m = re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", fname)
+    if m_cm:
+        return float(m_cm.group(1)) / 100.0
+    elif m_m:
+        return float(m_m.group(1))
+    return 999.0  # VR or unknown — keep as fallback
+
+
+def _parse_survey_id(filename: str) -> str:
+    """Extract the survey ID prefix from a BAG filename.
+
+    Examples:
+        H12696_MB_50cm_MLLW_1of3.bag -> H12696
+        W00181_MB_4m_MLLW_combined.bag -> W00181
+        E01096_MB_7m_MLLW_6of7.bag -> E01096
+    """
+    import re
+
+    m = re.match(r"^([A-Z]\d{4,5})", filename)
+    return m.group(1) if m else filename
+
+
+def _dedup_survey_resolutions(urls: list[str], target_resolution: float | None = None) -> list[str]:
+    """Deduplicate multi-resolution exports of the same survey.
+
+    NCEI provides the same survey at multiple resolutions (e.g. H12696 at
+    50cm, 2m, 4m). Each resolution may have multiple spatial parts (1of3,
+    2of3, 3of3) which cover different areas and must all be kept.
+
+    Strategy:
+    1. Group URLs by survey ID (H12696, W00181, etc.)
+    2. For each survey, find the set of distinct resolutions available.
+    3. Pick the best resolution: closest to target without being coarser.
+    4. Keep ALL spatial parts (1of3, 2of3, combined, etc.) at that resolution.
+    5. Prune parts at other resolutions.
+    """
+    if not target_resolution or target_resolution <= 0:
+        return urls
+
+    # Collect per-survey resolution sets and annotate each URL
+    survey_resolutions: dict[str, set[float]] = {}
+    url_info: list[tuple[str, str, float]] = []
+    for url in urls:
+        filename = url.split("/")[-1].replace(".bag", "")
+        survey_id = _parse_survey_id(filename)
+        res = _parse_bag_resolution(filename)
+        survey_resolutions.setdefault(survey_id, set()).add(res)
+        url_info.append((url, survey_id, res))
+
+    # For each survey with multiple resolutions, pick the best one
+    best_res_for_survey: dict[str, float] = {}
+    for survey_id, resolutions in survey_resolutions.items():
+        if len(resolutions) <= 1:
+            best_res_for_survey[survey_id] = min(resolutions)
+            continue
+
+        # Prefer the coarsest resolution still finer than target
+        finer = [r for r in resolutions if r <= target_resolution]
+        best = max(finer) if finer else min(resolutions)
+
+        best_res_for_survey[survey_id] = best
+        pruned_res = sorted(resolutions - {best})
+        if pruned_res:
+            logger.debug(
+                f"BAG dedup: {survey_id} — keeping {best}m, "
+                f"pruning {pruned_res}m (target={target_resolution}m)"
+            )
+
+    # Filter: keep only URLs at the chosen resolution for their survey
+    kept = [url for url, sid, res in url_info if res == best_res_for_survey.get(sid, res)]
+
+    pruned_count = len(urls) - len(kept)
+    if pruned_count:
+        logger.info(
+            f"BAG dedup: {len(urls)} -> {len(kept)} urls "
+            f"(pruned {pruned_count} redundant multi-resolution exports)"
+        )
+    return kept
+
+
 @concurrent_lru_cache(maxsize=BAG_CACHE_SIZE)
 def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
     """
@@ -912,11 +998,34 @@ class BAGProvider(Provider):
         # Note: BAGDiscovery now returns URLs sorted Best -> Worst (Resolution, then Date).
         # rioxarray.merge_arrays prioritizes the FIRST array (Top-Down), so this order is correct.
 
+        # OPTIMIZATION: Deduplicate multi-resolution exports of the same survey.
+        # NCEI often provides the same survey at multiple resolutions (e.g.
+        # H12696_MB_50cm, H12696_MB_2m, H12696_MB_4m). These are redundant —
+        # the finer resolution fully supersedes the coarser ones. For each survey,
+        # keep only the version closest to (but not coarser than) the target
+        # resolution. This typically cuts 51 urls down to ~15-20.
+        urls = _dedup_survey_resolutions(urls, target_resolution=resolution)
+
         logger.info(f"BAG fetch: Found {len(urls)} files to process.")
 
-        # 2. Fetch/Load Each
-        project_layers = []
+        def _log_mem(label: str) -> None:
+            """Log current process RSS for memory debugging."""
+            try:
+                import resource
+
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                logger.debug(f"[MEM] {label}: peak RSS {rss_kb / 1024:.0f} MB")
+            except Exception:
+                pass
+
+        # 2. Fetch, clip, reproject, and merge each tile incrementally.
+        # Previous approach accumulated all clipped tiles in a list before merging,
+        # which OOM'd for dense survey areas (30+ tiles x ~800MB each = 24GB+).
+        # Now each tile is merged into an accumulator immediately and freed.
+        merged_ds: xr.Dataset | None = None
         provenance_dict: dict[int, dict[str, str]] = {}
+        tiles_merged = 0
+        _log_mem(f"BAG fetch start ({len(urls)} urls)")
 
         for url in urls:
             try:
@@ -926,39 +1035,47 @@ class BAGProvider(Provider):
                     logger.warning(f"BAG fetch: Failed to load data from {url}")
                     continue
 
-                # OPTIMIZATION: Clip EARLY (before reprojection/merge)
-                # This drastically reduces memory usage for large surveys
+                # OPTIMIZATION: Clip in native CRS to avoid cross-CRS materialization.
                 try:
-                    # Clip using EPSG:4326 bounds. rioxarray handles transformations.
-                    da = da.rio.clip_box(
-                        minx=west,
-                        miny=south,
-                        maxx=east,
-                        maxy=north,
-                        crs="EPSG:4326",
-                        allow_one_dimensional_raster=True,
-                    )
+                    native_crs = da.rio.crs
+                    if native_crs and str(native_crs) != "EPSG:4326":
+                        from pyproj import Transformer
+
+                        transformer = Transformer.from_crs("EPSG:4326", native_crs, always_xy=True)
+                        nx_west, nx_south = transformer.transform(west, south)
+                        nx_east, nx_north = transformer.transform(east, north)
+                        da = da.rio.clip_box(
+                            minx=min(nx_west, nx_east),
+                            miny=min(nx_south, nx_north),
+                            maxx=max(nx_west, nx_east),
+                            maxy=max(nx_south, nx_north),
+                            allow_one_dimensional_raster=True,
+                        )
+                    else:
+                        da = da.rio.clip_box(
+                            minx=west,
+                            miny=south,
+                            maxx=east,
+                            maxy=north,
+                            crs="EPSG:4326",
+                            allow_one_dimensional_raster=True,
+                        )
                 except Exception as e:
-                    # rioxarray.exceptions.NoDataInBounds (or similar) - Skip this tile
                     logger.debug(f"BAG tile empty after clip (url={url}): {e}")
                     continue
 
                 if da is None or da.size == 0:
                     continue
 
-                da_work: xr.DataArray = cast(xr.DataArray, da)
+                # Materialize the small clipped subset now so the Dask graph
+                # referencing the full backing zarr can be released.
+                da_work = cast(xr.DataArray, da.load())
+                del da
 
                 # Reproject individual chunk to target CRS
-                # OPTIMIZATION: Reproject (and downsample) BEFORE filtering to reduce data volume
-                if crs and da_work.rio.crs and da_work.rio.crs != crs:
+                if crs and da_work.rio.crs and str(da_work.rio.crs) != crs:
                     try:
-                        # Optional: Pass resolution if provided to enforce downsampling early
                         reproj_knn = {}
-                        # If target is projected (meters) and we have input_res (meters)
-                        # Actually EPSG:4326 is degrees, so resolution (meters) needs care,
-                        # but rioxarray handles 'resolution' arg if units match or if it assumes target units.
-                        # Using 'resolution' with 4326 target might yield weird degrees.
-                        # Safer to let rioxarray/gdal handle it or only pass if not 4326.
                         if resolution and "EPSG:4326" not in crs:
                             reproj_knn["resolution"] = resolution
 
@@ -969,10 +1086,7 @@ class BAGProvider(Provider):
 
                 # --- CLEANING / FILTERING ---
                 filter_cfg = kwargs.get("filter", {})
-
-                # 1. Deviation/Spike Removal
                 max_dev = filter_cfg.get("max_depth_change") or filter_cfg.get("max_deviation")
-
                 if max_dev:
                     threshold = float(max_dev)
                     if _depth_range_within_threshold(da_work, threshold):
@@ -984,16 +1098,14 @@ class BAGProvider(Provider):
                         logger.info(f"Applying BAG Deviation Filter (Threshold={threshold}m) to {url}")
                         da_work = clean_data_deviation(da_work, threshold=threshold)
 
+                # --- Provenance ---
                 import hashlib
+                import re
 
                 filename = url.split("/")[-1].replace(".bag", "")
                 project_uid = int(hashlib.md5(filename.encode()).hexdigest(), 16) % 100000 + 40000
 
-                # Parse resolution from filename (e.g. H13385_MB_50cm_MLLW -> 50cm)
                 res_str = "Unknown"
-                import re
-
-                # Match 50cm, 0.5m, 1m, 4m
                 m_cm = re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", filename, re.IGNORECASE)
                 m_m = re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", filename, re.IGNORECASE)
                 if m_cm:
@@ -1017,47 +1129,42 @@ class BAGProvider(Provider):
                 if da_work.rio.crs:
                     p_ds.rio.write_crs(da_work.rio.crs, inplace=True)
                 p_ds.rio.write_transform(da_work.rio.transform(), inplace=True)
+                del da_work
 
-                project_layers.append(p_ds)
+                # --- Incremental merge: fold this tile into the accumulator ---
+                tiles_merged += 1
+                if merged_ds is None:
+                    merged_ds = p_ds
+                else:
+                    try:
+                        merged_elev = merge_arrays([merged_ds["elevation"], p_ds["elevation"]])
+                        merged_src = merge_arrays([merged_ds["source_id"], p_ds["source_id"]])
+                        merged_ds = xr.Dataset({"elevation": merged_elev, "source_id": merged_src})
+                        del merged_elev, merged_src
+                    except Exception as e:
+                        logger.warning(f"Incremental merge failed for {filename}: {e}")
+                del p_ds
+
+                if tiles_merged % 10 == 0:
+                    _log_mem(f"BAG progress: {tiles_merged} tiles merged")
 
             except Exception as e:
                 logger.warning(f"Failed to process BAG {url}: {e}")
 
-        if not project_layers:
-            # It is possible all BAGs were clipped out or failed
-            # This is not necessarily an error, just no coverage in this detailed window
-            # Return empty or raise?
-            # Runtime expects an array. Raise KeyError to trigger 'continue' in runtime loop.
+        if merged_ds is None:
             raise ProviderNoDataError(f"No BAG data intersects bbox {bbox} after clipping")
 
-        # 3. Merge
-        if len(project_layers) == 1:
-            merged_ds = project_layers[0]
-        else:
-            try:
-                # merge_arrays puts FIRST element on TOP (Priority).
-                # URLs are sorted Best -> Worst by discovery.
-                elevs = [ds["elevation"] for ds in project_layers]
-                sources = [ds["source_id"] for ds in project_layers]
+        _log_mem(f"BAG done: {tiles_merged} tiles merged")
 
-                final_elev = merge_arrays(elevs)
-                final_src = merge_arrays(sources)
-
-                # Defensive: Drop duplicate indices from merge
-                if not final_elev.indexes["x"].is_unique:
-                    final_elev = final_elev.drop_duplicates(dim="x")
-                if not final_elev.indexes["y"].is_unique:
-                    final_elev = final_elev.drop_duplicates(dim="y")
-
-                if not final_src.indexes["x"].is_unique:
-                    final_src = final_src.drop_duplicates(dim="x")
-                if not final_src.indexes["y"].is_unique:
-                    final_src = final_src.drop_duplicates(dim="y")
-
-                merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
-            except Exception as e:
-                logger.error(f"Failed to merge BAGs: {e}")
-                merged_ds = project_layers[0]
+        # Defensive: Drop duplicate indices from merge
+        for var in ["elevation", "source_id"]:
+            if var not in merged_ds:
+                continue
+            da_var = merged_ds[var]
+            for dim in ["x", "y"]:
+                if dim in da_var.indexes and not da_var.indexes[dim].is_unique:
+                    merged_ds[var] = da_var.drop_duplicates(dim=dim)
+                    da_var = merged_ds[var]
 
         # 4. Final Clip (Cleanup)
         # Ensure exact bounds (reprojection might have introduced slight over-run)

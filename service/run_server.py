@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing
 
 import uvicorn
 
@@ -27,18 +26,12 @@ def main() -> None:
 
     os.environ["TOPOBATHYSIM_DEBUG"] = str(args.debug)
 
-    # Default to CPU count if not specified, but cap at reasonable limit for laptop
-    # or just use multiprocessing.cpu_count()
+    # Default to 1 worker. /hydrate uses in-process job tracking (HYDRATION_JOBS dict)
+    # which is not shared across workers — multiple workers cause 404s on status polls.
+    # Parallelism is handled internally via ThreadPoolExecutor within hydrate().
     if args.workers is None:
-        # Default to high utilization for this task
-        # User has 24 cores. Let's start with 8 to be safe or just use all?
-        # Uvicorn recommends (2 x num_cores) + 1 usually, but for CPU heavy tasks, maybe simpler.
-        # Let's default to a sane 8 workers if not specified, or CPU count.
-        # Given user's explicit request for parallelism, let's use a good chunk.
-        cpu_count = multiprocessing.cpu_count()
-        # Cap default to 2 to avoid OOM if processes load big datasets
-        args.workers = min(cpu_count, 2)
-        print(f"Auto-configured workers: {args.workers} (CPU Count: {cpu_count})")
+        args.workers = 1
+        print(f"Auto-configured workers: {args.workers}")
 
     # If reload is True, workers must be 1 usually, or simple reload logic.
     # Uvicorn handles reload with workers=1?? No, reload excludes workers argument.

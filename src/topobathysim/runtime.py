@@ -500,13 +500,15 @@ def hydrate(
     resolution: float | None = None,
     time: datetime | None = None,
     max_workers: int | None = 2,
-    job_id: str | None = None,
-    jobs_dict: dict | None = None,
+    on_progress: Any | None = None,
 ) -> dict[str, int]:
     """
     Hydrate the cache for a given bbox and resolution by processing all covering grid cells.
     Does not return the fused dataset, only ensures cells are cached.
-    Mocks the behavior of run() but without aggregating results in memory.
+
+    Args:
+        on_progress: Optional callback called with (stats_dict) after each cell completes.
+                     Used by the service to write progress to a state file.
     """
 
     policy = _resolve_policy(policy_input)
@@ -517,14 +519,9 @@ def hydrate(
     cells, grid_cell_size = _get_grid_cells(bbox, target_crs)
     legend = generate_provider_legend(policy)
 
-    # Use centralized cache helper to ensure base dir exists
-    # We call get_fused_cache_info just to get the parent dir, though we do it per-cell below
-    # because the hash differs per cell.
-    # We'll just rely on the loop to create dirs.
-
     stats = {"total": len(cells), "cached": 0, "processed": 0, "failed": 0}
-    if job_id and jobs_dict:
-        jobs_dict[job_id]["total_cells"] = len(cells)
+    if on_progress:
+        on_progress(stats)
 
     policy_display_name = getattr(policy, "name", "Unnamed") or "Unnamed"
     logger.info(
@@ -638,13 +635,8 @@ def hydrate(
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
                 stats[status] += 1
-                if job_id and jobs_dict:
-                    if status == "cached":
-                        jobs_dict[job_id]["cached_cells"] += 1
-                    elif status == "processed":
-                        jobs_dict[job_id]["processed_cells"] += 1
-                    elif status == "failed":
-                        jobs_dict[job_id]["failed_cells"] += 1
+                if on_progress:
+                    on_progress(stats)
 
         # Force GC between batches to reclaim memory from completed cells
         gc.collect()

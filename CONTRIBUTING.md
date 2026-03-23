@@ -2,7 +2,7 @@
 
 TopoBathySim is a policy-driven **topobathymetric fusion runtime** (library + optional service). The core idea is to fuse heterogeneous geospatial layers into data-first products (`xarray.Dataset`) with **per-pixel provenance**.
 
-We welcome contributions—especially **new dataset providers** and **policy presets** for regions outside our initial Northeast US focus.
+We welcome contributions, especially **new dataset providers** and **policy presets** for regions outside our initial Northeast US focus.
 
 ## Project principles
 

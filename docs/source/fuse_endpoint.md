@@ -123,13 +123,74 @@ curl "http://localhost:9595/fuse?bbox=-73.85,40.78,-73.72,40.82&format=geotiff" 
 gdalinfo fused.tif
 ```
 
+## POST /fuse — Dynamic Policy Override
+
+The `POST` variant accepts a JSON body and supports **dynamic policy switching**,
+allowing you to override the server's default fusion policy per request.
+
+```text
+POST /fuse
+Content-Type: application/json
+```
+
+### Request Body
+
+| Field          | Type          | Required | Default    | Description                                          |
+| -------------- | ------------- | -------- | ---------- | ---------------------------------------------------- |
+| `bbox`         | `[w, s, e, n]` | yes    | —          | Bounding box in WGS84 decimal degrees                |
+| `resolution`   | float         | no       | 30.0       | Output resolution in meters                          |
+| `format`       | string        | no       | `zarr`     | Output format: `zarr` or `geotiff`                   |
+| `policy_yaml`  | string        | no       | null       | Raw YAML policy content to override default fusion   |
+| `policy_name`  | string        | no       | null       | Name of a server-side policy (reserved, not yet implemented) |
+
+When `policy_yaml` is provided, it takes precedence over both `policy_name`
+and the server's default policy. The raw YAML string is parsed and used as
+the fusion policy for that request only.
+
+### Example — custom policy
+
+```python
+import requests, yaml
+
+# Define a minimal custom policy inline
+policy = {
+    "name": "Simple GEBCO+CUDEM",
+    "crs": "EPSG:4326",
+    "variables": [{
+        "name": "elevation",
+        "steps": [
+            {"provider": "gebco_2025", "operator": "overwrite"},
+            {"provider": "ncei_cudem", "operator": "overwrite"},
+        ]
+    }]
+}
+
+resp = requests.post("http://localhost:9595/fuse", json={
+    "bbox": [-73.85, 40.78, -73.72, 40.82],
+    "resolution": 30,
+    "format": "zarr",
+    "policy_yaml": yaml.dump(policy),
+})
+```
+
+### Cache behavior
+
+Custom policies are **cached separately** from the server default. The cache
+key is a SHA256 hash of the policy content + bbox + resolution, so:
+
+- Two requests with the same custom YAML hit the same cache entry.
+- A custom policy request never collides with a default policy request.
+- Modifying a single line in the YAML produces a different cache key.
+
+Cached results live at `~/.cache/topobathysim/fused_zarr/{hash}.zarr`.
+
 ## Error Handling
 
-| Status | Reason |
-|--------|--------|
-| `400` | Invalid bbox parameters, ordering, format, or missing values |
-| `404` | Fusion returned no elevation data (bbox outside valid area) |
-| `500` | Runtime fusion error |
+| Status | Reason                                                       |
+| ------ | ------------------------------------------------------------ |
+| `400`  | Invalid bbox parameters, ordering, format, or missing values |
+| `404`  | Fusion returned no elevation data (bbox outside valid area)  |
+| `500`  | Runtime fusion error                                         |
 
 ## Performance Notes
 

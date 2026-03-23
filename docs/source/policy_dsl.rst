@@ -81,3 +81,21 @@ For advanced fusion, you can specify **Transition Rules** to apply different ope
         - target_provider: "gebco"
           operator: "metric_feather"
           blend_distance: 500.0
+
+
+Runtime Policy Override
+-----------------------
+
+Policies are normally loaded from a YAML file at server startup, but both the
+``/fuse`` and ``/hydrate`` endpoints accept a ``policy_yaml`` field that lets
+you pass raw YAML at request time. This is useful for:
+
+- **Testing a policy change** before committing it to the server.
+- **One-off fusion** with a region-specific provider stack.
+- **Hydrating a cache** for a custom policy without restarting the server.
+
+Custom policies produce **separate cache entries** (keyed by a SHA256 hash of
+the policy content), so they never collide with the server default or with each
+other.
+
+See :doc:`fuse_endpoint` and :doc:`hydration` for API details and examples.

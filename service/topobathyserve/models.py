@@ -30,7 +30,7 @@ class HydrateRequest(BaseModel):
     resolution: float = Field(30.0, description="Output resolution in meters", examples=[30.0])
     policy_yaml: str | None = Field(None, description="Optional raw YAML config to override default policy")
     max_workers: int = Field(
-        4, description="Number of workers to use for parallel grid fetching", ge=1, le=16
+        2, description="Number of workers to use for parallel grid fetching", ge=1, le=16
     )
 
 
