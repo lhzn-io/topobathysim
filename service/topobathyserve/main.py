@@ -231,6 +231,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # clean up logic if needed
 
 
+# Job tracking
+HYDRATION_JOBS: dict[str, dict[str, Any]] = {}
+
 app = FastAPI(
     title="BathyServe",
     description="Microservice for Hybrid Bathymetry (GEBCO 2025 + BlueTopo)",
@@ -1502,13 +1505,33 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-def _hydrate_task(policy_path: str, bbox: tuple[float, float, float, float], resolution: float) -> None:
+def _hydrate_task(
+    job_id: str,
+    policy_path: str,
+    bbox: tuple[float, float, float, float],
+    resolution: float,
+    max_workers: int = 4,
+) -> None:
     try:
-        logger.info(f"Starting background hydration for {bbox} @ {resolution}m")
-        stats = hydrate(policy_path, bbox, resolution=resolution)
-        logger.info(f"Hydration finished: {stats}")
+        HYDRATION_JOBS[job_id]["status"] = "running"
+        logger.info(
+            f"Starting background hydration [{job_id}] for {bbox} @ {resolution}m with {max_workers} workers"
+        )
+        stats = hydrate(
+            policy_path,
+            bbox,
+            resolution=resolution,
+            max_workers=max_workers,
+            job_id=job_id,
+            jobs_dict=HYDRATION_JOBS,
+        )
+        HYDRATION_JOBS[job_id]["status"] = "completed"
+        HYDRATION_JOBS[job_id]["stats"] = stats
+        logger.info(f"Hydration [{job_id}] finished: {stats}")
     except Exception as e:
-        logger.error(f"Hydration failed: {e}", exc_info=True)
+        HYDRATION_JOBS[job_id]["status"] = "failed"
+        HYDRATION_JOBS[job_id]["error"] = str(e)
+        logger.error(f"Hydration [{job_id}] failed: {e}", exc_info=True)
 
 
 @app.post("/hydrate")
@@ -1522,17 +1545,47 @@ async def trigger_hydrate(
     This ensures all underlying grid cells are computed and cached.
     """
     start_time = datetime.now()
+    import uuid
+
+    job_id = str(uuid.uuid4())
+
+    HYDRATION_JOBS[job_id] = {
+        "id": job_id,
+        "status": "pending",
+        "bbox": request.bbox,
+        "resolution": request.resolution,
+        "submitted_at": start_time.isoformat(),
+        "total_cells": 0,
+        "processed_cells": 0,
+        "cached_cells": 0,
+        "failed_cells": 0,
+    }
+
+    # Handle custom policy or default to loaded policy
+    policy_input = request.policy_yaml if request.policy_yaml else str(policy_path)
+
     background_tasks.add_task(
         _hydrate_task,
-        str(policy_path),
+        job_id,
+        policy_input,
         request.bbox,
         request.resolution,
+        request.max_workers,
     )
 
     return {
         "status": "accepted",
         "message": "Hydration task started in background",
+        "job_id": job_id,
         "bbox": request.bbox,
         "resolution": request.resolution,
         "timestamp": start_time.isoformat(),
     }
+
+
+@app.get("/hydrate/{job_id}")
+async def get_hydration_status(job_id: str) -> dict[str, Any]:
+    """Get the status of a specific hydration job."""
+    if job_id not in HYDRATION_JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return HYDRATION_JOBS[job_id]

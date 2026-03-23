@@ -198,32 +198,70 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderTier2(d) { // Fused
-        const zoomRows = Object.entries(d.by_zoom || {}).map(([z, i]) => {
-            const resMeters = 156543.03 / Math.pow(2, z);
-
-            // Area Estimate (Bounds)
-            const latDiff = Math.abs(i.lat_max - i.lat_min);
-            const lonDiff = Math.abs(i.lon_max - i.lon_min);
-            const avgLat = (i.lat_max + i.lat_min) / 2;
-            const kmPerDegLat = 111.32;
-            const kmPerDegLon = 111.32 * Math.cos(avgLat * Math.PI / 180);
-            const areaSqKm = (latDiff * kmPerDegLat) * (lonDiff * kmPerDegLon);
-
-            return `<tr>
-                <td><strong>L${z}</strong> <small style="color:#8b949e">~${resMeters.toFixed(1)}m</small></td>
-                <td>${i.count}</td>
-                <td>${formatBytes(i.bytes)}</td>
-                <td>${areaSqKm < 0.1 ? '<0.1' : areaSqKm.toFixed(1)} km²</td>
-                <td style="font-family:monospace; font-size:0.8rem">${i.lon_min?.toFixed(2)}, ${i.lat_min?.toFixed(2)}</td>
-            </tr>`;
-        }).join('');
-        return `
+        let html = `
             <div class="stats-row" style="margin-bottom:16px;">
-                <span>Total Chunks: <strong>${d.count}</strong></span>
+                <span>Total Fused Cached Grid Cells: <strong>${d.count}</strong></span>
                 <span style="margin-left:16px;">Total Size: <strong>${formatBytes(d.bytes)}</strong></span>
             </div>
-            <div class="detail-section"><h4>Inventory by Resolution</h4>
-            <table class="detail-table"><thead><tr><th>Zoom / Res</th><th>Chunks</th><th>Size</th><th>Coverage (Est)</th><th>Min Bounds</th></tr></thead><tbody>${zoomRows}</tbody></table></div>`;
+        `;
+
+        if (!d.policies || d.policies.length === 0) {
+            return html + `<div class="detail-section"><em>No nested policy groups found.</em></div>`;
+        }
+
+        d.policies.forEach(p => {
+            const zoomRows = Object.entries(p.by_zoom || {}).map(([z, i]) => {
+                const resMeters = 156543.03 / Math.pow(2, z);
+                const latDiff = Math.abs(i.lat_max - i.lat_min);
+                const lonDiff = Math.abs(i.lon_max - i.lon_min);
+                const avgLat = (i.lat_max + i.lat_min) / 2;
+                const kmPerDegLat = 111.32;
+                const kmPerDegLon = 111.32 * Math.cos(avgLat * Math.PI / 180);
+                const areaSqKm = (latDiff * kmPerDegLat) * (lonDiff * kmPerDegLon);
+
+                return `<tr>
+                    <td><strong>L${z}</strong> <small style="color:#8b949e">~${resMeters.toFixed(1)}m</small></td>
+                    <td>${i.count}</td>
+                    <td>${formatBytes(i.bytes)}</td>
+                    <td>${areaSqKm < 0.1 ? '<0.1' : areaSqKm.toFixed(1)} km²</td>
+                    <td style="font-family:monospace; font-size:0.8rem">${i.lon_min?.toFixed(2)}, ${i.lat_min?.toFixed(2)}</td>
+                </tr>`;
+            }).join('');
+
+            html += `
+            <div class="detail-section" style="margin-top: 24px; padding: 12px; border: 1px solid #30363d; border-radius: 6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0; color:#58a6ff;">Policy Hash: <span style="font-family:monospace; color:#c9d1d9;">${p.policy_hash}</span></h4>
+                    <span style="font-size:0.9rem;">${p.count} grid cells · ${formatBytes(p.bytes)}</span>
+                </div>
+                `;
+
+            if (p.yaml_snippet) {
+                // Ensure safe HTML rendering of YAML snippet
+                const safeYaml = p.yaml_snippet
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;");
+
+                html += `
+                <details style="margin-top: 12px; margin-bottom: 12px;">
+                    <summary style="cursor:pointer; color:#8b949e; font-size:0.9rem;">View Policy YAML</summary>
+                    <pre style="background:#161b22; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.85rem; margin-top:8px;"><code>${safeYaml}</code></pre>
+                </details>
+                `;
+            } else {
+                html += `<div style="margin-top:12px; margin-bottom:12px; color:#8b949e; font-size:0.9rem;"><em>No YAML mapping found for this hash.</em></div>`;
+            }
+
+            html += `
+                <table class="detail-table">
+                    <thead><tr><th>Zoom / Res</th><th>Cached Grid Cells</th><th>Size</th><th>Coverage (Est)</th><th>Min Bounds</th></tr></thead>
+                    <tbody>${zoomRows}</tbody>
+                </table>
+            </div>`;
+        });
+
+        return html;
     }
 
     function renderTier3(d) { // Providers
@@ -245,11 +283,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Purge Logic ---
 
     // Expose globally for inline onclick
-    window.openPurgeModal = (tierNums) => {
+    window.openPurgeModal = async (tierNums) => {
         if(!summaryData) {
              alert("Cache summary not loaded yet.");
              return;
         }
+
+        if (!fullDetail) {
+             const preloadBtn = document.getElementById('purgeGlobalBtn');
+             if (preloadBtn) preloadBtn.disabled = true;
+             await loadDetail(null, true);
+             if (preloadBtn) preloadBtn.disabled = false;
+        }
+
+        window.selectedTier2Hashes = new Set(); // Reset sub-selections
 
         // If specific tiers requested (array), select them
         // If empty array passed (global button), select none initially (or maybe Tier 1?)
@@ -267,9 +314,12 @@ document.addEventListener('DOMContentLoaded', () => {
         checkPurgeSafety();
     };
 
-    function renderPurgeModalList() {
+
+        function renderPurgeModalList() {
         if (!summaryData || !purgeTierListEl) return;
         purgeTierListEl.innerHTML = '';
+
+        window.selectedTier2Hashes = window.selectedTier2Hashes || new Set();
 
         summaryData.tiers.forEach(t => {
             const row = document.createElement('div');
@@ -281,7 +331,11 @@ document.addEventListener('DOMContentLoaded', () => {
             checkbox.checked = selectedPurgeTiers.has(t.number);
             checkbox.onchange = (e) => {
                 if(e.target.checked) selectedPurgeTiers.add(t.number);
-                else selectedPurgeTiers.delete(t.number);
+                else {
+                    selectedPurgeTiers.delete(t.number);
+                    if (t.number === 2) window.selectedTier2Hashes.clear();
+                }
+                renderPurgeModalList(); // Re-render to show/hide dynamic hash lists
                 checkPurgeSafety();
             };
 
@@ -292,6 +346,41 @@ document.addEventListener('DOMContentLoaded', () => {
             row.appendChild(checkbox);
             row.appendChild(label);
             purgeTierListEl.appendChild(row);
+
+            // Dynamically show the Tier 2 hashes if Tier 2 is selected
+            if (t.number === 2 && selectedPurgeTiers.has(2) && typeof fullDetail !== 'undefined' && fullDetail && fullDetail.tier_2 && fullDetail.tier_2.policies && fullDetail.tier_2.policies.length > 0) {
+                const subContainer = document.createElement('div');
+                subContainer.style.cssText = 'padding-left: 32px; font-size: 0.85rem; color: #aaa; margin-bottom: 8px; margin-top: 4px;';
+
+                const helpText = document.createElement('div');
+                helpText.textContent = 'Select specific hashes to purge (leave all unchecked to purge the ENTIRE tier):';
+                helpText.style.marginBottom = '6px';
+                subContainer.appendChild(helpText);
+
+                fullDetail.tier_2.policies.forEach(p => {
+                    const hashRow = document.createElement('div');
+                    hashRow.style.cssText = 'display:flex; align-items:center; gap:8px; padding: 2px 0;';
+
+                    const hashCb = document.createElement('input');
+                    hashCb.type = 'checkbox';
+                    hashCb.checked = window.selectedTier2Hashes.has(p.policy_hash);
+                    hashCb.onchange = (e) => {
+                        if(e.target.checked) window.selectedTier2Hashes.add(p.policy_hash);
+                        else window.selectedTier2Hashes.delete(p.policy_hash);
+                    };
+
+                    const hashLabel = document.createElement('span');
+                    let snip = p.yaml_snippet || 'Custom Policy';
+                    if (snip.length > 50) snip = snip.substring(0, 50) + '...';
+                    hashLabel.textContent = `${p.policy_hash.substring(0,8)}... (${formatBytes(p.bytes)}) - ${snip}`;
+                    hashLabel.title = p.yaml_snippet || '';
+
+                    hashRow.appendChild(hashCb);
+                    hashRow.appendChild(hashLabel);
+                    subContainer.appendChild(hashRow);
+                });
+                purgeTierListEl.appendChild(subContainer);
+            }
         });
     }
 
@@ -336,7 +425,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({
                     tiers: tiers,
                     dry_run: isDryRun,
-                    yes: true
+                    yes: true,
+                    tier_2_hashes: (tiers.includes(2) && window.selectedTier2Hashes && window.selectedTier2Hashes.size > 0)
+                                     ? Array.from(window.selectedTier2Hashes)
+                                     : null
                 })
             });
 

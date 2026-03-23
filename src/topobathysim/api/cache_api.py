@@ -217,15 +217,30 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
     )
 
     # Map Tier 2
-    by_zoom = {}
-    for z, info in d.fused_by_zoom.items():
-        by_zoom[float(z)] = ZoomDetail(
-            count=info["count"],
-            bytes=info["bytes"],
-            lon_min=_safe_float(info["lon_min"]),
-            lon_max=_safe_float(info["lon_max"]),
-            lat_min=_safe_float(info["lat_min"]),
-            lat_max=_safe_float(info["lat_max"]),
+    from topobathysim.api.models import PolicyHashGroup
+
+    policies_mapped = []
+
+    for phash, pdict in getattr(d, "fused_policies", {}).items():
+        by_zoom = {}
+        for z, info in pdict.get("by_zoom", {}).items():
+            by_zoom[float(z)] = ZoomDetail(
+                count=info["count"],
+                bytes=info["bytes"],
+                lon_min=_safe_float(info["lon_min"]),
+                lon_max=_safe_float(info["lon_max"]),
+                lat_min=_safe_float(info["lat_min"]),
+                lat_max=_safe_float(info["lat_max"]),
+            )
+
+        policies_mapped.append(
+            PolicyHashGroup(
+                policy_hash=phash,
+                yaml_snippet=pdict.get("yaml_snippet"),
+                count=pdict.get("count", 0),
+                bytes=pdict.get("bytes", 0),
+                by_zoom=by_zoom,
+            )
         )
 
     t2 = Tier2Detail(
@@ -233,7 +248,7 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
         bytes=d.fused_total_bytes,
         newest=_safe_float(d.fused_newest),
         oldest=_safe_float(d.fused_oldest),
-        by_zoom=by_zoom,
+        policies=policies_mapped,
     )
 
     # Map Tier 3
@@ -318,7 +333,12 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
     return detail
 
 
-def purge_tiers(tiers: list[int], dry_run: bool = True, yes: bool = False) -> PurgeResult:
+def purge_tiers(
+    tiers: list[int],
+    dry_run: bool = True,
+    yes: bool = False,
+    tier_2_hashes: list[str] | None = None,
+) -> PurgeResult:
     """Purge specified cache tiers."""
 
     # Safety check for Tier 5
@@ -335,6 +355,11 @@ def purge_tiers(tiers: list[int], dry_run: bool = True, yes: bool = False) -> Pu
 
     for tier in tiers_to_process:
         paths = tier.purge_paths()
+
+        # Filter Tier 2 paths if tier_2_hashes is provided
+        if tier.number == 2 and tier_2_hashes is not None:
+            paths = [p for p in paths if p.name in tier_2_hashes]
+
         deleted_count = 0
         deleted_bytes = 0
 

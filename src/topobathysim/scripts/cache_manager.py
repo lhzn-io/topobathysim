@@ -244,8 +244,8 @@ def _fmt_size(n: int) -> str:
     if n < 1024**2:
         return f"{n / 1024:.1f} KB"
     if n < 1024**3:
-        return f"{n / 1024 ** 2:.1f} MB"
-    return f"{n / 1024 ** 3:.2f} GB"
+        return f"{n / 1024**2:.1f} MB"
+    return f"{n / 1024**3:.2f} GB"
 
 
 def _fmt_age(secs: float) -> str:
@@ -515,7 +515,7 @@ def _render_status_table() -> Table:
     """Compact 5-row tier summary used as the TUI header."""
     total = sum(t.size_bytes() for t in TIERS)
     table = Table(
-        title=(f"[bold cyan]TopoBathySim Cache[/]  " f"[dim]{CACHE_ROOT}  ·  {_fmt_size(total)} total[/]"),
+        title=(f"[bold cyan]TopoBathySim Cache[/]  [dim]{CACHE_ROOT}  ·  {_fmt_size(total)} total[/]"),
         box=box.ROUNDED,
         show_header=True,
         header_style="bold dim",
@@ -568,8 +568,8 @@ class _StatusData:
     fused_total_bytes: int = 0
     fused_newest: float = 0.0
     fused_oldest: float = float("inf")
-    # zoom -> {"count": int, "bytes": int, "lon_min/max": float, "lat_min/max": float}
-    fused_by_zoom: dict[int | float, dict] = field(default_factory=dict)
+    # policy_hash -> {"yaml_snippet": str/None, "count": int, "bytes": int, "by_zoom": dict}
+    fused_policies: dict[str, dict] = field(default_factory=dict)
     # Tier 3 - provider zarr
     provider_zarr: list[tuple[str, int, int, float, float]] = field(
         default_factory=list
@@ -618,37 +618,88 @@ def _gather_status_data() -> _StatusData:
 
     # ── Tier 2: fused zarr ────────────────────────────────────────
     fused_root = CACHE_ROOT / "fused_zarr"
+    policies_root = CACHE_ROOT / "policies"
     if fused_root.exists():
-        stores = [p for p in fused_root.iterdir() if p.suffix == ".zarr"]
-        d.fused_count = len(stores)
-        for item in stores:
-            sz = _dir_size_bytes(item) if item.is_dir() else item.stat().st_size
-            mtime = item.stat().st_mtime
-            d.fused_total_bytes += sz
-            d.fused_newest = max(d.fused_newest, mtime)
-            d.fused_oldest = min(d.fused_oldest, mtime)
-            extents_res = _fused_zarr_extents(item)
-            if extents_res is not None:
-                x0, x1, y0, y1, res = extents_res
-                zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(
-                    x0, x1, y0, y1, resolution=res
-                )
-                if zoom not in d.fused_by_zoom:
-                    d.fused_by_zoom[zoom] = {
+        # Iterate over policy directories (or direct .zarr in legacy format)
+        for item in fused_root.iterdir():
+            if item.is_dir():
+                if item.suffix == ".zarr":
+                    # Legacy zarr right in fused_zarr
+                    stores = [item]
+                    phash = "legacy"
+                else:
+                    # New style: hash subdirectories
+                    stores = [p for p in item.iterdir() if p.suffix == ".zarr"]
+                    phash = item.name
+
+                if not stores:
+                    continue
+
+                if phash not in d.fused_policies:
+                    yaml_snippet = None
+                    if phash != "legacy":
+                        # Look for either strictly {phash}.yaml or glob *.{phash}.yaml
+                        yaml_path = policies_root / f"{phash}.yaml"
+                        yaml_match = None
+
+                        if yaml_path.exists():
+                            yaml_match = yaml_path
+                        else:
+                            matches = list(policies_root.glob(f"*.{phash}.yaml"))
+                            if matches:
+                                yaml_match = matches[0]
+
+                        if yaml_match:
+                            import contextlib
+
+                            with contextlib.suppress(Exception):
+                                yaml_snippet = yaml_match.read_text()
+                    d.fused_policies[phash] = {
+                        "yaml_snippet": yaml_snippet,
                         "count": 0,
                         "bytes": 0,
-                        "lon_min": lon_min,
-                        "lon_max": lon_max,
-                        "lat_min": lat_min,
-                        "lat_max": lat_max,
+                        "by_zoom": {},
                     }
-                b = d.fused_by_zoom[zoom]
-                b["count"] += 1
-                b["bytes"] += sz
-                b["lon_min"] = min(b["lon_min"], lon_min)
-                b["lon_max"] = max(b["lon_max"], lon_max)
-                b["lat_min"] = min(b["lat_min"], lat_min)
-                b["lat_max"] = max(b["lat_max"], lat_max)
+
+                p_dict = d.fused_policies[phash]
+
+                for z_item in stores:
+                    d.fused_count += 1
+                    sz = _dir_size_bytes(z_item)
+                    mtime = z_item.stat().st_mtime
+                    d.fused_total_bytes += sz
+                    p_dict["bytes"] += sz
+                    p_dict["count"] += 1
+                    d.fused_newest = max(d.fused_newest, mtime)
+                    d.fused_oldest = min(d.fused_oldest, mtime)
+
+                    extents_res = _fused_zarr_extents(z_item)
+                    if extents_res is not None:
+                        x0, x1, y0, y1, res = extents_res
+                        zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(
+                            x0, x1, y0, y1, resolution=res
+                        )
+                        # Use 2-decimal precision to accurately group custom resolutions
+                        if isinstance(zoom, float):
+                            zoom = round(zoom, 2)
+
+                        b_z = p_dict["by_zoom"]
+                        if zoom not in b_z:
+                            b_z[zoom] = {
+                                "count": 0,
+                                "bytes": 0,
+                                "lon_min": lon_min,
+                                "lon_max": lon_max,
+                                "lat_min": lat_min,
+                                "lat_max": lat_max,
+                            }
+                        b = b_z[zoom]
+                        b["count"] += 1
+                        b["bytes"] += sz
+                        b["lon_min"] = min(b["lon_min"], lon_min)
+                        b["lon_max"] = max(b["lon_max"], lon_max)
+                        b["lat_min"] = min(b["lat_min"], lat_min)
+                        b["lat_max"] = max(b["lat_max"], lat_max)
 
     # ── Tier 3: provider zarr ─────────────────────────────────────
     for provider in PROVIDERS:
@@ -782,16 +833,19 @@ def _render_status_report(c: Console, d: _StatusData) -> None:
         c.print(
             f"  [bold]{d.fused_count}[/] stores · [bold green]{_fmt_size(d.fused_total_bytes)}[/]{age_str}"
         )
-        if d.fused_by_zoom:
-            c.print()
+        for phash, p_dict in d.fused_policies.items():
+            c.print(
+                f"  [bold cyan]Policy Hash:[/] {phash} "
+                f"({p_dict['count']} stores, {_fmt_size(p_dict['bytes'])})"
+            )
             t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
             t.add_column("Zoom", justify="right", width=6)
             t.add_column("Stores", justify="right", width=7)
             t.add_column("Size", justify="right", width=10)
             t.add_column("Lon range", justify="center", min_width=22)
             t.add_column("Lat range", justify="center", min_width=18)
-            for zoom in sorted(d.fused_by_zoom):
-                b = d.fused_by_zoom[zoom]
+            for zoom in sorted(p_dict["by_zoom"]):
+                b = p_dict["by_zoom"][zoom]
                 lon_str = f"{b['lon_min']:.2f}°  …  {b['lon_max']:.2f}°"
                 lat_str = f"{b['lat_min']:.2f}°  …  {b['lat_max']:.2f}°"
                 t.add_row(str(zoom), str(b["count"]), _fmt_size(b["bytes"]), lon_str, lat_str)

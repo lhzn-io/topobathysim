@@ -435,6 +435,18 @@ def get_fused_cache_info(
     # We hash the policy content digest itself to keep the key short but content-addressed
     policy_content_hash = hash_policy(policy.model_dump())
 
+    # Save policy to cache if it doesn't exist
+    policies_dir = cache_dir.parent / "policies"
+    policies_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(c for c in getattr(policy, "name", "Unnamed") if c.isalnum()) or "Unnamed"
+    short_hash = policy_content_hash[:8]
+    policy_cache_path = policies_dir / f"{safe_name}.{short_hash}.yaml"
+    if not policy_cache_path.exists():
+        import yaml
+
+        with open(policy_cache_path, "w") as f:
+            yaml.dump(policy.model_dump(mode="json"), f)
+
     key_dict = {
         "policy_hash": policy_content_hash,
         "cell": [round(x, 8) for x in bbox],
@@ -444,7 +456,7 @@ def get_fused_cache_info(
     key_str = json.dumps(key_dict, sort_keys=True, default=str)
     key_hash = hashlib.md5(key_str.encode()).hexdigest()
 
-    return cache_dir / f"{key_hash}.zarr", key_hash
+    return cache_dir / short_hash / f"{key_hash}.zarr", key_hash
 
 
 def get_cache_info_for_point(
@@ -482,17 +494,19 @@ def get_fused_cache_path(
 
 
 def hydrate(
-    policy_input: str | Path,
+    policy_input: str | Path | Any,
     bbox: tuple[float, float, float, float],
     resolution: float | None = None,
     time: datetime | None = None,
+    max_workers: int | None = 4,
+    job_id: str | None = None,
+    jobs_dict: dict | None = None,
 ) -> dict[str, int]:
     """
     Hydrate the cache for a given bbox and resolution by processing all covering grid cells.
     Does not return the fused dataset, only ensures cells are cached.
     Mocks the behavior of run() but without aggregating results in memory.
     """
-    import shutil
 
     policy = _resolve_policy(policy_input)
     target_crs = policy.crs
@@ -508,10 +522,15 @@ def hydrate(
     # We'll just rely on the loop to create dirs.
 
     stats = {"total": len(cells), "cached": 0, "processed": 0, "failed": 0}
+    if job_id and jobs_dict:
+        jobs_dict[job_id]["total_cells"] = len(cells)
 
-    logger.info(f"Starting hydration for {len(cells)} cells. BBox: {bbox}, Res: {res}")
+    policy_display_name = getattr(policy, "name", "Unnamed") or "Unnamed"
+    logger.info(
+        f"Starting hydration for {len(cells)} cells [{policy_display_name}]. BBox: {bbox}, Res: {res}"
+    )
 
-    for i, cell_bbox in enumerate(cells, 1):
+    def _process_cell(i: int, cell_bbox: tuple[float, float, float, float]) -> str:
         # Use centralized cache helper
         cache_path, key_hash = get_fused_cache_info(policy_input, cell_bbox, resolution=res)
 
@@ -533,7 +552,6 @@ def hydrate(
 
                 if valid_grid and valid_legend:
                     is_cached = True
-                    stats["cached"] += 1
 
                 ds_meta.close()
             except Exception as e:
@@ -542,9 +560,12 @@ def hydrate(
         if is_cached:
             if i % 10 == 0:
                 logger.info(f"Hydration progress: {i}/{len(cells)} (Cached)")
-            continue
+            return "cached"
 
-        logger.info(f"Hydrating cell {i}/{len(cells)}: {cell_bbox} -> {cache_path.name}")
+        policy_display_name = getattr(policy, "name", "Unnamed") or "Unnamed"
+        logger.info(
+            f"Hydrating cell {i}/{len(cells)} [{policy_display_name}]: " f"{cell_bbox} -> {cache_path.name}"
+        )
 
         # Process and Cache
         try:
@@ -590,12 +611,27 @@ def hydrate(
 
             shutil.move(str(tmp_path), str(cache_path))
 
-            stats["processed"] += 1
             ds_cell.close()
+            return "processed"
 
         except Exception as e:
             logger.error(f"Failed to hydrate cell {cell_bbox}: {e}", exc_info=True)
-            stats["failed"] += 1
+            return "failed"
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process_cell, i, cb): cb for i, cb in enumerate(cells, 1)}
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            stats[status] += 1
+            if job_id and jobs_dict:
+                if status == "cached":
+                    jobs_dict[job_id]["cached_cells"] += 1
+                elif status == "processed":
+                    jobs_dict[job_id]["processed_cells"] += 1
+                elif status == "failed":
+                    jobs_dict[job_id]["failed_cells"] += 1
 
     logger.info(f"Hydration complete. Stats: {stats}")
     return stats

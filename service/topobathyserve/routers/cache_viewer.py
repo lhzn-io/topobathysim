@@ -78,7 +78,12 @@ async def purge_cache(request: PurgeRequest) -> PurgeResult:
         if is_destructive:
             logger.warning(f"Purging cache tiers {request.tiers} (user request)")
 
-        result = cache_api.purge_tiers(tiers=request.tiers, dry_run=request.dry_run, yes=request.yes)
+        result = cache_api.purge_tiers(
+            tiers=request.tiers,
+            dry_run=request.dry_run,
+            yes=request.yes,
+            tier_2_hashes=request.tier_2_hashes,
+        )
         return result
 
     except Exception as e:

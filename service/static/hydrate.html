@@ -126,6 +126,28 @@
                 </div>
             </div>
 
+            <!-- Inject Custom Policy Override Section -->
+            <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;">
+                <label>Fusion Policy Override (Optional)</label>
+                <div style="font-size: 0.8rem; color: #666; margin-bottom: 8px;">
+                    Upload a YAML file or paste raw YAML to override default fusion logic.
+                </div>
+
+                <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                    <button type="button" id="uploadPolicyBtn" style="padding: 6px 12px; font-size: 14px; background: #eaedf0; color: #333; border: 1px solid #ccc; border-radius: 4px; cursor: pointer;">
+                        Upload YAML
+                    </button>
+                    <input type="file" id="policyFileInput" accept=".yaml,.yml" style="display: none;">
+
+                    <button type="button" id="clearPolicyBtn" style="padding: 6px 12px; font-size: 14px; background: #fee; color: #a00; border: 1px solid #fcc; border-radius: 4px; cursor: pointer; display: none;">
+                        Clear Custom Policy
+                    </button>
+                </div>
+
+                <textarea id="policyYamlArea" rows="6" placeholder="# Paste policy config YAML here..." style="width: 100%; box-sizing: border-box; padding: 8px; font-family: monospace; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; resize: vertical;"></textarea>
+            </div>
+            <!-- End Custom Policy Injection -->
+
             <div id="estimates">
                 <div class="stat-item">
                     <span class="stat-label">Effective Res</span>
@@ -464,6 +486,11 @@
                     force: false
                 };
 
+                const customPolicyStr = document.getElementById('policyYamlArea') ? document.getElementById('policyYamlArea').value.trim() : "";
+                if (customPolicyStr.length > 0) {
+                    payload.policy_yaml = customPolicyStr;
+                }
+
                 const response = await fetch('/hydrate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -475,6 +502,7 @@
                 if (response.ok) {
                     statusDiv.innerHTML = `✅ Job Started! <br>ID: <code>${data.job_id}</code>`;
                     statusDiv.className = 'success';
+                    pollStatus(data.job_id); // Start polling here
                 } else {
                     statusDiv.innerHTML = `❌ Error: ${data.detail || 'Unknown error'}`;
                     statusDiv.className = 'error';
@@ -528,6 +556,93 @@
         }
 
         init();
+        async function pollStatus(job_id) {
+            const resultDiv = document.getElementById("status");
+            const pollInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/hydrate/${job_id}`);
+                    const data = await response.json();
+
+                    if (data.status === "completed") {
+                        clearInterval(pollInterval);
+                        resultDiv.innerHTML = `
+                            <strong>Success!</strong><br>
+                            Job ID: ${data.id}<br>
+                            Status: Completed<br>
+                            Progress: ${data.total_cells}/${data.total_cells} cells processed.<br>
+                            Cached: ${data.stats.cached}, Processed: ${data.stats.processed}, Failed: ${data.stats.failed}
+                        `;
+                    } else if (data.status === "failed") {
+                        clearInterval(pollInterval);
+                        resultDiv.className = "error";
+                        resultDiv.innerHTML = `
+                            <strong>Failed!</strong><br>
+                            Job ID: ${data.id}<br>
+                            Error: ${data.error}
+                        `;
+                    } else {
+                        // running / pending
+                        const total = data.total_cells || 0;
+                        const processed = (data.processed_cells || 0) + (data.cached_cells || 0) + (data.failed_cells || 0);
+                        const progress = total > 0 ? Math.round((processed / total) * 100) : 0;
+
+                        resultDiv.innerHTML = `
+                            <div style="margin-bottom: 8px;"><strong>Running Hydration...</strong></div>
+                            Job ID: ${data.id}<br>
+                            Status: ${data.status}<br>
+                            Progress: ${progress}% (${processed}/${total} cells)
+                            <div style="width: 100%; background-color: #e0e0e0; border-radius: 4px; margin-top: 8px; overflow: hidden;">
+                                <div style="width: ${progress}%; height: 10px; background-color: #4CAF50;"></div>
+                            </div>
+                        `;
+                    }
+                } catch (e) {
+                    console.error("Polling error", e);
+                }
+            }, 2000);
+        }
+
+        // --- Custom Policy Injection ---
+        const uploadPolicyBtn = document.getElementById('uploadPolicyBtn');
+        const policyFileInput = document.getElementById('policyFileInput');
+        const clearPolicyBtn = document.getElementById('clearPolicyBtn');
+        const policyYamlArea = document.getElementById('policyYamlArea');
+
+        if (uploadPolicyBtn && policyFileInput) {
+            uploadPolicyBtn.addEventListener('click', () => {
+                policyFileInput.click();
+            });
+
+            policyFileInput.addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    policyYamlArea.value = evt.target.result;
+                    clearPolicyBtn.style.display = 'inline-block';
+                    uploadPolicyBtn.style.background = '#e6f4ea';
+                };
+                reader.readAsText(file);
+            });
+        }
+
+        if (clearPolicyBtn) {
+            clearPolicyBtn.addEventListener('click', () => {
+                policyYamlArea.value = '';
+                policyFileInput.value = '';
+                clearPolicyBtn.style.display = 'none';
+                uploadPolicyBtn.style.background = '#eaedf0';
+            });
+        }
+
+        // Initial map fix
+        setTimeout(() => {
+            map.invalidateSize();
+            if (selectionRect) {
+                map.fitBounds(selectionRect.getBounds(), {padding: [50, 50]});
+            }
+        }, 500);
     </script>
 </body>
 </html></html>

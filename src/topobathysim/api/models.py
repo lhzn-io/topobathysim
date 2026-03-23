@@ -50,12 +50,20 @@ class ZoomDetail(BaseModel):
     lat_max: float
 
 
+class PolicyHashGroup(BaseModel):
+    policy_hash: str
+    yaml_snippet: str | None
+    count: int
+    bytes: int
+    by_zoom: dict[float, ZoomDetail]
+
+
 class Tier2Detail(BaseModel):
     count: int
     bytes: int
     newest: float
     oldest: float
-    by_zoom: dict[float, ZoomDetail]
+    policies: list[PolicyHashGroup]
 
 
 class ProviderDetail(BaseModel):
@@ -109,6 +117,7 @@ class CacheDetail(BaseModel):
 
 class PurgeRequest(BaseModel):
     tiers: list[int]
+    tier_2_hashes: list[str] | None = None
     dry_run: bool = True
     yes: bool = False
 
