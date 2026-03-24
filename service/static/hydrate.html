@@ -487,11 +487,17 @@
 
             try {
                 const bounds = selectionRect.getBounds();
+                const mode = document.querySelector('input[name="resMode"]:checked').value;
                 const payload = {
                     bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
                     resolution: getEffectiveResolution(),
                     force: false
                 };
+                // When in zoom mode, send zoom level so the server computes
+                // latitude-aware resolution matching the tile endpoint exactly.
+                if (mode === 'zoom') {
+                    payload.zoom = parseInt(document.getElementById('zoomLevel').value);
+                }
 
                 const workersVal = parseInt(document.getElementById('maxWorkers').value);
                 if (!isNaN(workersVal) && workersVal >= 1) {

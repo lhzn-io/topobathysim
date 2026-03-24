@@ -28,6 +28,13 @@ class HydrateRequest(BaseModel):
         examples=[[-73.82607, 40.75870, -72.85789, 41.20501]],
     )
     resolution: float = Field(30.0, description="Output resolution in meters", examples=[30.0])
+    zoom: int | None = Field(
+        None,
+        description="Slippy map zoom level. When set, resolution is computed per-cell "
+        "to match the tile endpoint (accounts for latitude). Overrides 'resolution'.",
+        ge=0,
+        le=22,
+    )
     policy_yaml: str | None = Field(None, description="Optional raw YAML config to override default policy")
     max_workers: int = Field(
         2, description="Number of workers to use for parallel grid fetching", ge=1, le=16

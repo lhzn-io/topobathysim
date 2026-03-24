@@ -449,10 +449,17 @@ def get_fused_cache_info(
         with open(policy_cache_path, "w") as f:
             yaml.dump(policy.model_dump(mode="json"), f)
 
+    # Quantize resolution to nearest 0.5m for the cache key.
+    # This absorbs latitude-dependent variation within a zoom level
+    # (e.g. z=13 gives 14.44-14.48m across a region → all key to 14.5m)
+    # while keeping distinct zoom levels separate (14.5 vs 7.0 vs 29.0).
+    # The actual computation still uses the full-precision resolution.
+    quantized_res = round(resolution * 2) / 2
+
     key_dict = {
         "policy_hash": policy_content_hash,
         "cell": [round(x, 8) for x in bbox],
-        "res": round(resolution, 8),
+        "res": quantized_res,
         "crs": target_crs,
     }
     key_str = json.dumps(key_dict, sort_keys=True, default=str)
@@ -493,6 +500,17 @@ def get_fused_cache_path(
     """Legacy wrapper for get_fused_cache_info returning only the Path."""
     path, _ = get_fused_cache_info(policy_input, bbox, resolution)
     return path
+
+
+def _zoom_resolution(zoom: int, center_lat: float) -> float:
+    """Compute tile-endpoint-compatible resolution for a given zoom and latitude.
+
+    Uses the same formula as the /elevation and /tiles endpoints:
+        res = 156543.03 * cos(center_lat_rad) / 2^zoom
+    """
+    import math
+
+    return round(156543.03 * math.cos(math.radians(center_lat)) / (2.0**zoom), 8)
 
 
 def hydrate(
@@ -585,6 +603,7 @@ def hydrate(
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),
                 "hydrated": "true",
+                "source": "hydrate",
             }
             ds_cell.attrs.update(new_attrs)
             if "provenance_dict" in ds_cell.attrs:
@@ -631,17 +650,24 @@ def hydrate(
     batch_size = max(max_workers or 2, 2) * 2
     cell_items = list(enumerate(cells, 1))
 
-    try:
-        # ProcessPoolExecutor requires picklable functions. _process_cell is a
-        # closure, so we use fork-based mp context where children inherit state.
-        mp_ctx = multiprocessing.get_context("fork")
-        pool_cls: type = concurrent.futures.ProcessPoolExecutor
-        pool_kwargs: dict[str, Any] = {"max_workers": max_workers, "mp_context": mp_ctx}
-    except ValueError:
-        # "fork" not available (e.g. macOS with spawn-only) — fall back to threads
-        logger.info("ProcessPoolExecutor(fork) unavailable, falling back to threads")
-        pool_cls = concurrent.futures.ThreadPoolExecutor
-        pool_kwargs = {"max_workers": max_workers}
+    # Daemon processes cannot spawn children (ProcessPoolExecutor would fail with
+    # "daemonic processes are not allowed to have children"). This happens when
+    # hydrate() runs inside the /hydrate endpoint's subprocess. Fall back to threads.
+    current = multiprocessing.current_process()
+    is_daemon = getattr(current, "daemon", False)
+
+    pool_cls: type = concurrent.futures.ThreadPoolExecutor
+    pool_kwargs: dict[str, Any] = {"max_workers": max_workers}
+
+    if not is_daemon:
+        try:
+            mp_ctx = multiprocessing.get_context("fork")
+            pool_cls = concurrent.futures.ProcessPoolExecutor
+            pool_kwargs = {"max_workers": max_workers, "mp_context": mp_ctx}
+        except ValueError:
+            logger.info("ProcessPoolExecutor(fork) unavailable, falling back to threads")
+    else:
+        logger.info("Running inside daemon process, using ThreadPoolExecutor")
 
     for batch_start in range(0, len(cell_items), batch_size):
         batch = cell_items[batch_start : batch_start + batch_size]
@@ -803,6 +829,7 @@ def run(
                 "crs": target_crs,
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),
+                "source": "tile",
             }
             ds_cell.attrs.update(new_attrs)
 

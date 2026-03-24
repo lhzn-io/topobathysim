@@ -38,7 +38,7 @@ from .models import (
     TIDReportResponse,
     TileMetadataResponse,
 )
-from .routers import cache_viewer
+from .routers import cache_viewer, dem_viewer
 
 # Configure Logging
 log_dir = Path("logs")
@@ -243,6 +243,7 @@ app = FastAPI(
 )
 
 app.include_router(cache_viewer.router)
+app.include_router(dem_viewer.router)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -1603,24 +1604,44 @@ async def trigger_hydrate(
     # Handle custom policy or default to loaded policy
     policy_input = request.policy_yaml if request.policy_yaml else str(policy_path)
 
+    # Compute effective resolution: zoom-based (latitude-aware) or explicit meters
+    if request.zoom is not None:
+        # Match the tile endpoint's resolution formula:
+        # res = 156543.03 * cos(center_lat) / 2^z
+        center_lat = (request.bbox[1] + request.bbox[3]) / 2.0
+        effective_resolution = round(156543.03 * math.cos(math.radians(center_lat)) / (2.0**request.zoom), 8)
+        logger.info(
+            f"Zoom {request.zoom} at lat {center_lat:.4f} -> " f"resolution {effective_resolution:.4f}m"
+        )
+    else:
+        effective_resolution = request.resolution
+
     # Write initial state to disk before spawning
     initial_state: dict[str, Any] = {
         "id": job_id,
         "status": "pending",
         "bbox": list(request.bbox),
-        "resolution": request.resolution,
+        "resolution": effective_resolution,
         "submitted_at": start_time.isoformat(),
         "total_cells": 0,
         "processed_cells": 0,
         "cached_cells": 0,
         "failed_cells": 0,
     }
+    if request.zoom is not None:
+        initial_state["zoom"] = request.zoom
     job_state.write_state(job_id, initial_state)
 
     # Spawn subprocess
     proc = multiprocessing.Process(
         target=_hydrate_subprocess,
-        args=(job_id, policy_input, request.bbox, request.resolution, request.max_workers),
+        args=(
+            job_id,
+            policy_input,
+            request.bbox,
+            effective_resolution,
+            request.max_workers,
+        ),
         daemon=True,
     )
     proc.start()

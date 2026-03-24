@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>TopoBathySim | DEM Viewer</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111; color: #ccc; overflow: hidden; }
+        #canvas { width: 100vw; height: 100vh; display: block; }
+
+        #panel {
+            position: absolute; top: 16px; left: 16px; z-index: 10;
+            background: rgba(20, 20, 28, 0.92); padding: 16px; border-radius: 8px;
+            width: 290px; font-size: 13px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.08);
+        }
+        #panel h3 { margin: 0 0 4px; font-size: 15px; color: #e0e0e0; }
+        #panel .subtitle { font-size: 11px; margin-bottom: 12px; }
+        #panel .subtitle a { color: #5af; text-decoration: none; }
+        .ctrl { margin-bottom: 10px; }
+        .ctrl label { display: block; font-size: 11px; color: #888; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .ctrl select, .ctrl input[type=number] {
+            width: 100%; padding: 5px 8px; background: #1a1a24; border: 1px solid #333; border-radius: 4px; color: #ddd; font-size: 13px;
+        }
+        .ctrl input[type=range] { width: 100%; accent-color: #5af; }
+        .ctrl .row { display: flex; gap: 6px; }
+        .ctrl .row input { flex: 1; }
+        .ctrl .val { float: right; color: #5af; font-size: 11px; }
+        button {
+            width: 100%; padding: 6px; background: #2a4a7a; border: none; border-radius: 4px;
+            color: #ddd; cursor: pointer; font-size: 13px; margin-top: 4px;
+        }
+        button:hover { background: #3a5a9a; }
+        #stats { font-size: 11px; color: #666; margin-top: 10px; padding-top: 8px; border-top: 1px solid #222; line-height: 1.5; }
+        #error-msg { color: #f55; font-size: 12px; margin-top: 8px; display: none; }
+
+        #tooltip {
+            position: absolute; z-index: 20; pointer-events: none; display: none;
+            background: rgba(10, 10, 18, 0.94); border: 1px solid rgba(255,255,255,0.15);
+            padding: 8px 12px; border-radius: 6px; font-size: 12px; color: #ccc;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5); white-space: nowrap;
+        }
+        #tooltip .elev { color: #5af; font-weight: 600; font-size: 14px; }
+        #tooltip .coord { color: #888; font-size: 11px; }
+
+        .toggle-row { display: flex; gap: 6px; margin-bottom: 6px; }
+        .toggle-btn {
+            flex: 1; padding: 4px 8px; background: #1a1a24; border: 1px solid #333;
+            border-radius: 4px; color: #888; cursor: pointer; font-size: 11px; text-align: center;
+        }
+        .toggle-btn.active { background: #2a4a7a; border-color: #5af; color: #ddd; }
+
+        #loading-overlay {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 100;
+            background: rgba(10, 10, 18, 0.95); display: flex; align-items: center;
+            justify-content: center; flex-direction: column; color: #ccc;
+        }
+        #loading-overlay .spinner {
+            width: 40px; height: 40px; border: 3px solid #333; border-top-color: #5af;
+            border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 16px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<div id="loading-overlay" style="display:none">
+    <div class="spinner"></div>
+    <div id="loading-msg">Loading DEM...</div>
+</div>
+
+<div id="panel">
+    <h3>TopoBathySim DEM Viewer</h3>
+    <p class="subtitle"><a href="/viewer/cache-viewer.html">&larr; Cache Manager</a> &middot; <a href="/viewer/hydrate.html">Hydrate</a></p>
+
+    <div class="ctrl">
+        <label>Fused Dataset</label>
+        <select id="dataset-select"><option value="">Loading datasets...</option></select>
+        <div class="row" style="gap:4px;margin-top:4px">
+            <button onclick="loadDataset()" style="flex:1">Load DEM</button>
+            <button onclick="clearCache()" title="Delete cached mosaic and rebuild" style="background:#555;flex:0">Clear Cache</button>
+        </div>
+        <label style="font-size:11px;margin-top:4px;display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="checkbox" id="show-tiles" onchange="populateDatasets()"> Show map tile layers
+        </label>
+    </div>
+
+    <div class="ctrl">
+        <label>Color Scale (m)</label>
+        <div class="row">
+            <input type="number" id="z-min" value="-20" step="1">
+            <input type="number" id="z-max" value="10" step="1">
+        </div>
+    </div>
+
+    <div class="ctrl">
+        <label>Vertical Exaggeration <span class="val" id="exag-val">5x</span></label>
+        <input type="range" id="z-exag" min="1" max="80" step="1" value="5">
+    </div>
+
+    <div class="ctrl">
+        <label>Decimation (lower = more detail) <span class="val" id="dec-val">4</span></label>
+        <input type="range" id="decimation" min="1" max="16" step="1" value="4">
+    </div>
+
+    <div class="toggle-row">
+        <div class="toggle-btn active" id="btn-solid" onclick="setRenderMode('solid')">Solid</div>
+        <div class="toggle-btn" id="btn-wire" onclick="setRenderMode('wire')">Wireframe</div>
+        <div class="toggle-btn" id="btn-both" onclick="setRenderMode('both')">Both</div>
+    </div>
+
+    <div id="stats">Select a dataset and click Load.</div>
+    <div id="error-msg"></div>
+</div>
+
+<div id="tooltip">
+    <div class="elev" id="tt-elev"></div>
+    <div class="coord" id="tt-coord"></div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── State ──
+let demData = null;
+let solidMesh = null;
+let wireMesh = null;
+let renderMode = 'solid';
+
+// ── Three.js Setup ──
+const canvas = document.getElementById('canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x0a0a12);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 5000);
+camera.position.set(0, 300, 400);
+
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.screenSpacePanning = true;
+controls.maxPolarAngle = Math.PI * 0.85;
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+
+// ── Lighting ──
+scene.add(new THREE.AmbientLight(0x404050, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(200, 400, 300);
+scene.add(dirLight);
+const dirLight2 = new THREE.DirectionalLight(0x8090b0, 0.3);
+dirLight2.position.set(-200, 200, -100);
+scene.add(dirLight2);
+
+// ── Raycaster ──
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const tooltip = document.getElementById('tooltip');
+
+// ── Colormap ──
+function elevationColor(z, zMin, zMax) {
+    if (isNaN(z)) return [0.05, 0.05, 0.08];
+    if (z < 0) {
+        const t = Math.max(0, Math.min(1, (z - zMin) / (0 - zMin)));
+        return [0, t * 0.4, 0.6 + t * 0.4];
+    } else {
+        const t = Math.min(1, z / Math.max(zMax, 0.01));
+        return [0.2 + 0.6 * t, 0.6 - 0.2 * t, 0.15];
+    }
+}
+
+// ── Build Terrain Geometry ──
+function buildTerrain(buffer, meta, decimation, zExag, zMin, zMax) {
+    const { width, height, bounds } = meta;
+    const [lonMin, latMin, lonMax, latMax] = bounds;
+    const step = Math.max(1, Math.round(decimation));
+    const nx = Math.floor((width - 1) / step) + 1;
+    const ny = Math.floor((height - 1) / step) + 1;
+    const lonCenter = (lonMin + lonMax) / 2;
+    const latCenter = (latMin + latMax) / 2;
+    const cosLat = Math.cos(latCenter * Math.PI / 180);
+    const degToM = 111320;
+    const sceneScale = 0.01;
+
+    const positions = new Float32Array(nx * ny * 3);
+    const colors = new Float32Array(nx * ny * 3);
+    const elevations = new Float32Array(nx * ny);
+    const lonlats = new Float32Array(nx * ny * 2);
+    const nanMask = new Uint8Array(nx * ny);
+
+    let idx = 0;
+    for (let iy = 0; iy < ny; iy++) {
+        const srcY = Math.min(iy * step, height - 1);
+        const lat = latMax - srcY * meta.dy;
+        for (let ix = 0; ix < nx; ix++) {
+            const srcX = Math.min(ix * step, width - 1);
+            const lon = lonMin + srcX * meta.dx;
+            const srcIdx = srcY * width + srcX;
+            let z = buffer[srcIdx];
+            const rawZ = z;
+            const isNanCell = isNaN(z);
+            if (isNanCell) z = 0;
+
+            positions[idx * 3] = (lon - lonCenter) * cosLat * degToM * sceneScale;
+            positions[idx * 3 + 1] = z * zExag * sceneScale;
+            positions[idx * 3 + 2] = -(lat - latCenter) * degToM * sceneScale;
+
+            const [r, g, b] = elevationColor(rawZ, zMin, zMax);
+            colors[idx * 3] = r;
+            colors[idx * 3 + 1] = g;
+            colors[idx * 3 + 2] = b;
+
+            elevations[idx] = rawZ;
+            lonlats[idx * 2] = lon;
+            lonlats[idx * 2 + 1] = lat;
+            nanMask[idx] = isNanCell ? 1 : 0;
+            idx++;
+        }
+    }
+
+    const indices = [];
+    for (let iy = 0; iy < ny - 1; iy++) {
+        for (let ix = 0; ix < nx - 1; ix++) {
+            const a = iy * nx + ix, b = a + 1, c = (iy + 1) * nx + ix, d = c + 1;
+            if (!nanMask[a] && !nanMask[c] && !nanMask[b]) indices.push(a, c, b);
+            if (!nanMask[b] && !nanMask[c] && !nanMask[d]) indices.push(b, c, d);
+        }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    geometry.userData = { elevations, lonlats, nx, ny };
+    return geometry;
+}
+
+function rebuildMesh() {
+    if (!demData) return;
+    const zExag = parseFloat(document.getElementById('z-exag').value);
+    const zMin = parseFloat(document.getElementById('z-min').value);
+    const zMax = parseFloat(document.getElementById('z-max').value);
+    const decimation = parseInt(document.getElementById('decimation').value);
+    document.getElementById('exag-val').textContent = zExag + 'x';
+    document.getElementById('dec-val').textContent = decimation;
+
+    if (solidMesh) { scene.remove(solidMesh); solidMesh.geometry.dispose(); solidMesh = null; }
+    if (wireMesh) { scene.remove(wireMesh); wireMesh.geometry.dispose(); wireMesh = null; }
+
+    const geometry = buildTerrain(demData.buffer, demData.meta, decimation, zExag, zMin, zMax);
+
+    solidMesh = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({
+        vertexColors: true, side: THREE.DoubleSide, shininess: 20, specular: 0x222233
+    }));
+    solidMesh.name = 'terrain';
+
+    wireMesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+        wireframe: true, color: 0x334466, opacity: 0.3, transparent: true
+    }));
+    wireMesh.name = 'wireframe';
+
+    applyRenderMode();
+
+    const box = new THREE.Box3().setFromObject(solidMesh);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxSpan = Math.max(size.x, size.z);
+    const elevAngle = 40 * Math.PI / 180;
+    const dist = maxSpan * 0.9;
+    controls.target.copy(center);
+    camera.position.set(center.x, center.y + dist * Math.sin(elevAngle), center.z + dist * Math.cos(elevAngle));
+    controls.update();
+}
+
+function applyRenderMode() {
+    if (!solidMesh || !wireMesh) return;
+    scene.remove(solidMesh); scene.remove(wireMesh);
+    if (renderMode === 'solid' || renderMode === 'both') scene.add(solidMesh);
+    if (renderMode === 'wire' || renderMode === 'both') scene.add(wireMesh);
+}
+
+window.setRenderMode = function(mode) {
+    renderMode = mode;
+    document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('btn-' + mode).classList.add('active');
+    applyRenderMode();
+};
+
+// ── Dataset Discovery ──
+async function populateDatasets() {
+    try {
+        const showTiles = document.getElementById('show-tiles')?.checked;
+        const url = showTiles ? '/api/v1/dem/datasets' : '/api/v1/dem/datasets?source=hydrate';
+        const res = await fetch(url);
+        const datasets = await res.json();
+        const sel = document.getElementById('dataset-select');
+        sel.innerHTML = '';
+        if (datasets.length === 0) {
+            sel.innerHTML = '<option value="">No fused datasets found</option>';
+            return;
+        }
+        for (const ds of datasets) {
+            const opt = document.createElement('option');
+            opt.value = ds.id;
+            const bbox = ds.bbox ? `[${ds.bbox.map(v => v.toFixed(2)).join(', ')}]` : '';
+            opt.textContent = `${ds.id} (${ds.cell_count} cells) ${bbox}`;
+            sel.appendChild(opt);
+        }
+
+        // Auto-select from URL param
+        const params = new URLSearchParams(window.location.search);
+        if (params.has('dataset')) {
+            sel.value = params.get('dataset');
+            loadDataset();
+        }
+    } catch (e) {
+        document.getElementById('dataset-select').innerHTML = '<option value="">Failed to load datasets</option>';
+    }
+}
+
+// ── Cache Management ──
+window.clearCache = async function() {
+    const sel = document.getElementById('dataset-select');
+    const datasetId = sel.value;
+    if (!datasetId) return;
+    try {
+        const r = await fetch(`/api/v1/dem/datasets/${datasetId}/cache`, {method:'DELETE'});
+        const j = await r.json();
+        if (r.ok) {
+            document.getElementById('info').innerText = `Cache cleared: ${j.deleted?.join(', ') || 'nothing to clear'}. Click Load DEM to rebuild.`;
+        } else {
+            document.getElementById('info').innerText = `Clear failed: ${j.detail || r.statusText}`;
+        }
+    } catch(e) { document.getElementById('info').innerText = `Clear error: ${e.message}`; }
+};
+
+// ── Data Loading ──
+window.loadDataset = async function() {
+    const policyPrefix = document.getElementById('dataset-select').value;
+    if (!policyPrefix) return;
+
+    const overlay = document.getElementById('loading-overlay');
+    const loadMsg = document.getElementById('loading-msg');
+    overlay.style.display = 'flex';
+
+    try {
+        loadMsg.textContent = 'Fetching metadata...';
+        const metaRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/meta`);
+        if (!metaRes.ok) throw new Error(`Metadata error (${metaRes.status}): ${await metaRes.text()}`);
+        const meta = await metaRes.json();
+
+        const sizeMB = ((meta.width * meta.height * 4) / 1e6).toFixed(1);
+        loadMsg.textContent = `Mosaicing ${meta.cell_count} cells (${meta.width}x${meta.height}, ~${sizeMB} MB)...`;
+
+        const binRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/elevation.bin`);
+        if (!binRes.ok) throw new Error(`DEM error (${binRes.status}): ${await binRes.text()}`);
+        const buffer = new Float32Array(await binRes.arrayBuffer());
+
+        if (buffer.length !== meta.width * meta.height) {
+            throw new Error(`Size mismatch: expected ${meta.width * meta.height}, got ${buffer.length}`);
+        }
+
+        demData = { buffer, meta };
+
+        let validCount = 0, nanCount = 0, minZ = Infinity, maxZ = -Infinity;
+        for (let i = 0; i < buffer.length; i++) {
+            if (isNaN(buffer[i])) { nanCount++; continue; }
+            validCount++;
+            if (buffer[i] < minZ) minZ = buffer[i];
+            if (buffer[i] > maxZ) maxZ = buffer[i];
+        }
+
+        document.getElementById('stats').innerHTML =
+            `<b>${policyPrefix}</b> (${meta.cell_count} cells)<br>` +
+            `Grid: ${meta.width} x ${meta.height} (${(buffer.length / 1e6).toFixed(1)}M cells)<br>` +
+            `Bounds: ${meta.bounds[0].toFixed(4)}, ${meta.bounds[1].toFixed(4)} &rarr; ${meta.bounds[2].toFixed(4)}, ${meta.bounds[3].toFixed(4)}<br>` +
+            `CRS: ${meta.crs}<br>` +
+            `Elevation: ${minZ.toFixed(2)}m to ${maxZ.toFixed(2)}m<br>` +
+            `Valid: ${validCount.toLocaleString()} | NaN: ${nanCount.toLocaleString()}`;
+
+        document.getElementById('error-msg').style.display = 'none';
+        loadMsg.textContent = 'Building mesh...';
+        await new Promise(r => setTimeout(r, 50));
+        rebuildMesh();
+
+    } catch (err) {
+        document.getElementById('error-msg').textContent = err.message;
+        document.getElementById('error-msg').style.display = 'block';
+    } finally {
+        overlay.style.display = 'none';
+    }
+};
+
+// ── UI Bindings ──
+document.getElementById('z-exag').addEventListener('input', rebuildMesh);
+document.getElementById('z-min').addEventListener('change', rebuildMesh);
+document.getElementById('z-max').addEventListener('change', rebuildMesh);
+document.getElementById('decimation').addEventListener('input', rebuildMesh);
+
+// ── Mouse Picking ──
+canvas.addEventListener('mousemove', (event) => {
+    if (!solidMesh) return;
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(solidMesh);
+    if (intersects.length > 0) {
+        const hit = intersects[0];
+        const geo = hit.object.geometry;
+        const { elevations, lonlats } = geo.userData;
+        const idx = geo.index.array;
+        const a = idx[hit.faceIndex * 3], b = idx[hit.faceIndex * 3 + 1], c = idx[hit.faceIndex * 3 + 2];
+        const pos = geo.attributes.position;
+        let nearest = a, nearestDist = Infinity;
+        for (const vi of [a, b, c]) {
+            const dx = pos.getX(vi) - hit.point.x, dy = pos.getY(vi) - hit.point.y, dz = pos.getZ(vi) - hit.point.z;
+            const d = dx*dx + dy*dy + dz*dz;
+            if (d < nearestDist) { nearestDist = d; nearest = vi; }
+        }
+        const z = elevations[nearest], lon = lonlats[nearest * 2], lat = lonlats[nearest * 2 + 1];
+        document.getElementById('tt-elev').textContent = isNaN(z) ? 'NaN (no data)' : `${z.toFixed(3)} m`;
+        document.getElementById('tt-coord').textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+        tooltip.style.display = 'block';
+        tooltip.style.left = (event.clientX + 16) + 'px';
+        tooltip.style.top = (event.clientY - 10) + 'px';
+    } else {
+        tooltip.style.display = 'none';
+    }
+});
+canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+
+// ── WASD Movement ──
+const keysDown = {};
+const MOVE_SPEED = 2.0;
+window.addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return; keysDown[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup', (e) => { keysDown[e.key.toLowerCase()] = false; });
+
+function applyWASD() {
+    const forward = new THREE.Vector3(); camera.getWorldDirection(forward); forward.y = 0; forward.normalize();
+    const strafe = new THREE.Vector3(-forward.z, 0, forward.x);
+    const delta = new THREE.Vector3();
+    if (keysDown['w']) delta.add(forward);
+    if (keysDown['s']) delta.sub(forward);
+    if (keysDown['a']) delta.sub(strafe);
+    if (keysDown['d']) delta.add(strafe);
+    if (keysDown['q'] || keysDown['e']) delta.y += keysDown['e'] ? 1 : -1;
+    if (delta.lengthSq() > 0) {
+        delta.normalize().multiplyScalar(MOVE_SPEED);
+        if (keysDown['shift']) delta.multiplyScalar(4);
+        camera.position.add(delta);
+        controls.target.add(delta);
+    }
+}
+
+// ── Resize + Render Loop ──
+window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+function animate() { requestAnimationFrame(animate); applyWASD(); controls.update(); renderer.render(scene, camera); }
+animate();
+populateDatasets();
+</script>
+</body>
+</html>
