@@ -4,6 +4,7 @@ import math
 import multiprocessing
 import os
 import sys
+import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -425,6 +426,12 @@ SKIP_LAND_BACKGROUND = os.getenv("SKIP_LAND_BACKGROUND", "False").lower() in (
 # Tiling Constants
 TILE_SIZE_PX = 512
 TILE_PADDING_PX = 4  # Standard padding to avoid edge artifacts and ensure cache parity
+
+# Concurrency: limit simultaneous fusion runs per worker to prevent resource exhaustion.
+# At high zoom (e.g. z=17, ~0.9m), each run() is CPU/IO-heavy; unbounded concurrency
+# causes all requests to compete and none to finish before client timeout.
+_FUSION_SEMAPHORE = threading.Semaphore(int(os.environ.get("TOPOBATHY_MAX_CONCURRENT_TILES", "3")))
+_TILE_FUSION_TIMEOUT = int(os.environ.get("TOPOBATHY_TILE_TIMEOUT", "120"))  # seconds
 
 
 # So I can change the signature of render_png to accept an optional 'legend' dict.
@@ -1116,6 +1123,7 @@ def get_xyz_tile(
     vmin: float | None = Query(None, description="Explicit Min Elevation"),
     vmax: float | None = Query(None, description="Explicit Max Elevation"),
     tile_size: int = Query(512, description="Output pixel dimension for standard square XYZ tiles"),
+    nocache: bool = Query(False, description="Bypass tile output cache and force regeneration"),
 ) -> Response:
     """
     XYZ Tile Endpoint.
@@ -1172,7 +1180,7 @@ def get_xyz_tile(
         media_type = "application/octet-stream"
 
     # 1. Check Cache
-    if tile_path.exists() and tile_path.stat().st_size > 0:
+    if not nocache and tile_path.exists() and tile_path.stat().st_size > 0:
         logger.debug(f"Cache Hit: {tile_path}")
         return FileResponse(tile_path, media_type=media_type)
 
@@ -1184,10 +1192,10 @@ def get_xyz_tile(
     res_meters = 156543.03 * math.cos(math.radians(center_lat)) / (2**z)
     res_meters = round(res_meters, 8)
 
-    # Pad requested bbox to supply surrounding context for PNG Hillshade rendering
-    # Ensures Matplotlib 3x3 surface normal calculation interpolates accurately
-    # Use pad_px=2 to completely remove any 3x3 kernel edge effects
-    pad_px = 2 if format == "png" else 0
+    # Pad requested bbox to supply surrounding context for PNG Hillshade rendering.
+    # The trim MUST match the fetch halo (TILE_PADDING_PX) so no halo pixels remain
+    # in the output — mismatched pad causes 1px seams at tile boundaries.
+    pad_px = TILE_PADDING_PX if format == "png" else 0
     dx_deg = (east - west) / tile_size
     dy_deg = (north - south) / tile_size
 
@@ -1203,6 +1211,12 @@ def get_xyz_tile(
     logger.info(
         f"Tile Run Call: z={z} x={x} y={y} res={res_meters} bbox={(req_west, req_south, req_east, req_north)}"
     )
+    # Acquire semaphore to limit concurrent fusion runs (prevents resource exhaustion at high zoom)
+    acquired = _FUSION_SEMAPHORE.acquire(timeout=_TILE_FUSION_TIMEOUT)
+    if not acquired:
+        logger.warning(f"Tile {z}/{x}/{y} timed out waiting for fusion slot ({_TILE_FUSION_TIMEOUT}s)")
+        return Response(content="Server busy - tile fusion backlog", status_code=503)
+
     # Run Fusion
     try:
         ds = run(
@@ -1211,7 +1225,6 @@ def get_xyz_tile(
             resolution=res_meters,
             use_cache=True,
         )
-        # Add logging here
         logger.info(f"Tile Fusion Result: res={res_meters} bbox={(req_west, req_south, req_east, req_north)}")
         logger.debug(f"/tiles run() returned ds with attrs: {ds.attrs}")
     except ValueError as e:
@@ -1224,6 +1237,8 @@ def get_xyz_tile(
         logger.error(f"Runtime failed: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         return Response(content=f"Error: {e}", status_code=500)
+    finally:
+        _FUSION_SEMAPHORE.release()
 
     # Force alignment to explicitly bounded 256x256 grid for Leaflet rendering
     # Mathematically resample exact Web Mercator bounds to eliminate visual overlap seams

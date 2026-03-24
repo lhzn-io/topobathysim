@@ -26,11 +26,12 @@ def main() -> None:
 
     os.environ["TOPOBATHYSIM_DEBUG"] = str(args.debug)
 
-    # Default to 1 worker. /hydrate uses in-process job tracking (HYDRATION_JOBS dict)
-    # which is not shared across workers — multiple workers cause 404s on status polls.
-    # Parallelism is handled internally via ThreadPoolExecutor within hydrate().
+    # Default to 2 workers. Hydration job state is persisted to disk (JSON files),
+    # so multi-worker is safe. Only the _HYDRATE_PROCESSES dict (subprocess handles)
+    # is per-worker, which only affects cleanup of zombie processes.
+    # Tile fusion concurrency is controlled by _FUSION_SEMAPHORE per worker.
     if args.workers is None:
-        args.workers = 1
+        args.workers = 2
         print(f"Auto-configured workers: {args.workers}")
 
     # If reload is True, workers must be 1 usually, or simple reload logic.

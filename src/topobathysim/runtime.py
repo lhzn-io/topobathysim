@@ -888,6 +888,22 @@ def run(
         # downstream "Reindexing only valid with uniquely valued Index" errors.
         merged_ds = merged_ds.drop_duplicates(dim="x").drop_duplicates(dim="y")
 
+        # Adjacent cells are computed independently and may have y-pixel grids that are
+        # slightly offset from each other.  combine_by_coords unions both coordinate arrays
+        # rather than aligning them, producing interleaved valid/NaN rows at cell boundaries.
+        # Fill those stripes now so downstream linear interp doesn't propagate them.
+        # Note: interpolate_na requires a monotonically increasing index; y is north-up
+        # (descending), so sort ascending, fill, then restore.
+        if "elevation" in merged_ds:
+            elev = merged_ds["elevation"]
+            if bool(elev.isnull().any()):
+                merged_ds["elevation"] = (
+                    elev.sortby("y", ascending=True)
+                    .interpolate_na(dim="y", method="linear")
+                    .sortby("y", ascending=False)
+                    .interpolate_na(dim="x", method="linear")
+                )
+
     # Clip to the exact requested bbox, reprojecting bounds to target CRS if needed.
     if target_crs != "EPSG:4326":
         transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)

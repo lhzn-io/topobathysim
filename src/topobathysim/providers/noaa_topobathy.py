@@ -816,8 +816,12 @@ class NoaaTopobathyProvider(Provider):
         if self._spatial_index is not None and not self._spatial_index.empty:
             query_box = box(west, south, east, north)
 
+            # Drop rows with missing geometries (corrupt index entries) before spatial query
+            valid_mask = self._spatial_index.geometry.notnull()
+            valid_index = self._spatial_index[valid_mask]
+
             # Filter by intersection
-            candidates = self._spatial_index[self._spatial_index.intersects(query_box)].copy()
+            candidates = valid_index[valid_index.intersects(query_box)].copy()
 
             if not candidates.empty:
                 # Helper: Extract Year
@@ -1120,7 +1124,10 @@ class NoaaTopobathyProvider(Provider):
             with contextlib.suppress(Exception):
                 query_geom = gdf_box.to_crs(self._tile_index.crs)[0]
 
-        matches = self._tile_index[self._tile_index.intersects(query_geom)]
+        # Drop rows with missing geometries before spatial query
+        valid_mask = self._tile_index.geometry.notnull()
+        valid_index = self._tile_index[valid_mask]
+        matches = valid_index[valid_index.intersects(query_geom)]
 
         results = []
         for _, row in matches.iterrows():
