@@ -108,8 +108,10 @@
         <div class="toggle-btn active" id="btn-solid" onclick="setRenderMode('solid')">Solid</div>
         <div class="toggle-btn" id="btn-wire" onclick="setRenderMode('wire')">Wireframe</div>
         <div class="toggle-btn" id="btn-both" onclick="setRenderMode('both')">Both</div>
+        <div class="toggle-btn" id="btn-prov" onclick="setRenderMode('provenance')">Provenance</div>
     </div>
 
+    <div id="provenance-stats"></div>
     <div id="stats">Select a dataset and click Load.</div>
     <div id="error-msg"></div>
 </div>
@@ -117,10 +119,12 @@
 <div id="tooltip">
     <div class="elev" id="tt-elev"></div>
     <div class="coord" id="tt-coord"></div>
+    <div class="source" id="tt-source" style="font-size:11px; margin-top:2px;"></div>
 </div>
 
 <canvas id="canvas"></canvas>
 
+<script src="provenance-utils.js"></script>
 <script type="importmap">
 {
     "imports": {
@@ -139,6 +143,8 @@ let demData = null;
 let solidMesh = null;
 let wireMesh = null;
 let renderMode = 'solid';
+let provenanceOverlay = null;
+let savedElevColors = null;  // cached elevation vertex colors for toggling back
 
 // ── Three.js Setup ──
 const canvas = document.getElementById('canvas');
@@ -202,6 +208,7 @@ function buildTerrain(buffer, meta, decimation, zExag, zMin, zMax) {
     const elevations = new Float32Array(nx * ny);
     const lonlats = new Float32Array(nx * ny * 2);
     const nanMask = new Uint8Array(nx * ny);
+    const pixelIndices = new Uint32Array(nx * ny);
 
     let idx = 0;
     for (let iy = 0; iy < ny; iy++) {
@@ -229,6 +236,7 @@ function buildTerrain(buffer, meta, decimation, zExag, zMin, zMax) {
             lonlats[idx * 2] = lon;
             lonlats[idx * 2 + 1] = lat;
             nanMask[idx] = isNanCell ? 1 : 0;
+            pixelIndices[idx] = srcIdx;
             idx++;
         }
     }
@@ -247,7 +255,7 @@ function buildTerrain(buffer, meta, decimation, zExag, zMin, zMax) {
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    geometry.userData = { elevations, lonlats, nx, ny };
+    geometry.userData = { elevations, lonlats, nx, ny, pixelIndices };
     return geometry;
 }
 
@@ -262,6 +270,7 @@ function rebuildMesh() {
 
     if (solidMesh) { scene.remove(solidMesh); solidMesh.geometry.dispose(); solidMesh = null; }
     if (wireMesh) { scene.remove(wireMesh); wireMesh.geometry.dispose(); wireMesh = null; }
+    savedElevColors = null; // invalidate cached colors on rebuild
 
     const geometry = buildTerrain(demData.buffer, demData.meta, decimation, zExag, zMin, zMax);
 
@@ -291,14 +300,41 @@ function rebuildMesh() {
 function applyRenderMode() {
     if (!solidMesh || !wireMesh) return;
     scene.remove(solidMesh); scene.remove(wireMesh);
-    if (renderMode === 'solid' || renderMode === 'both') scene.add(solidMesh);
+    if (renderMode === 'solid' || renderMode === 'both' || renderMode === 'provenance') scene.add(solidMesh);
     if (renderMode === 'wire' || renderMode === 'both') scene.add(wireMesh);
 }
 
 window.setRenderMode = function(mode) {
     renderMode = mode;
     document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
-    document.getElementById('btn-' + mode).classList.add('active');
+    const btnId = mode === 'provenance' ? 'btn-prov' : 'btn-' + mode;
+    document.getElementById(btnId).classList.add('active');
+
+    // Toggle vertex colors between elevation and provenance
+    if (solidMesh && solidMesh.geometry.attributes.color) {
+        const colors = solidMesh.geometry.attributes.color;
+        if (mode === 'provenance' && provenanceOverlay) {
+            // Save elevation colors on first switch
+            if (!savedElevColors) {
+                savedElevColors = new Float32Array(colors.array);
+            }
+            // Apply provenance colors using userData mapping
+            const geo = solidMesh.geometry;
+            const userData = geo.userData;
+            if (userData && userData.pixelIndices) {
+                for (let vi = 0; vi < colors.count; vi++) {
+                    const pi = userData.pixelIndices[vi];
+                    const [r, g, b] = provenanceOverlay.color(pi);
+                    colors.setXYZ(vi, r, g, b);
+                }
+                colors.needsUpdate = true;
+            }
+        } else if (savedElevColors) {
+            // Restore elevation colors
+            colors.array.set(savedElevColors);
+            colors.needsUpdate = true;
+        }
+    }
     applyRenderMode();
 };
 
@@ -399,6 +435,20 @@ window.loadDataset = async function() {
         await new Promise(r => setTimeout(r, 50));
         rebuildMesh();
 
+        // Fetch provenance data (non-blocking)
+        loadMsg.textContent = 'Loading provenance...';
+        try {
+            const provRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/provenance.bin`);
+            if (provRes.ok) {
+                const provBuf = new Uint32Array(await provRes.arrayBuffer());
+                const legend = meta.policy_legend || {};
+                provenanceOverlay = new ProvenanceOverlay(provBuf, legend, meta.width, meta.height);
+                document.getElementById('provenance-stats').innerHTML = provenanceOverlay.statsHTML();
+            }
+        } catch (e) {
+            console.warn('Provenance load failed:', e);
+        }
+
     } catch (err) {
         document.getElementById('error-msg').textContent = err.message;
         document.getElementById('error-msg').style.display = 'block';
@@ -436,6 +486,16 @@ canvas.addEventListener('mousemove', (event) => {
         const z = elevations[nearest], lon = lonlats[nearest * 2], lat = lonlats[nearest * 2 + 1];
         document.getElementById('tt-elev').textContent = isNaN(z) ? 'NaN (no data)' : `${z.toFixed(3)} m`;
         document.getElementById('tt-coord').textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+
+        // Show provenance on Shift+hover or in provenance mode
+        const srcEl = document.getElementById('tt-source');
+        if (provenanceOverlay && (event.shiftKey || renderMode === 'provenance')) {
+            const pi = geo.userData.pixelIndices ? geo.userData.pixelIndices[nearest] : nearest;
+            srcEl.innerHTML = provenanceOverlay.tooltipHTML(pi);
+        } else {
+            srcEl.innerHTML = '';
+        }
+
         tooltip.style.display = 'block';
         tooltip.style.left = (event.clientX + 16) + 'px';
         tooltip.style.top = (event.clientY - 10) + 'px';

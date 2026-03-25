@@ -415,11 +415,28 @@ class GEBCO2025Provider(Provider):
                     d["source_id"] for d in normalized if isinstance(d, xr.Dataset) and "source_id" in d
                 ]
 
+                # rioxarray.merge_arrays requires exactly 'y' and 'x' mappings to safely handle
+                # descending Y coordinates (which look "upside down" structurally if they are just
+                # named lat/lon and missing CRS).
+                for i in range(len(elevs)):
+                    if "lat" in elevs[i].dims and "lon" in elevs[i].dims:
+                        elevs[i] = elevs[i].rename({"lat": "y", "lon": "x"})
+                        elevs[i] = elevs[i].rio.write_crs("EPSG:4326")
+                        elevs[i] = elevs[i].rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+                for i in range(len(sources)):
+                    if "lat" in sources[i].dims and "lon" in sources[i].dims:
+                        sources[i] = sources[i].rename({"lat": "y", "lon": "x"})
+                        sources[i] = sources[i].rio.write_crs("EPSG:4326")
+                        sources[i] = sources[i].rio.set_spatial_dims(x_dim="x", y_dim="y")
+
                 final_elev = merge_arrays(elevs)
+                final_elev = final_elev.rename({"y": "lat", "x": "lon"})  # rename back for downstream slices
                 final_elev = sanitize_elevation_nodata(final_elev, abs_valid_limit=100000.0)
 
                 if sources:
                     final_src = merge_arrays(sources)
+                    final_src = final_src.rename({"y": "lat", "x": "lon"})
                     merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
                 else:
                     merged_ds = xr.Dataset({"elevation": final_elev})

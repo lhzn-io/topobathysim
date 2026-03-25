@@ -199,6 +199,78 @@ def _mosaic_to_bin(
     return canvas
 
 
+def _mosaic_source_to_bin(
+    policy_dir: Path,
+    dx: float,
+    dy: float,
+    width: int,
+    height: int,
+    x_min: float,
+    y_max: float,
+    cluster_bbox: list[float] | None = None,
+) -> np.ndarray:
+    """Paint source_elevation IDs into a pre-allocated uint32 canvas (north-first).
+
+    Mirrors _mosaic_to_bin but reads source_elevation instead of elevation.
+    Each pixel stores the integer ID of the data provider that contributed it.
+    """
+    canvas = np.zeros((height, width), dtype=np.uint32)
+    cells_painted = 0
+
+    for cell_path in sorted(policy_dir.glob("*.zarr")):
+        try:
+            if cluster_bbox is not None:
+                attrs = _read_cell_attrs(cell_path)
+                if attrs and not _cell_in_cluster(attrs, cluster_bbox):
+                    continue
+
+            ds = xr.open_dataset(cell_path, engine="zarr", decode_coords="all")
+            x_vals = ds.x.values if "x" in ds.coords else None
+            if x_vals is None or len(x_vals) < 2:
+                ds.close()
+                continue
+            cell_dx = abs(float(x_vals[1] - x_vals[0]))
+            if abs(cell_dx - dx) / max(dx, 1e-10) > _RES_TOLERANCE:
+                ds.close()
+                continue
+
+            if "source_elevation" not in ds:
+                ds.close()
+                continue
+
+            y_vals = ds.y.values
+            src = ds["source_elevation"].values.astype(np.uint32)
+            ds.close()
+
+            col_start = int(round((float(min(x_vals)) - x_min) / dx))
+            row_start = int(round((y_max - float(max(y_vals))) / dy))
+
+            if len(y_vals) > 1 and y_vals[0] < y_vals[-1]:
+                src = src[::-1]
+
+            src_r0 = max(0, -row_start)
+            src_c0 = max(0, -col_start)
+            dst_r0 = max(0, row_start)
+            dst_c0 = max(0, col_start)
+            copy_h = min(src.shape[0] - src_r0, height - dst_r0)
+            copy_w = min(src.shape[1] - src_c0, width - dst_c0)
+
+            if copy_h <= 0 or copy_w <= 0:
+                continue
+
+            src_slice = src[src_r0 : src_r0 + copy_h, src_c0 : src_c0 + copy_w]
+            dst_slice = canvas[dst_r0 : dst_r0 + copy_h, dst_c0 : dst_c0 + copy_w]
+            mask = (dst_slice == 0) & (src_slice > 0)
+            dst_slice[mask] = src_slice[mask]
+            cells_painted += 1
+
+        except Exception as e:
+            logger.warning(f"Failed to paint provenance cell {cell_path.name}: {e}")
+
+    logger.info(f"Provenance mosaic complete: {cells_painted} cells -> {width}x{height}")
+    return canvas
+
+
 def _cell_in_cluster(attrs: dict[str, Any], cluster_bbox: list[float] | None) -> bool:
     """Check if a cell's geographic bbox overlaps the cluster bbox."""
     if cluster_bbox is None:
@@ -371,6 +443,77 @@ async def get_elevation_binary(dataset_id: str) -> Response:
         content=content,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename={dataset_id}_elevation.bin"},
+    )
+
+
+@router.get("/datasets/{dataset_id}/provenance.bin")
+async def get_provenance_binary(dataset_id: str) -> Response:
+    """Return the mosaiced source_elevation grid as a raw Uint32 binary (north-first).
+
+    Each pixel stores a source ID integer that maps to a provider name via the
+    policy_legend in the dataset metadata. 0 = no data.
+    """
+    root = _fused_zarr_root()
+    policy_prefix, dx, dy, cluster_bbox = _parse_dataset_id(root, dataset_id)
+    policy_dir = _resolve_policy_dir(root, policy_prefix)
+
+    cache_bin = policy_dir / f"_mosaic_{dataset_id}_provenance.bin"
+    cache_meta_file = policy_dir / f"_mosaic_{dataset_id}.json"
+
+    cache_valid = False
+    if cache_bin.exists() and cache_meta_file.exists():
+        try:
+            cached = json.loads(cache_meta_file.read_text())
+            current_cells = 0
+            for cp in policy_dir.glob("*.zarr"):
+                a = _read_cell_attrs(cp)
+                if not a:
+                    continue
+                if abs(a.get("_dx", 0) - dx) / max(dx, 1e-10) > _RES_TOLERANCE:
+                    continue
+                if not _cell_in_cluster(a, cluster_bbox):
+                    continue
+                current_cells += 1
+            if cached.get("cell_count") == current_cells:
+                cache_valid = True
+        except Exception:
+            pass
+
+    if cache_valid:
+        logger.info(f"Provenance mosaic cache hit: {cache_bin.name}")
+        content = cache_bin.read_bytes()
+    else:
+        meta = await get_dataset_meta(dataset_id)
+        width = meta["width"]
+        height = meta["height"]
+
+        x_min = float("inf")
+        y_max = float("-inf")
+        for cell_path in sorted(policy_dir.glob("*.zarr")):
+            attrs = _read_cell_attrs(cell_path)
+            if attrs is None:
+                continue
+            cell_dx = attrs.get("_dx", 0)
+            if abs(cell_dx - dx) / max(dx, 1e-10) > _RES_TOLERANCE:
+                continue
+            if not _cell_in_cluster(attrs, cluster_bbox):
+                continue
+            x_min = min(x_min, attrs.get("_x_min", x_min))
+            y_max = max(y_max, attrs.get("_y_max", y_max))
+
+        canvas = _mosaic_source_to_bin(policy_dir, dx, dy, width, height, x_min, y_max, cluster_bbox)
+        content = canvas.tobytes()
+
+        try:
+            cache_bin.write_bytes(content)
+            logger.info(f"Provenance mosaic cached: {cache_bin.name} ({len(content)} bytes)")
+        except Exception as e:
+            logger.warning(f"Failed to cache provenance mosaic: {e}")
+
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={dataset_id}_provenance.bin"},
     )
 
 

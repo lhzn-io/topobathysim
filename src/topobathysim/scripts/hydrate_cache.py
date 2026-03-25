@@ -209,8 +209,8 @@ def main() -> None:
         "bbox",
         type=float,
         nargs=4,
-        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
-        help="Bounding box in WGS84 decimal degrees",
+        metavar="BBOX",
+        help="Bounding box in WGS84 decimal degrees (WEST SOUTH EAST NORTH)",
     )
     p_fuse.add_argument(
         "-r",
@@ -238,8 +238,8 @@ def main() -> None:
         "bbox",
         type=float,
         nargs=4,
-        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
-        help="Bounding box in WGS84 decimal degrees",
+        metavar="BBOX",
+        help="Bounding box in WGS84 decimal degrees (WEST SOUTH EAST NORTH)",
     )
     p_tiles.add_argument("-z", "--zoom", type=int, default=13, help="Zoom level (default: 13)")
     p_tiles.add_argument("-j", "--jobs", type=int, default=4, help="Parallel fetch workers (default: 4)")
