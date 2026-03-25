@@ -1224,6 +1224,7 @@ def get_xyz_tile(
             (req_west, req_south, req_east, req_north),
             resolution=res_meters,
             use_cache=True,
+            target_zoom=z,
         )
         logger.info(f"Tile Fusion Result: res={res_meters} bbox={(req_west, req_south, req_east, req_north)}")
         logger.debug(f"/tiles run() returned ds with attrs: {ds.attrs}")
@@ -1528,6 +1529,7 @@ def _hydrate_subprocess(
     bbox: tuple[float, float, float, float],
     resolution: float,
     max_workers: int = 2,
+    target_zoom: int | None = None,
 ) -> None:
     """
     Entry point for the hydration subprocess.
@@ -1583,6 +1585,7 @@ def _hydrate_subprocess(
             resolution=resolution,
             max_workers=max_workers,
             on_progress=_on_progress,
+            target_zoom=target_zoom,
         )
         state = job_state.read_state(job_id) or state
         state["status"] = "completed"
@@ -1656,6 +1659,7 @@ async def trigger_hydrate(
             request.bbox,
             effective_resolution,
             request.max_workers,
+            request.zoom,
         ),
         daemon=True,
     )

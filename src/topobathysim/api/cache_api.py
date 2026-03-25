@@ -89,6 +89,15 @@ def get_cache_summary(cache_bust: bool = False) -> CacheSummary:
     total_bytes = 0
     tier_summaries: list[CacheTierSummary] = []
 
+    # Map tier numbers to the API endpoint that generates them
+    tier_origins = {
+        1: "/tiles",
+        2: "/fuse",
+        3: "/hydrate",
+        4: "auto-discovery",
+        5: "download",
+    }
+
     for tier in TIERS:
         # These methods scan the filesystem, hence the caching
         try:
@@ -133,6 +142,7 @@ def get_cache_summary(cache_bust: bool = False) -> CacheSummary:
                 bytes=sz,
                 mb=mb_val,
                 warning=tier.warning,
+                origin=tier_origins.get(tier.number),
             )
         )
 
@@ -231,12 +241,29 @@ def get_cache_detail(cache_bust: bool = True) -> CacheDetail:
                 lon_max=_safe_float(info["lon_max"]),
                 lat_min=_safe_float(info["lat_min"]),
                 lat_max=_safe_float(info["lat_max"]),
+                origin_zoom=info.get("origin_zoom", 0),
+                origin_meters=info.get("origin_meters", 0),
+                origin_unknown=info.get("origin_unknown", 0),
+                resolution_m=_safe_float(info["resolution_m"])
+                if info.get("resolution_m") is not None
+                else None,
             )
+
+        # Extract policy name from YAML snippet if available
+        policy_name = None
+        snippet = pdict.get("yaml_snippet")
+        if snippet:
+            import re
+
+            m = re.search(r"^name:\s*(.+)$", snippet, re.MULTILINE)
+            if m:
+                policy_name = m.group(1).strip()
 
         policies_mapped.append(
             PolicyHashGroup(
                 policy_hash=phash,
-                yaml_snippet=pdict.get("yaml_snippet"),
+                policy_name=policy_name,
+                yaml_snippet=snippet,
                 count=pdict.get("count", 0),
                 bytes=pdict.get("bytes", 0),
                 by_zoom=by_zoom,

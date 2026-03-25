@@ -111,6 +111,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Rendering ---
 
+    function originBadgeHtml(origin) {
+        if (!origin) return '';
+        const classMap = {
+            '/fuse': 'origin-fuse',
+            '/tiles': 'origin-tiles',
+            '/hydrate': 'origin-hydrate',
+            'auto-discovery': 'origin-discovery',
+            'download': 'origin-download',
+        };
+        const cls = classMap[origin] || '';
+        return `<span class="origin-badge ${cls}">${origin}</span>`;
+    }
+
     function renderTierList(tiers) {
         tierListEl.innerHTML = '';
 
@@ -121,14 +134,17 @@ document.addEventListener('DOMContentLoaded', () => {
             card.onclick = () => selectTier(tier.number);
 
             const warningHtml = tier.warning ?
-                `<span class="tier-badge" style="background:rgba(210,153,34,0.2); color:#d29922; margin-left:8px;" title="${tier.purge_reason}">⚠️ Warning</span>` : '';
+                `<span class="tier-badge" style="background:rgba(210,153,34,0.2); color:#d29922; margin-left:8px;" title="${tier.purge_reason}">Warning</span>` : '';
 
             card.innerHTML = `
                 <div class="tier-header">
                     <span class="tier-title">Tier ${tier.number}</span>
                     <span class="tier-badge">${(tier.items || 0).toLocaleString()} items</span>
                 </div>
-                <div class="tier-desc" style="font-size:0.85rem; color:#8b949e; margin-bottom:6px;">${tier.name}</div>
+                <div class="tier-desc" style="font-size:0.85rem; color:#8b949e; margin-bottom:6px;">
+                    ${tier.name}
+                    ${originBadgeHtml(tier.origin)}
+                </div>
                 <div class="tier-meta">
                     <span style="font-family:monospace;">${formatBytes(tier.bytes)}</span>
                     ${warningHtml}
@@ -190,28 +206,50 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Sub-Renderers ---
     function renderTier1(d) { // Tiles
-        const rows = d.tile_subdirs.map(s => `<tr><td>${s.label}</td><td>${s.files}</td><td>${formatBytes(s.bytes)}</td></tr>`).join('');
+        const totalBytes = d.tile_subdirs.reduce((sum, s) => sum + s.bytes, 0);
+        const totalFiles = d.tile_subdirs.reduce((sum, s) => sum + s.files, 0);
+        const rows = d.tile_subdirs.map(s => `<tr><td>${s.label}</td><td>${s.files.toLocaleString()}</td><td>${formatBytes(s.bytes)}</td></tr>`).join('');
         return `
+            <div class="tier2-stats-bar">
+                <div class="tier2-stat"><span class="tier2-stat-label">Files</span><span class="tier2-stat-value">${totalFiles.toLocaleString()}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Total Size</span><span class="tier2-stat-value">${formatBytes(totalBytes)}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Meta JSONs</span><span class="tier2-stat-value">${d.meta_count.toLocaleString()}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">NPZ Arrays</span><span class="tier2-stat-value">${d.npz_count.toLocaleString()}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('/tiles')}</span></div>
+            </div>
             <div class="detail-section"><h4>Subdirectories</h4>
-            <table class="detail-table"><thead><tr><th>Name</th><th>Files</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>
-            <div class="detail-section"><h4>Metadata</h4><p>Meta JSONs: ${d.meta_count}</p><p>NPZ Arrays: ${d.npz_count}</p></div>`;
+            <table class="detail-table"><thead><tr><th>Name</th><th>Files</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
     function renderTier2(d) { // Fused
         let html = `
-            <div class="stats-row" style="margin-bottom:16px;">
-                <span>Total Fused Cached Grid Cells: <strong>${d.count}</strong></span>
-                <span style="margin-left:16px;">Total Size: <strong>${formatBytes(d.bytes)}</strong></span>
+            <div class="tier2-stats-bar">
+                <div class="tier2-stat">
+                    <span class="tier2-stat-label">Grid Cells</span>
+                    <span class="tier2-stat-value">${d.count.toLocaleString()}</span>
+                </div>
+                <div class="tier2-stat">
+                    <span class="tier2-stat-label">Total Size</span>
+                    <span class="tier2-stat-value">${formatBytes(d.bytes)}</span>
+                </div>
+                <div class="tier2-stat">
+                    <span class="tier2-stat-label">Policies</span>
+                    <span class="tier2-stat-value">${(d.policies || []).length}</span>
+                </div>
+                <div class="tier2-stat">
+                    <span class="tier2-stat-label">Origin</span>
+                    <span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('/fuse')}</span>
+                </div>
             </div>
         `;
 
         if (!d.policies || d.policies.length === 0) {
-            return html + `<div class="detail-section"><em>No nested policy groups found.</em></div>`;
+            return html + `<div class="detail-section"><em style="color:var(--text-secondary);">No nested policy groups found.</em></div>`;
         }
 
         d.policies.forEach(p => {
             const zoomRows = Object.entries(p.by_zoom || {}).map(([z, i]) => {
-                const resMeters = 156543.03 / Math.pow(2, z);
+                const resMeters = i.resolution_m || (156543.03 / Math.pow(2, z));
                 const latDiff = Math.abs(i.lat_max - i.lat_min);
                 const lonDiff = Math.abs(i.lon_max - i.lon_min);
                 const avgLat = (i.lat_max + i.lat_min) / 2;
@@ -219,43 +257,71 @@ document.addEventListener('DOMContentLoaded', () => {
                 const kmPerDegLon = 111.32 * Math.cos(avgLat * Math.PI / 180);
                 const areaSqKm = (latDiff * kmPerDegLat) * (lonDiff * kmPerDegLon);
 
+                // Build provenance badge
+                let provBadge = '';
+                const zoomCount = i.origin_zoom || 0;
+                const metersCount = i.origin_meters || 0;
+                const unknownCount = i.origin_unknown || 0;
+                if (zoomCount > 0 && metersCount === 0 && unknownCount === 0) {
+                    provBadge = `<span class="origin-badge origin-tiles">Z${z} tile</span>`;
+                } else if (metersCount > 0 && zoomCount === 0 && unknownCount === 0) {
+                    provBadge = `<span class="origin-badge origin-fuse">${resMeters.toFixed(1)}m</span>`;
+                } else if (zoomCount > 0 || metersCount > 0) {
+                    // Mixed provenance
+                    const parts = [];
+                    if (zoomCount > 0) parts.push(`<span class="origin-badge origin-tiles">${zoomCount} tile</span>`);
+                    if (metersCount > 0) parts.push(`<span class="origin-badge origin-fuse">${metersCount} res</span>`);
+                    if (unknownCount > 0) parts.push(`<span class="origin-badge" style="opacity:0.5">${unknownCount} legacy</span>`);
+                    provBadge = parts.join(' ');
+                } else if (unknownCount > 0) {
+                    provBadge = `<span class="origin-badge" style="opacity:0.5">legacy</span>`;
+                }
+
                 return `<tr>
-                    <td><strong>L${z}</strong> <small style="color:#8b949e">~${resMeters.toFixed(1)}m</small></td>
+                    <td>L${z} <span class="res-hint">~${resMeters.toFixed(1)}m</span></td>
                     <td>${i.count}</td>
                     <td>${formatBytes(i.bytes)}</td>
-                    <td>${areaSqKm < 0.1 ? '<0.1' : areaSqKm.toFixed(1)} km²</td>
+                    <td>${areaSqKm < 0.1 ? '<0.1' : areaSqKm.toFixed(1)} km&sup2;</td>
+                    <td>${provBadge}</td>
                     <td style="font-family:monospace; font-size:0.8rem">${i.lon_min?.toFixed(2)}, ${i.lat_min?.toFixed(2)}</td>
                 </tr>`;
             }).join('');
 
+            const titleHtml = p.policy_name
+                ? `<h4 class="policy-card-title">${p.policy_name}</h4>`
+                : `<h4 class="policy-card-title" style="color:var(--text-secondary); font-style:italic;">Unnamed Policy</h4>`;
+
             html += `
-            <div class="detail-section" style="margin-top: 24px; padding: 12px; border: 1px solid #30363d; border-radius: 6px;">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h4 style="margin:0; color:#58a6ff;">Policy Hash: <span style="font-family:monospace; color:#c9d1d9;">${p.policy_hash}</span></h4>
-                    <span style="font-size:0.9rem;">${p.count} grid cells · ${formatBytes(p.bytes)}</span>
-                </div>
-                `;
+            <div class="policy-card">
+                <div class="policy-card-header">
+                    <div>
+                        ${titleHtml}
+                        <div class="policy-card-hash">${p.policy_hash}</div>
+                    </div>
+                    <div class="policy-card-stats">
+                        <div class="policy-card-size">${formatBytes(p.bytes)}</div>
+                        <div class="policy-card-cells">${p.count.toLocaleString()} grid cells</div>
+                    </div>
+                </div>`;
 
             if (p.yaml_snippet) {
-                // Ensure safe HTML rendering of YAML snippet
                 const safeYaml = p.yaml_snippet
                     .replace(/&/g, "&amp;")
                     .replace(/</g, "&lt;")
                     .replace(/>/g, "&gt;");
 
                 html += `
-                <details style="margin-top: 12px; margin-bottom: 12px;">
-                    <summary style="cursor:pointer; color:#8b949e; font-size:0.9rem;">View Policy YAML</summary>
-                    <pre style="background:#161b22; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.85rem; margin-top:8px;"><code>${safeYaml}</code></pre>
-                </details>
-                `;
+                <details style="margin-top: 14px; margin-bottom: 14px;">
+                    <summary class="yaml-toggle">View Policy YAML</summary>
+                    <pre class="yaml-snippet"><code>${safeYaml}</code></pre>
+                </details>`;
             } else {
-                html += `<div style="margin-top:12px; margin-bottom:12px; color:#8b949e; font-size:0.9rem;"><em>No YAML mapping found for this hash.</em></div>`;
+                html += `<div style="margin-top:12px; margin-bottom:12px; color:var(--text-secondary); font-size:0.85rem; font-style:italic;">No YAML mapping found for this hash.</div>`;
             }
 
             html += `
-                <table class="detail-table">
-                    <thead><tr><th>Zoom / Res</th><th>Cached Grid Cells</th><th>Size</th><th>Coverage (Est)</th><th>Min Bounds</th></tr></thead>
+                <table class="detail-table zoom-table">
+                    <thead><tr><th>Zoom / Res</th><th>Cached Grid Cells</th><th>Size</th><th>Coverage (Est)</th><th>Origin</th><th>Min Bounds</th></tr></thead>
                     <tbody>${zoomRows}</tbody>
                 </table>
             </div>`;
@@ -265,18 +331,49 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderTier3(d) { // Providers
-        const rows = d.providers.map(p => `<tr><td>${p.name}</td><td>${p.count}</td><td>${formatBytes(p.bytes)}</td><td>${formatDate(p.newest)}</td></tr>`).join('');
-        return `<div class="detail-section"><h4>Providers</h4><table class="detail-table"><thead><tr><th>Name</th><th>Count</th><th>Size</th><th>Newest</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        const totalBytes = d.providers.reduce((sum, p) => sum + p.bytes, 0);
+        const totalCount = d.providers.reduce((sum, p) => sum + p.count, 0);
+        const rows = d.providers.map(p => `<tr><td>${p.name}</td><td>${p.count.toLocaleString()}</td><td>${formatBytes(p.bytes)}</td><td>${formatDate(p.newest)}</td></tr>`).join('');
+        return `
+            <div class="tier2-stats-bar">
+                <div class="tier2-stat"><span class="tier2-stat-label">Providers</span><span class="tier2-stat-value">${d.providers.length}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Zarr Stores</span><span class="tier2-stat-value">${totalCount.toLocaleString()}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Total Size</span><span class="tier2-stat-value">${formatBytes(totalBytes)}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('/hydrate')}</span></div>
+            </div>
+            <div class="detail-section"><h4>Providers</h4><table class="detail-table"><thead><tr><th>Name</th><th>Count</th><th>Size</th><th>Newest</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
     function renderTier4(d) { // Discovery
-        const rows = d.discovery.map(i => `<tr><td>${i.label}</td><td>${i.ok?'OK':'Err'}</td><td>${i.entries}</td><td>${formatBytes(i.bytes)}</td></tr>`).join('');
-        return `<div class="detail-section"><h4>Metadata Files</h4><table class="detail-table"><thead><tr><th>File</th><th>Status</th><th>Entries</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        const totalBytes = d.discovery.reduce((sum, i) => sum + i.bytes, 0);
+        const rows = d.discovery.map(i => {
+            const statusBadge = i.ok
+                ? '<span style="color:var(--success); font-weight:600;">OK</span>'
+                : '<span style="color:var(--danger); font-weight:600;">Err</span>';
+            return `<tr><td>${i.label}</td><td>${statusBadge}</td><td>${i.entries.toLocaleString()}</td><td>${formatBytes(i.bytes)}</td></tr>`;
+        }).join('');
+        return `
+            <div class="tier2-stats-bar">
+                <div class="tier2-stat"><span class="tier2-stat-label">Index Files</span><span class="tier2-stat-value">${d.discovery.length}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Total Size</span><span class="tier2-stat-value">${formatBytes(totalBytes)}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('auto-discovery')}</span></div>
+            </div>
+            <div class="detail-section"><h4>Metadata Files</h4><table class="detail-table"><thead><tr><th>File</th><th>Status</th><th>Entries</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
     function renderTier5(d) { // Raw
-        const rows = d.raw_files.map(r => `<tr><td>${r.provider}</td><td>${r.count}</td><td>${formatBytes(r.bytes)}</td><td>${formatDate(r.newest)}</td></tr>`).join('');
-        return `<div class="detail-section"><h4>Raw Source Files</h4><p style="color:#faa; font-size:0.9rem; margin-bottom:8px;">Warning: Deleting these requires re-download.</p><table class="detail-table"><thead><tr><th>Provider</th><th>Count</th><th>Size</th><th>Newest</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        const totalBytes = d.raw_files.reduce((sum, r) => sum + r.bytes, 0);
+        const totalCount = d.raw_files.reduce((sum, r) => sum + r.count, 0);
+        const rows = d.raw_files.map(r => `<tr><td>${r.provider}</td><td>${r.count.toLocaleString()}</td><td>${formatBytes(r.bytes)}</td><td>${formatDate(r.newest)}</td></tr>`).join('');
+        return `
+            <div class="tier2-stats-bar" style="border-color: rgba(248, 81, 73, 0.15); background: rgba(100, 30, 30, 0.2);">
+                <div class="tier2-stat"><span class="tier2-stat-label">Providers</span><span class="tier2-stat-value">${d.raw_files.length}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Files</span><span class="tier2-stat-value">${totalCount.toLocaleString()}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Total Size</span><span class="tier2-stat-value">${formatBytes(totalBytes)}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('download')}</span></div>
+            </div>
+            <div class="alert alert-danger" style="margin-bottom:16px;">Deleting raw source files requires re-download from remote servers.</div>
+            <div class="detail-section"><h4>Raw Source Files</h4><table class="detail-table"><thead><tr><th>Provider</th><th>Count</th><th>Size</th><th>Newest</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
 
@@ -370,7 +467,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     };
 
                     const hashLabel = document.createElement('span');
-                    let snip = p.yaml_snippet || 'Custom Policy';
+                    let snip = p.policy_name || p.yaml_snippet || 'Custom Policy';
                     if (snip.length > 50) snip = snip.substring(0, 50) + '...';
                     hashLabel.textContent = `${p.policy_hash.substring(0,8)}... (${formatBytes(p.bytes)}) - ${snip}`;
                     hashLabel.title = p.yaml_snippet || '';

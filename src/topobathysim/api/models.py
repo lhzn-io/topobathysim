@@ -19,6 +19,7 @@ class CacheTierSummary(BaseModel):
     bytes: int
     mb: float
     warning: bool
+    origin: str | None = None
 
 
 class CacheSummary(BaseModel):
@@ -48,10 +49,15 @@ class ZoomDetail(BaseModel):
     lon_max: float
     lat_min: float
     lat_max: float
+    origin_zoom: int = 0
+    origin_meters: int = 0
+    origin_unknown: int = 0
+    resolution_m: float | None = None
 
 
 class PolicyHashGroup(BaseModel):
     policy_hash: str
+    policy_name: str | None = None
     yaml_snippet: str | None
     count: int
     bytes: int

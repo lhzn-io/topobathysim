@@ -258,8 +258,11 @@ def _fmt_age(secs: float) -> str:
     return f"{secs / 86400:.1f}d ago"
 
 
-def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float, float] | None:
-    """Return (x_min, x_max, y_min, y_max, resolution) from a zarr store's coordinate arrays."""
+def _fused_zarr_extents(
+    path: Path,
+) -> tuple[float, float, float, float, float, str | None, int | None, float | None] | None:
+    """Return (x_min, x_max, y_min, y_max, resolution, resolution_origin, target_zoom, resolution_m)
+    from a zarr store's coordinate arrays and attrs."""
     try:
         import zarr  # type: ignore[import]
 
@@ -278,7 +281,25 @@ def _fused_zarr_extents(path: Path) -> tuple[float, float, float, float, float] 
         if res is None:
             res = width / (count - 1) if count > 1 else 0.0
 
-        return min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1), res
+        # Read provenance attrs (may not exist on legacy zarr files)
+        root_attrs = z.attrs
+        raw_origin = root_attrs.get("resolution_origin")
+        resolution_origin: str | None = str(raw_origin) if raw_origin is not None else None
+        raw_tz = root_attrs.get("target_zoom")
+        target_zoom_val: int | None = int(str(raw_tz)) if raw_tz is not None else None
+        raw_rm = root_attrs.get("resolution_m")
+        resolution_m_val: float | None = float(str(raw_rm)) if raw_rm is not None else None
+
+        return (
+            min(x0, x1),
+            max(x0, x1),
+            min(y0, y1),
+            max(y0, y1),
+            res,
+            resolution_origin,
+            target_zoom_val,
+            resolution_m_val,
+        )
     except Exception:
         return None
 
@@ -675,7 +696,7 @@ def _gather_status_data() -> _StatusData:
 
                     extents_res = _fused_zarr_extents(z_item)
                     if extents_res is not None:
-                        x0, x1, y0, y1, res = extents_res
+                        x0, x1, y0, y1, res, res_origin, tgt_zoom, res_m = extents_res
                         zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(
                             x0, x1, y0, y1, resolution=res
                         )
@@ -692,6 +713,10 @@ def _gather_status_data() -> _StatusData:
                                 "lon_max": lon_max,
                                 "lat_min": lat_min,
                                 "lat_max": lat_max,
+                                "origin_zoom": 0,
+                                "origin_meters": 0,
+                                "origin_unknown": 0,
+                                "resolution_m": res_m,
                             }
                         b = b_z[zoom]
                         b["count"] += 1
@@ -700,6 +725,16 @@ def _gather_status_data() -> _StatusData:
                         b["lon_max"] = max(b["lon_max"], lon_max)
                         b["lat_min"] = min(b["lat_min"], lat_min)
                         b["lat_max"] = max(b["lat_max"], lat_max)
+                        # Track provenance origin counts
+                        if res_origin == "zoom":
+                            b["origin_zoom"] += 1
+                        elif res_origin == "meters":
+                            b["origin_meters"] += 1
+                        else:
+                            b["origin_unknown"] += 1
+                        # Keep the resolution_m from the first cell with a value
+                        if res_m is not None and b.get("resolution_m") is None:
+                            b["resolution_m"] = res_m
 
     # ── Tier 3: provider zarr ─────────────────────────────────────
     for provider in PROVIDERS:

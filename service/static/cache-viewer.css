@@ -442,3 +442,171 @@ header {
     background: rgba(0,0,0,0.2);
     color: white;
 }
+
+/* ── Origin Badges ── */
+.origin-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+}
+
+.origin-badge.origin-fuse {
+    background: rgba(88, 166, 255, 0.15);
+    color: #79c0ff;
+    border: 1px solid rgba(88, 166, 255, 0.3);
+}
+
+.origin-badge.origin-tiles {
+    background: rgba(63, 185, 80, 0.15);
+    color: #56d364;
+    border: 1px solid rgba(63, 185, 80, 0.3);
+}
+
+.origin-badge.origin-hydrate {
+    background: rgba(188, 140, 255, 0.15);
+    color: #d2a8ff;
+    border: 1px solid rgba(188, 140, 255, 0.3);
+}
+
+.origin-badge.origin-discovery {
+    background: rgba(210, 153, 34, 0.15);
+    color: #e3b341;
+    border: 1px solid rgba(210, 153, 34, 0.3);
+}
+
+.origin-badge.origin-download {
+    background: rgba(248, 81, 73, 0.12);
+    color: #ff7b72;
+    border: 1px solid rgba(248, 81, 73, 0.25);
+}
+
+/* ── Tier 2 Policy Cards ── */
+.policy-card {
+    margin-top: 20px;
+    padding: 16px 20px;
+    border: 1px solid rgba(88, 166, 255, 0.2);
+    border-radius: 10px;
+    background: rgba(88, 166, 255, 0.04);
+    transition: var(--transition);
+}
+
+.policy-card:hover {
+    border-color: rgba(88, 166, 255, 0.35);
+    background: rgba(88, 166, 255, 0.06);
+}
+
+.policy-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+}
+
+.policy-card-title {
+    margin: 0;
+    font-family: 'Outfit', sans-serif;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--accent);
+    line-height: 1.3;
+}
+
+.policy-card-hash {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-top: 2px;
+}
+
+.policy-card-stats {
+    text-align: right;
+    flex-shrink: 0;
+}
+
+.policy-card-size {
+    font-family: 'Outfit', sans-serif;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.policy-card-cells {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-top: 2px;
+}
+
+/* ── Tier 2 Aggregate Stats Bar ── */
+.tier2-stats-bar {
+    display: flex;
+    gap: 24px;
+    padding: 14px 20px;
+    background: rgba(30, 60, 100, 0.25);
+    border: 1px solid rgba(88, 166, 255, 0.15);
+    border-radius: 8px;
+    margin-bottom: 8px;
+}
+
+.tier2-stat {
+    display: flex;
+    flex-direction: column;
+}
+
+.tier2-stat-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+
+.tier2-stat-value {
+    font-family: 'Outfit', sans-serif;
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+/* ── YAML Snippet Toggle ── */
+.yaml-toggle {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    user-select: none;
+    transition: color 0.15s;
+}
+
+.yaml-toggle:hover {
+    color: var(--accent-hover);
+}
+
+.yaml-snippet {
+    background: rgba(0, 0, 0, 0.35);
+    padding: 12px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    margin-top: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    line-height: 1.6;
+}
+
+/* ── Zoom Level Table Refinements ── */
+.detail-table.zoom-table td:first-child {
+    font-weight: 600;
+    color: var(--accent);
+}
+
+.detail-table.zoom-table .res-hint {
+    color: var(--text-secondary);
+    font-weight: 400;
+    font-size: 0.8rem;
+    margin-left: 4px;
+}

@@ -520,6 +520,7 @@ def hydrate(
     time: datetime | None = None,
     max_workers: int | None = 2,
     on_progress: Any | None = None,
+    target_zoom: int | None = None,
 ) -> dict[str, int]:
     """
     Hydrate the cache for a given bbox and resolution by processing all covering grid cells.
@@ -528,6 +529,8 @@ def hydrate(
     Args:
         on_progress: Optional callback called with (stats_dict) after each cell completes.
                      Used by the service to write progress to a state file.
+        target_zoom: If set, the hydration was requested at a specific slippy-map zoom level
+                     rather than an explicit resolution in meters.
     """
 
     policy = _resolve_policy(policy_input)
@@ -595,7 +598,7 @@ def hydrate(
                 halo_pct=0.10,
             )
 
-            new_attrs = {
+            new_attrs: dict[str, object] = {
                 "policy_hash": key_hash,
                 "policy_legend": str(legend),
                 "grid_cell_size": grid_cell_size,
@@ -604,7 +607,13 @@ def hydrate(
                 "cell_bbox": list(cell_bbox),
                 "hydrated": "true",
                 "source": "hydrate",
+                "resolution_m": round(res, 4),
             }
+            if target_zoom is not None:
+                new_attrs["target_zoom"] = int(target_zoom)
+                new_attrs["resolution_origin"] = "zoom"
+            else:
+                new_attrs["resolution_origin"] = "meters"
             ds_cell.attrs.update(new_attrs)
             if "provenance_dict" in ds_cell.attrs:
                 ds_cell.attrs["provenance_dict_json"] = json.dumps(ds_cell.attrs["provenance_dict"])
@@ -696,6 +705,7 @@ def run(
     resolution: float | None = None,
     time: datetime | None = None,
     use_cache: bool = True,
+    target_zoom: int | None = None,
 ) -> xr.Dataset:
     """
     Execute a fusion policy to generate a topobathymetric dataset.
@@ -822,7 +832,7 @@ def run(
             )
 
             # Attributes
-            new_attrs = {
+            new_attrs: dict[str, object] = {
                 "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
                 "policy_legend": str(legend),
                 "grid_cell_size": grid_cell_size,
@@ -830,7 +840,13 @@ def run(
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),
                 "source": "tile",
+                "resolution_m": round(resolution if resolution else 30.0, 4),
             }
+            if target_zoom is not None:
+                new_attrs["target_zoom"] = int(target_zoom)
+                new_attrs["resolution_origin"] = "zoom"
+            else:
+                new_attrs["resolution_origin"] = "meters"
             ds_cell.attrs.update(new_attrs)
 
             if "provenance_dict" in ds_cell.attrs:
