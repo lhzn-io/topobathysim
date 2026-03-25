@@ -1,0 +1,36 @@
+ARG BASE_IMAGE=ghcr.io/dusty-nv/python:r36.2.0
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+# Install system dependencies
+# PDAL and GDAL on Jetson (JetPack 6 / Ubuntu 22.04)
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libnetcdf-dev \
+    libgdal-dev \
+    libpdal-dev \
+    pdal \
+    gdal-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Library and install it
+# We assume the build context is the root of topobathysim/
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install .
+
+# Copy Service dependencies and install service
+# We need to make sure the relative path in service/pyproject.toml doesn't break
+# Or we can just install the service directly since topobathysim is already in site-packages
+COPY service ./service
+RUN pip install ./service --no-deps && pip install fastapi uvicorn[standard] pydantic-settings fastapi-cache2[redis] click
+
+# Default port 9595
+EXPOSE 9595
+
+# Set pythonpath so it finds topobathyserve
+ENV PYTHONPATH="/app:/app/src:/app/service"
+
+CMD ["uvicorn", "topobathyserve.main:app", "--host", "0.0.0.0", "--port", "9595", "--workers", "2"]
