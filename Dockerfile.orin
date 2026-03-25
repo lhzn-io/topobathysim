@@ -1,13 +1,14 @@
-ARG BASE_IMAGE=ghcr.io/dusty-nv/python:r36.2.0
+ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.2.0
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
-# Install system dependencies
-# PDAL and GDAL on Jetson (JetPack 6 / Ubuntu 22.04)
+# Install additional dev dependencies not in the base image
 RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
+    python3-venv \
+    python3-dev \
+    cmake \
+    ninja-build \
     libnetcdf-dev \
     libgdal-dev \
     libpdal-dev \
@@ -15,15 +16,24 @@ RUN apt-get update && apt-get install -y \
     gdal-bin \
     && rm -rf /var/lib/apt/lists/*
 
+# Alias python to python3
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+# Setup virtual environment
+RUN python3 -m venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Pre-install build requirements to avoid build-isolation issues (like NumPy 2.0)
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install "numpy<2.0.0" Cython hatchling scikit-build cmake py-cpuinfo setuptools_scm
+
 # Copy Library and install it
 # We assume the build context is the root of topobathysim/
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN pip install .
+RUN pip install --no-build-isolation .
 
 # Copy Service dependencies and install service
-# We need to make sure the relative path in service/pyproject.toml doesn't break
-# Or we can just install the service directly since topobathysim is already in site-packages
 COPY service ./service
 RUN pip install ./service --no-deps && pip install fastapi uvicorn[standard] pydantic-settings fastapi-cache2[redis] click
 
