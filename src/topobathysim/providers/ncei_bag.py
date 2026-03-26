@@ -25,6 +25,7 @@ from rioxarray.merge import merge_arrays
 from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumNoDataError, VDatumResolver
+from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -1045,7 +1046,7 @@ class BAGProvider(Provider):
             cls._singleton = super().__new__(cls)
         return cast(BAGProvider, cls._singleton)
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
+    def __init__(self, cache_dir: str | Path | None = None) -> None:
         """
         Initialize the BAG provider.
 
@@ -1054,6 +1055,9 @@ class BAGProvider(Provider):
         """
         if getattr(self, "_initialized", False):
             return
+
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_bag"
         self.cache_dir.mkdir(parents=True, exist_ok=True)

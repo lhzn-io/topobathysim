@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 
+from topobathysim.config import get_cache_root
 from topobathysim.runtime import hydrate, run, should_consolidate
 
 from . import job_state
@@ -744,7 +745,7 @@ async def get_elevation(
 
         # Check if we have any cached fused datasets for this coordinate
         # We start with the requested zoom, or the highest available in the tile cache
-        base_cache_dir = Path(os.environ.get("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
+        base_cache_dir = get_cache_root()
 
         check_zooms = []
         if zoom is not None:
@@ -986,7 +987,7 @@ def get_tile_metadata(
     bounds = {"north": north, "south": south, "west": west, "east": east}
 
     # Check Cache existence
-    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
+    base_cache_dir = get_cache_root() / "tiles"
     params_str = f"{policy_path.name}|{vmin}|{vmax}|{tile_size}"
     param_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
 
@@ -1073,7 +1074,7 @@ def get_tile_pixel_source(
     col = max(0, min(tile_size - 1, col))
     row = max(0, min(tile_size - 1, row))
 
-    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
+    base_cache_dir = get_cache_root() / "tiles"
     safe_style = "".join(c for c in style if c.isalnum() or c in ("-", "_")) or "default"
     tile_dir = base_cache_dir / "visual" / safe_style / str(z) / str(x)
     params_str = f"{policy_path.name}|{vmin}|{vmax}|{tile_size}"
@@ -1149,7 +1150,7 @@ def get_xyz_tile(
     logger.info(f"XYZ Request: z={z} x={x} y={y} | Format={format} | Style={style} | VMin={vmin} VMax={vmax}")
 
     # --- Caching Logic ---
-    base_cache_dir = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser() / "tiles"
+    base_cache_dir = get_cache_root() / "tiles"
 
     # Determine Cache Subdirectory based on format/style (Parity with Legacy)
     if format in ["png", "jpg", "jpeg"]:
@@ -1454,7 +1455,7 @@ async def clear_cache(type: str = "output") -> dict[str, object]:
     import shutil
 
     # Default cache location
-    cache_root = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
+    cache_root = get_cache_root()
     deleted = []
 
     try:

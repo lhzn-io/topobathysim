@@ -16,6 +16,7 @@ from shapely.geometry import box
 
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
+from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -71,12 +72,15 @@ class NoaaTopobathyProvider(Provider):
             cls._singleton = super().__new__(cls)
         return cast(NoaaTopobathyProvider, cls._singleton)
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
+    def __init__(self, cache_dir: str | Path | None = None) -> None:
         """
         Initializes the Topobathy provider, creating necessary cache directories.
         """
         if getattr(self, "_initialized", False):
             return
+
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         self.base_cache_dir = Path(cache_dir).expanduser()
         self.cache_dir = self.base_cache_dir / "noaa_topobathy"

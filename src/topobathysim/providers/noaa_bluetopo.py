@@ -25,6 +25,7 @@ from shapely.geometry import Point, box
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
+from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -69,7 +70,7 @@ class NoaaBlueTopoProvider(Provider):
             cls._singleton = super().__new__(cls)
         return cast(NoaaBlueTopoProvider, cls._singleton)
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
+    def __init__(self, cache_dir: str | Path | None = None) -> None:
         """
         Initialize the BlueTopo provider.
 
@@ -78,6 +79,9 @@ class NoaaBlueTopoProvider(Provider):
         """
         if getattr(self, "_initialized", False):
             return
+
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         self.vdatum = VDatumResolver()
         base_cache = Path(cache_dir).expanduser()

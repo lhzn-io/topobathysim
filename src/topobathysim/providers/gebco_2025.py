@@ -14,6 +14,7 @@ import xarray as xr
 from rioxarray.merge import merge_arrays
 
 from ..runtime import should_consolidate
+from ..config import get_cache_root
 from .base import Provider, sanitize_elevation_nodata
 from .registry import registry
 
@@ -58,7 +59,7 @@ class GEBCO2025Provider(Provider):
         west: float = -180,
         east: float = 180,
         output_format: str = "GTiff",
-        cache_dir: str = "~/.cache/topobathysim",
+        cache_dir: str | Path | None = None,
     ):
         """
         Initialize the GEBCO provider.
@@ -66,9 +67,12 @@ class GEBCO2025Provider(Provider):
         Args:
             dem_type: Type of DEM (default: GEBCO_2025).
             south, north, west, east: Global bounds.
-            output_format: Output format (default: GTiff).
+            output_format: Output format for the grid.
             cache_dir: Directory to store cached data files.
         """
+        if cache_dir is None:
+            cache_dir = get_cache_root()
+
         if hasattr(self, "_initialized") and self._initialized:
             return
 

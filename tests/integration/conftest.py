@@ -3,6 +3,9 @@ from pathlib import Path
 import pytest
 
 
+from topobathysim.config import get_cache_root
+
+
 @pytest.fixture(scope="session")
 def persistent_cache_dir() -> Path:
     """
@@ -11,6 +14,6 @@ def persistent_cache_dir() -> Path:
     significantly reducing test suite runtime.
     """
     # Use a subdirectory in the standard user cache to separate test data from production data
-    path = Path("~/.cache/topobathysim/tests").expanduser()
+    path = get_cache_root() / "tests"
     path.mkdir(parents=True, exist_ok=True)
     return path

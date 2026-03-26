@@ -20,6 +20,7 @@ from pystac_client import Client
 from rioxarray.merge import merge_arrays
 
 from ..manifest import OfflineManifest
+from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -40,8 +41,7 @@ class Usgs3DepProvider(Provider):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cast(Usgs3DepProvider, cls._instance)
-
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False) -> None:
+    def __init__(self, cache_dir: str | Path | None = None, offline_mode: bool = False) -> None:
         """
         Initialize the 3DEP provider.
 
@@ -52,8 +52,8 @@ class Usgs3DepProvider(Provider):
         if self._initialized:
             return
 
-        if cache_dir == "~/.cache/topobathysim":
-            cache_dir = os.environ.get("TOPOBATHYSIM_CACHE_DIR", cache_dir)
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         base_cache = Path(cache_dir).expanduser()
         self.cache_dir = base_cache / "usgs_3dep"

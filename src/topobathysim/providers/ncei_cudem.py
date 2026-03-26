@@ -22,6 +22,7 @@ from shapely.geometry import box
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
+from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -49,7 +50,7 @@ class CUDEMProvider(Provider):
             cls._singleton = super().__new__(cls)
         return cast(CUDEMProvider, cls._singleton)
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim") -> None:
+    def __init__(self, cache_dir: str | Path | None = None) -> None:
         """
         Initialize the CUDEM provider.
 
@@ -58,6 +59,9 @@ class CUDEMProvider(Provider):
         """
         if getattr(self, "_initialized", False):
             return
+
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         self.cache_dir = Path(cache_dir).expanduser() / "ncei_cudem"
         self.cache_dir.mkdir(parents=True, exist_ok=True)

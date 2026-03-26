@@ -72,7 +72,9 @@ from rich.text import Text
 # Config
 # ---------------------------------------------------------------------------
 
-CACHE_ROOT = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
+from topobathysim.config import get_cache_root
+
+CACHE_ROOT = get_cache_root()
 
 PROVIDERS = ["ncei_bag", "usgs_lidar", "noaa_bluetopo", "noaa_topobathy", "ncei_cudem", "usgs_3dep"]
 

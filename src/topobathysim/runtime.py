@@ -20,7 +20,8 @@ import xarray as xr
 from affine import Affine
 from pyproj import CRS, Transformer
 
-from topobathysim.operators.blend import metric_feather, overwrite
+from .config import get_cache_root
+from .operators.blend import metric_feather, overwrite
 from topobathysim.policy.loader import (
     generate_provider_legend,
     hash_policy,
@@ -426,12 +427,7 @@ def get_fused_cache_info(
     policy = _resolve_policy(policy_input)
     target_crs = policy.crs
 
-    default_cache = "~/.cache/topobathysim/fused_zarr"
-    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
-    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
-        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
-    else:
-        cache_dir = Path(cache_dir_str).expanduser()
+    cache_dir = get_cache_root() / "fused_zarr"
 
     # MD5 Hashing logic (Standardized Precision: 8 decimals)
     # We hash the policy content digest itself to keep the key short but content-addressed
@@ -770,12 +766,7 @@ def run(
     # For caching
     import os
 
-    default_cache = "~/.cache/topobathysim/fused_zarr"
-    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", default_cache)
-    if cache_dir_str != default_cache and not cache_dir_str.endswith("fused_zarr"):
-        cache_dir = Path(cache_dir_str).expanduser() / "fused_zarr"
-    else:
-        cache_dir = Path(cache_dir_str).expanduser()
+    cache_dir = get_cache_root() / "fused_zarr"
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 

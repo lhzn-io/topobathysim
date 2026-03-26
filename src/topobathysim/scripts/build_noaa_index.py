@@ -15,7 +15,8 @@ import fsspec
 import geopandas as gpd
 from shapely.geometry import box
 
-from topobathysim.providers.noaa_topobathy import NoaaTopobathyProvider
+from ..config import get_cache_root
+from ..providers.noaa_topobathy import NoaaTopobathyProvider
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,7 +25,7 @@ logging.getLogger("s3fs").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path("~/.cache/topobathysim").expanduser()
+CACHE_DIR = get_cache_root()
 METADATA_DIR = CACHE_DIR / "metadata"
 INDEX_PATH = METADATA_DIR / "noaa_project_extents.geojson"
 

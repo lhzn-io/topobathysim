@@ -14,6 +14,7 @@ import requests  # type: ignore
 import rioxarray
 import xarray as xr
 
+from ..config import get_cache_root
 from .base import Provider
 from .registry import registry
 
@@ -32,13 +33,16 @@ class GBR100Provider(Provider):
     )
     ZIP_FILENAME = "Great_Barrier_Reef_Bathymetry_2020_100m.zip"
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim"):
+    def __init__(self, cache_dir: str | Path | None = None):
         """
         Initialize the GBR100 provider.
 
         Args:
             cache_dir: Directory to store cached data files.
         """
+        if cache_dir is None:
+            cache_dir = get_cache_root()
+
         self.cache_dir = Path(cache_dir).expanduser() / "gbr100"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.zip_path = self.cache_dir / self.ZIP_FILENAME

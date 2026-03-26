@@ -21,13 +21,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_cache_root = os.environ.get("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")
-JOBS_DIR = Path(_cache_root).expanduser() / "hydration_jobs"
+from topobathysim.config import get_cache_root
 
 
 def _ensure_jobs_dir() -> Path:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    return JOBS_DIR
+    jobs_dir = get_cache_root() / "hydration_jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    return jobs_dir
 
 
 def job_path(job_id: str) -> Path:
@@ -70,7 +70,8 @@ def list_jobs(max_age_hours: float = 24) -> list[dict[str, Any]]:
     _ensure_jobs_dir()
     now = datetime.now(timezone.utc)
     jobs = []
-    for p in JOBS_DIR.glob("*.json"):
+    for f in _ensure_jobs_dir().glob("*.json"):
+
         try:
             state = json.loads(p.read_text())
         except (json.JSONDecodeError, OSError):

@@ -20,6 +20,7 @@ import s3fs
 import xarray as xr
 from affine import Affine
 
+from ..config import get_cache_root
 from ..manifest import OfflineManifest
 from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
@@ -35,7 +36,7 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] 
     Cached STAC query for 3DEP Lidar (Persisted & Process-Safe).
     """
     # Use a persistent lock file for STAC query caching
-    cache_path = Path("~/.cache/topobathysim/usgs_lidar/stac_discovery_cache.json").expanduser()
+    cache_path = get_cache_root() / "usgs_lidar" / "stac_discovery_cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Hashing
@@ -167,7 +168,7 @@ class UsgsLidarProvider(Provider):
             cls._instance = super().__new__(cls)
         return cast(UsgsLidarProvider, cls._instance)
 
-    def __init__(self, cache_dir: str = "~/.cache/topobathysim", offline_mode: bool = False) -> None:
+    def __init__(self, cache_dir: str | Path | None = None, offline_mode: bool = False) -> None:
         """
         Initialize the Lidar provider.
 
@@ -178,10 +179,8 @@ class UsgsLidarProvider(Provider):
         if self._initialized:
             return
 
-        import os
-
-        if cache_dir == "~/.cache/topobathysim":
-            cache_dir = os.environ.get("TOPOBATHYSIM_CACHE_DIR", cache_dir)
+        if cache_dir is None:
+            cache_dir = get_cache_root()
 
         self.cache_dir = Path(cache_dir).expanduser() / "usgs_lidar"
         self.cache_dir.mkdir(parents=True, exist_ok=True)

@@ -11,11 +11,12 @@ import xarray as xr
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
+from topobathysim.config import get_cache_root
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/dem", tags=["DEM Viewer"])
 
-_DEFAULT_CACHE = "~/.cache/topobathysim/fused_zarr"
 
 # Tolerance for resolution matching: 5% handles latitude-dependent pixel size
 # variation in projected CRS (e.g. EPSG:3857 L13 tiles: dx ≈ 14.44-14.46m).
@@ -23,10 +24,7 @@ _RES_TOLERANCE = 0.05
 
 
 def _fused_zarr_root() -> Path:
-    cache_dir_str = os.environ.get("TOPOBATHYSIM_CACHE_DIR", _DEFAULT_CACHE)
-    if cache_dir_str != _DEFAULT_CACHE and not cache_dir_str.endswith("fused_zarr"):
-        return Path(cache_dir_str).expanduser() / "fused_zarr"
-    return Path(cache_dir_str).expanduser()
+    return get_cache_root() / "fused_zarr"
 
 
 def _read_cell_attrs(cell_path: Path) -> dict[str, Any] | None:
