@@ -33,6 +33,9 @@ dependencies = [
   "pyproj",
   "rasterio",
   "affine",
+  "dask",
+  "bmi-topography",
+  "pyogrio",
   # Data access
   "pydap",
   "fsspec",
