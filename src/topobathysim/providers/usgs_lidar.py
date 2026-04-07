@@ -31,107 +31,103 @@ logger = logging.getLogger(__name__)
 
 
 @concurrent_lru_cache()
-def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] | None:
+def _discover_3dep_surveys(bbox: tuple[float, float, float, float]) -> list[dict[str, Any]]:
     """
-    Cached STAC query for 3DEP Lidar (Persisted & Process-Safe).
+    Discover distinct 3DEP COPC surveys covering bbox, newest-first (persisted & process-safe).
+
+    Iterates the STAC catalog sorted by ``-end_datetime``, collecting one representative tile per
+    distinct ``3dep:usgs_id``.  Stops after 8 surveys.  Results are written to
+    ``stac_discovery_cache.json`` under the key ``surveys_v2_{bbox_key}`` so they survive
+    process restarts and are shared across worker processes.
+
+    Returns an empty list on network failure.
     """
-    # Use a persistent lock file for STAC query caching
     cache_path = get_cache_root() / "usgs_lidar" / "stac_discovery_cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Hashing
-    bbox_key = f"{round(bbox[0], 6)}_{round(bbox[1], 6)}_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
+    bbox_key = (
+        f"surveys_v2_{round(bbox[0], 6)}_{round(bbox[1], 6)}" f"_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
+    )
 
-    # 2. Fast Path: Read from shared JSON (with short lock)
     from filelock import FileLock
 
     main_lock = FileLock(cache_path.with_suffix(".lock"))
 
+    # Fast path: already cached
     with main_lock:
         if cache_path.exists():
             try:
                 with open(cache_path) as f:
                     data = json.load(f)
-                    if bbox_key in data:
-                        # logger.debug(f"STAC Discovery Cache Hit: {bbox_key}")
-                        return cast(dict[str, Any] | None, data[bbox_key])
+                if bbox_key in data:
+                    return cast(list[dict[str, Any]], data[bbox_key])
             except Exception:
                 pass
 
-    # 3. Slow Path: Network Query (Protected by query-specific lock)
-    # This prevents 50 processes from querying the EXACT SAME bbox simultaneously,
-    # but allows them to query DIFFERENT bboxes in parallel.
+    # Slow path: network query, serialised per bbox to avoid duplicate queries
     import hashlib
 
     query_hash = hashlib.md5(bbox_key.encode()).hexdigest()
     query_lock_path = cache_path.parent / f"stac_query_{query_hash}.lock"
 
     with FileLock(query_lock_path):
-        # 3a. Re-check main cache inside the query lock
-        # (Another process might have just finished this exact query)
+        # Double-check after acquiring query lock
         with main_lock:
             if cache_path.exists():
                 try:
                     with open(cache_path) as f:
                         data = json.load(f)
-                        if bbox_key in data:
-                            logger.debug(f"STAC Discovery Cache Hit (after wait): {bbox_key}")
-                            return cast(dict[str, Any] | None, data[bbox_key])
+                    if bbox_key in data:
+                        logger.debug(f"STAC Discovery Cache Hit (after wait): {bbox_key}")
+                        return cast(list[dict[str, Any]], data[bbox_key])
                 except Exception:
                     pass
 
-        # 3b. Actually Execute Query
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
         import planetary_computer
         from pystac_client import Client
 
+        surveys: list[dict[str, Any]] = []
+        seen_usgs_ids: set[str] = set()
+        max_surveys = 8
+
         try:
-            logger.debug(f"Querying STAC: {stac_url} with bbox {bbox}")
-            # Search without 'limit' (which forces tiny pages)
-            # Use iterator to break early
+            logger.debug(f"Discovering 3DEP COPC surveys for bbox {bbox}")
             catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-            search = catalog.search(collections=["3dep-lidar-copc"], bbox=bbox)
+            # 3dep-lidar-copc items carry start_datetime/end_datetime, not datetime.
+            search = catalog.search(
+                collections=["3dep-lidar-copc"],
+                bbox=bbox,
+                sortby=["-end_datetime"],
+            )
 
-            # Taking just the first item without exhausting all pages
-            items = []
             for item in search.items():
-                items.append(item)
-                break
+                usgs_id = item.properties.get("3dep:usgs_id", item.id)
+                if usgs_id in seen_usgs_ids:
+                    continue  # already have a tile from this survey
+                seen_usgs_ids.add(usgs_id)
 
-            result = None
-            if items:
-                # Extract only what we need to return
-                item = items[0]
-                assets = item.assets
-                href = assets["data"].href
-
+                href = item.assets["data"].href
                 props = item.properties
-                native_epsg = props.get("proj:epsg")
-                projjson = props.get("proj:projjson", {})
+                surveys.append(
+                    {
+                        "href": href,
+                        "native_epsg": props.get("proj:epsg"),
+                        "projjson": props.get("proj:projjson", {}),
+                        "id": item.id,
+                        "usgs_id": usgs_id,
+                        "bbox": item.bbox,
+                        "properties": props,
+                    }
+                )
 
-                result = {
-                    "href": href,
-                    "native_epsg": native_epsg,
-                    "projjson": projjson,
-                    "id": item.id,
-                    "bbox": item.bbox,
-                    "properties": item.properties,
-                }
+                if len(surveys) >= max_surveys:
+                    break
 
-            # 3c. Write Result to Cache
-            with main_lock:
-                data = {}
-                if cache_path.exists():
-                    try:
-                        with open(cache_path) as f:
-                            data = json.load(f)
-                    except Exception:
-                        pass
-                data[bbox_key] = result
-                with open(cache_path, "w") as f:
-                    json.dump(data, f, indent=2)
-
-            return cast(dict[str, Any] | None, result)
+            logger.info(
+                f"Discovered {len(surveys)} 3DEP survey(s) for bbox {bbox}: "
+                + str([s["usgs_id"] for s in surveys])
+            )
 
         except Exception as e:
             err_str = str(e)
@@ -139,7 +135,21 @@ def _query_3dep_stac(bbox: tuple[float, float, float, float]) -> dict[str, Any] 
                 logger.warning(f"STAC Network Error: {err_str.split('Caused by')[-1].strip()}")
             else:
                 logger.warning(f"STAC Query Error: {e}")
-            return None
+            return []
+
+        with main_lock:
+            data = {}
+            if cache_path.exists():
+                try:
+                    with open(cache_path) as f:
+                        data = json.load(f)
+                except Exception:
+                    pass
+            data[bbox_key] = surveys
+            with open(cache_path, "w") as f:
+                json.dump(data, f, indent=2)
+
+        return surveys
 
 
 def _pdal_worker(pipeline_json: str, queue: Any) -> None:
@@ -523,334 +533,321 @@ class UsgsLidarProvider(Provider):
             logger.error(f"Lidar Read Error: {e}", exc_info=True)
             return None
 
+    def _fetch_one_survey(
+        self,
+        survey: dict[str, Any],
+        bounds: tuple[float, float, float, float],
+        resolution: float,
+        target_crs: str,
+        force_cache: bool,
+    ) -> xr.Dataset | None:
+        """
+        Fetch and rasterize a single 3DEP COPC survey tile described by *survey*.
+
+        Checks per-slice Zarr cache first; on miss, streams the COPC file via PDAL in an
+        isolated subprocess, reprojects to *target_crs*, builds a provenance Dataset, and
+        writes the result to the slice Zarr cache.  Spawns a background thread to download
+        the full source file when *force_cache* is True.
+
+        Returns an ``xr.Dataset`` with variables ``elevation`` (float32) and ``source_id``
+        (uint32) and ``attrs["provenance_dict"]``, or ``None`` on failure / no data.
+        """
+        import hashlib
+        import json
+        import tempfile
+        import threading
+
+        import numpy as np
+
+        href = survey["href"]
+        native_epsg = survey.get("native_epsg")
+
+        # --- Local file cache (full download) ---
+        local_path = self._get_cache_path(href)
+        if local_path.exists():
+            logger.info(f"Lidar Cache Hit (Source File): {local_path}")
+            native_crs_str = f"EPSG:{native_epsg}" if native_epsg else None
+            return self._read_laz_file(local_path, bounds, resolution, target_crs, native_crs_str)
+
+        # --- Per-slice Zarr cache (streamed result) ---
+        slice_key = f"{href}_{bounds}_{resolution}_{target_crs}"
+        slice_hash = hashlib.md5(slice_key.encode()).hexdigest()
+        slice_zarr_path = self.cache_dir / "zarr" / f"stream_{slice_hash}.zarr"
+
+        if slice_zarr_path.exists():
+            try:
+                logger.info(f"Lidar Cache Hit (Streamed Zarr): {slice_zarr_path.name}")
+                return cast(
+                    xr.Dataset,
+                    xr.open_dataset(slice_zarr_path, engine="zarr", chunks="auto", decode_coords="all"),
+                )
+            except Exception as e:
+                logger.warning(f"Corrupt Streamed Zarr {slice_zarr_path}: {e}")
+                import shutil
+
+                shutil.rmtree(slice_zarr_path, ignore_errors=True)
+
+        if self.offline_mode:
+            logger.warning(f"Offline Mode: Missing Lidar file {local_path.name}")
+            return None
+
+        # --- Stream via PDAL ---
+        logger.info(f"Streaming COPC Asset ({survey.get('usgs_id', 'unknown')}): {href}")
+
+        if force_cache:
+            t = threading.Thread(target=self._download_and_cache, args=(href,))
+            t.daemon = True
+            t.start()
+
+        # If native_epsg missing, try projjson
+        if not native_epsg:
+            pjson = survey.get("projjson", {})
+            if "components" in pjson:
+                for comp in pjson["components"]:
+                    if comp.get("type") == "ProjectedCRS" and "id" in comp:
+                        native_epsg = comp["id"].get("code")
+                        break
+
+        reader_bounds = None
+        if native_epsg:
+            from pyproj import Transformer
+
+            transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{native_epsg}", always_xy=True)
+            xs = [bounds[0], bounds[0], bounds[2], bounds[2]]
+            ys = [bounds[1], bounds[3], bounds[1], bounds[3]]
+            tx, ty = transformer.transform(xs, ys)
+            minx, maxx = min(tx), max(tx)
+            miny, maxy = min(ty), max(ty)
+
+            width_est = (maxx - minx) / resolution
+            height_est = (maxy - miny) / resolution
+            logger.debug(
+                f"Native Bounds: X[{minx:.2f},{maxx:.2f}] Y[{miny:.2f},{maxy:.2f}] "
+                f"-> Grid {int(width_est)}x{int(height_est)}"
+            )
+
+            if width_est > 20_000 or height_est > 20_000:
+                logger.warning(
+                    f"Lidar grid too large ({int(width_est)}x{int(height_est)}) for "
+                    f"{survey.get('usgs_id')}. Skipping."
+                )
+                return None
+            if width_est <= 0 or height_est <= 0:
+                logger.warning(f"Invalid grid size ({width_est}x{height_est}). Skipping.")
+                return None
+
+            reader_bounds = f"([{minx}, {maxx}], [{miny}, {maxy}])"
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            output_filename = tmp.name
+
+        pipeline_config: dict[str, Any] = {
+            "pipeline": [
+                {"type": "readers.copc", "filename": href, "tag": "reader"},
+                {"type": "filters.range", "limits": "Classification[2:2]", "tag": "filter"},
+                {
+                    "type": "writers.gdal",
+                    "filename": output_filename,
+                    "resolution": resolution,
+                    "output_type": "mean",
+                    "data_type": "float32",
+                    "nodata": -9999.0,
+                },
+            ]
+        }
+        if reader_bounds:
+            pipeline_config["pipeline"][0]["bounds"] = reader_bounds
+            pipeline_config["pipeline"][2]["bounds"] = reader_bounds
+
+        import multiprocessing
+        import queue
+
+        ctx = multiprocessing.get_context("spawn")
+        q = ctx.Queue()
+        p = ctx.Process(target=_pdal_worker, args=(json.dumps(pipeline_config), q))
+        p.start()
+        p.join(timeout=60)
+
+        if p.is_alive():
+            logger.warning(f"PDAL timed out on {href}")
+            p.terminate()
+            return None
+        if p.exitcode != 0:
+            logger.warning(f"PDAL crashed (code {p.exitcode}) on {href}")
+            return None
+
+        try:
+            pdal_result = q.get(timeout=2)
+        except queue.Empty:
+            logger.warning(f"PDAL returned no result on {href}")
+            return None
+
+        if not pdal_result.get("success"):
+            logger.warning(f"PDAL Error: {pdal_result.get('error')}")
+            return None
+
+        logger.debug(f"PDAL ok. Points rasterized: {pdal_result.get('count', 0)}")
+
+        if not Path(output_filename).exists():
+            return None
+
+        try:
+            with rxr.open_rasterio(output_filename, masked=True) as da_raw:  # type: ignore
+                if isinstance(da_raw, list):
+                    da: xr.DataArray = da_raw[0]
+                elif isinstance(da_raw, xr.Dataset):
+                    da = da_raw.to_array().isel(variable=0)
+                else:
+                    da = cast(xr.DataArray, da_raw)
+
+                da = da.rename({"band": "variable"}).squeeze("variable")
+                da.name = "elevation"
+                da.attrs = {}
+                da.rio.write_nodata(-9999.0, inplace=True)
+
+                if native_epsg:
+                    with contextlib.suppress(Exception):
+                        da.rio.write_crs(f"EPSG:{native_epsg}", inplace=True)
+
+                if target_crs and da.rio.crs and da.rio.crs != target_crs:
+                    da = da.rio.reproject(target_crs)
+
+                da.load()
+        finally:
+            Path(output_filename).unlink(missing_ok=True)
+
+        # Build provenance Dataset
+        project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 70000
+        p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
+        p_source.name = "source_id"
+        p_source.rio.write_nodata(0, inplace=True)
+        p_source.attrs["_FillValue"] = 0
+
+        p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
+        if da.rio.crs:
+            p_ds.rio.write_crs(da.rio.crs, inplace=True)
+        p_ds.rio.write_transform(da.rio.transform(), inplace=True)
+
+        asset_name = Path(href.split("?")[0]).name
+        if not asset_name or len(asset_name) > 50:
+            asset_name = f"Asset {project_uid}"
+
+        p_ds.attrs["provenance_dict"] = {
+            project_uid: {
+                "name": f"Lidar Point Cloud: {asset_name}",
+                "provider": "usgs_lidar",
+                "usgs_id": survey.get("usgs_id", ""),
+            }
+        }
+
+        # Cache to Zarr
+        try:
+            if not slice_zarr_path.exists():
+                da_to_cache = p_ds.chunk({"y": 1024, "x": 1024})
+                da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=should_consolidate())
+                logger.info(f"Cached Streamed Lidar to Zarr: {slice_zarr_path.name}")
+        except Exception as e:
+            logger.warning(f"Failed to cache Streamed Lidar Zarr: {e}")
+
+        return cast(xr.Dataset, p_ds)
+
     def fetch_lidar_from_stac(
         self,
         bounds: tuple[float, float, float, float],
         resolution: float = 4.0,
         target_crs: str = "EPSG:4326",
-        force_cache: bool = True,  # Now means "Cache in background if not present"
+        force_cache: bool = True,
     ) -> xr.DataArray | xr.Dataset | None:
         """
-        Fetches Lidar from Microsoft Planetary Computer STAC API (3DEP COPC).
+        Fetch Lidar from Microsoft Planetary Computer STAC (3DEP COPC).
+
+        Discovers all distinct surveys covering *bounds* (newest-first), fetches each in turn,
+        and merges results with NaN-fill semantics so newer surveys take priority.  Stops as
+        soon as every grid cell is populated or all surveys are exhausted.
         """
-        import json
-        import tempfile
-        import threading
-
-        # MPC STAC Endpoint
         try:
-            # Call cached query function
-            bbox_tuple = tuple(bounds)
-            result = None
+            bbox_tuple = cast(tuple[float, float, float, float], tuple(bounds))
 
-            # 1. Offline Mode / Manifest Lookup
+            # --- Offline mode: use manifest (single best item, backward-compat) ---
             if self.offline_mode:
                 logger.debug(f"Offline Mode: Checking Manifest for Lidar in {bounds}")
                 manifest_items = self.manifest.find_items("3dep-lidar-copc", bounds)
-                if manifest_items:
-                    m_item = manifest_items[0]
-                    result = {
-                        "href": m_item["href"],
-                        "native_epsg": m_item.get("properties", {}).get("native_epsg"),
-                        "projjson": m_item.get("properties", {}).get("projjson"),
-                        "id": "manifest-item",
-                    }
-                    logger.info(f"Offline Manifest found Lidar asset: {result['href']}")
-
-            # 2. Online Mode
-            if not result and not self.offline_mode:
-                result = _query_3dep_stac(bbox_tuple)
-                if result:
-                    self.manifest.add_item(
-                        collection_id="3dep-lidar-copc",
-                        bbox=result.get("bbox", bbox_tuple),
-                        asset_href=result["href"],
-                        properties=result.get("properties") or {},
-                    )
-
-            if not result:
-                if self.offline_mode:
+                if not manifest_items:
                     logger.warning("Offline Mode: No Lidar coverage found in manifest.")
-                else:
-                    logger.warning(
-                        f"No 3DEP COPC Lidar found in Planetary Computer STAC for bbox={bounds}. "
-                        "Region may be covered by legacy datasets not yet indexed as COPC."
-                    )
+                    return None
+                m_item = manifest_items[0]
+                survey_stub: dict[str, Any] = {
+                    "href": m_item["href"],
+                    "native_epsg": m_item.get("properties", {}).get("native_epsg"),
+                    "projjson": m_item.get("properties", {}).get("projjson", {}),
+                    "id": "manifest-item",
+                    "usgs_id": "manifest",
+                }
+                logger.info(f"Offline Manifest found Lidar asset: {survey_stub['href']}")
+                return self._fetch_one_survey(survey_stub, bounds, resolution, target_crs, force_cache)
+
+            # --- Online mode: discover surveys, fuse newest-first ---
+            surveys = _discover_3dep_surveys(bbox_tuple)
+            if not surveys:
+                logger.warning(
+                    f"No 3DEP COPC Lidar found in Planetary Computer STAC for bbox={bounds}. "
+                    "Region may be covered by legacy datasets not yet indexed as COPC."
+                )
                 return None
 
-            href = result["href"]
-            native_epsg = result["native_epsg"]
-
-            # --- CACHING STRATEGY (Hybrid) ---
-            local_path = self._get_cache_path(href)
-
-            # Case A: Already Cached -> Use Local File (Fast/Offline)
-            if local_path.exists():
-                logger.info(f"Lidar Cache Hit (Source File): {local_path}")
-                native_crs_str = f"EPSG:{native_epsg}" if native_epsg else None
-                return self._read_laz_file(local_path, bounds, resolution, target_crs, native_crs_str)
-
-            # Case A.2: Check for Partial/Streamed Zarr Cache
-            # Even if source file isn't here, we might have cached the raster result from a previous stream
-            # We need a stable hash for the Zarr based on HREF + Params
-            import hashlib
-
-            res_str = f"{resolution:.2f}".replace(".", "p")
-            href_hash = hashlib.md5(href.encode()).hexdigest()
-            # Note: We include bounds/resolution in hash or filename because this is a partial slice
-            # Actually, `fetch_lidar_from_stac` might be called with different bounds for the same asset.
-            # So the cache key must ideally be (Asset ID + Resolution + BBox).
-            # But BBox varies.
-            # Simplified approach: We cache the *specific requested slice* using a hash of all params.
-            slice_key = f"{href}_{bounds}_{resolution}_{target_crs}"
-            slice_hash = hashlib.md5(slice_key.encode()).hexdigest()
-            slice_zarr_path = self.cache_dir / "zarr" / f"stream_{slice_hash}.zarr"
-
-            if slice_zarr_path.exists():
-                try:
-                    logger.info(f"Lidar Cache Hit (Streamed Zarr): {slice_zarr_path.name}")
-                    return xr.open_dataarray(
-                        slice_zarr_path, engine="zarr", chunks="auto", decode_coords="all"
-                    )
-                except Exception as e:
-                    logger.warning(f"Corrupt Streamed Zarr {slice_zarr_path}: {e}")
-                    import shutil
-
-                    shutil.rmtree(slice_zarr_path, ignore_errors=True)
-
-            # Case B: Offline Mode + Not Cached -> Fail
-            if self.offline_mode:
-                logger.warning(f"Offline Mode: Missing Lidar file {local_path.name}")
-                return None
-
-            # Case C: Online + Not Cached -> Stream + Background Download
-            logger.info(f"Streaming COPC Asset: {href}")
-
-            if force_cache:
-                logger.info("Spawning background thread to cache asset.")
-                t = threading.Thread(target=self._download_and_cache, args=(href,))
-                t.daemon = True  # Daemonize to not block exit, though download might be interrupted
-                t.start()
-
-            # --- START STREAMING (PDAL) ---
-            if native_epsg:
-                logger.debug(f"STAC Item Properties found. Native EPSG: {native_epsg}")
-
-            reader_bounds = None
-
-            if native_epsg:
-                # Reproject bounds to native for efficient reading
-                from pyproj import Transformer
-
-                transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{native_epsg}", always_xy=True)
-
-                xs = [bounds[0], bounds[0], bounds[2], bounds[2]]
-                ys = [bounds[1], bounds[3], bounds[1], bounds[3]]
-
-                tx, ty = transformer.transform(xs, ys)
-
-                minx, maxx = min(tx), max(tx)
-                miny, maxy = min(ty), max(ty)
-
-                # Check dimensions before PDAL execution to prevent OOM
-                width_est = (maxx - minx) / resolution
-                height_est = (maxy - miny) / resolution
-                logger.debug(
-                    f"STAC Native Bounds: X[{minx:.2f}, {maxx:.2f}] Y[{miny:.2f}, {maxy:.2f}] "
-                    f"Res={resolution} -> Grid: {int(width_est)}x{int(height_est)}"
+            # Add discovered items to the offline manifest for future offline use
+            for s in surveys:
+                self.manifest.add_item(
+                    collection_id="3dep-lidar-copc",
+                    bbox=s.get("bbox", bbox_tuple),
+                    asset_href=s["href"],
+                    properties=s.get("properties") or {},
                 )
 
-                if width_est > 20_000 or height_est > 20_000:
-                    logger.warning(
-                        f"Estimated Lidar Grid size too large ({int(width_est)}x{int(height_est)}). "
-                        "Aborting STAC fetch for this tile to prevent PDAL crash."
-                    )
-                    return None
+            canvas_elev: xr.DataArray | None = None
+            canvas_source: xr.DataArray | None = None
+            all_provenance: dict[int, dict[str, Any]] = {}
 
-                if width_est <= 0 or height_est <= 0:
-                    logger.warning(
-                        f"Estimated Lidar Grid size invalid ({width_est}x{height_est}). "
-                        "Calculated bounds may be effectively zero."
-                    )
-                    return None
+            for i, survey in enumerate(surveys):
+                usgs_id = survey.get("usgs_id", survey["id"])
+                logger.info(f"Fetching survey {i + 1}/{len(surveys)}: {usgs_id}")
 
-                reader_bounds = f"([{minx}, {maxx}], [{miny}, {maxy}])"
-            else:
-                # Check PROJJSON if native_epsg was missing
-                pjson = result.get("projjson", {})
-                if "components" in pjson:
-                    for comp in pjson["components"]:
-                        if comp.get("type") == "ProjectedCRS" and "id" in comp:
-                            native_epsg = comp["id"].get("code")
-                            break
+                ds = self._fetch_one_survey(survey, bounds, resolution, target_crs, force_cache)
+                if ds is None:
+                    logger.debug(f"Survey {usgs_id} returned no data for bounds {bounds}")
+                    continue
 
-            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-                output_filename = tmp.name
+                survey_elev = ds["elevation"]
+                survey_source = ds["source_id"]
+                all_provenance.update(ds.attrs.get("provenance_dict", {}))
 
-            pipeline_config = {
-                "pipeline": [
-                    {
-                        "type": "readers.copc",
-                        "filename": href,
-                        "tag": "reader",
-                    },
-                    {
-                        "type": "filters.range",
-                        "limits": "Classification[2:2]",  # Bare Earth
-                        "tag": "filter",
-                    },
-                    {
-                        "type": "writers.gdal",
-                        "filename": output_filename,
-                        "resolution": resolution,
-                        "output_type": "mean",
-                        "data_type": "float32",
-                        "nodata": -9999.0,
-                    },
-                ]
-            }
+                if canvas_elev is None or canvas_source is None:
+                    canvas_elev = survey_elev
+                    canvas_source = survey_source
+                else:
+                    # NaN-fill: canvas (newer/higher-priority) wins, survey fills gaps
+                    canvas_elev = canvas_elev.combine_first(survey_elev)
+                    canvas_source = canvas_source.combine_first(survey_source)
 
-            if reader_bounds:
-                pipeline_config["pipeline"][0]["bounds"] = reader_bounds
-                # Also force writer bounds
-                pipeline_config["pipeline"][2]["bounds"] = reader_bounds
+                nan_remaining = int(canvas_elev.isnull().sum())
+                logger.info(f"After survey {usgs_id}: {nan_remaining} NaN cells remaining")
+                if nan_remaining == 0:
+                    logger.info("All cells filled — stopping survey fusion early.")
+                    break
 
-            # Execute in isolated process to catch libc crashes (e.g. ArbiterError)
-            import multiprocessing
-            import queue
-
-            ctx = multiprocessing.get_context("spawn")
-            q = ctx.Queue()
-
-            p = ctx.Process(
-                target=_pdal_worker,
-                args=(json.dumps(pipeline_config), q),
-            )
-            p.start()
-            p.join(timeout=60)  # Don't hang forever on network issues
-
-            if p.is_alive():
-                logger.warning(f"PDAL Process Timed Out on {href}")
-                p.terminate()
+            if canvas_elev is None:
+                logger.warning(f"All {len(surveys)} survey(s) returned no data for bounds {bounds}")
                 return None
 
-            if p.exitcode != 0:
-                logger.warning(f"PDAL Process Crashed (Code {p.exitcode}) on {href}")
-                return None
+            # Rebuild final Dataset
+            p_ds = xr.Dataset({"elevation": canvas_elev, "source_id": canvas_source})
+            if canvas_elev.rio.crs:
+                p_ds.rio.write_crs(canvas_elev.rio.crs, inplace=True)
+            with contextlib.suppress(Exception):
+                p_ds.rio.write_transform(canvas_elev.rio.transform(), inplace=True)
+            p_ds.attrs["provenance_dict"] = all_provenance
 
-            try:
-                res = q.get(timeout=2)
-            except queue.Empty:
-                logger.warning(f"PDAL Process returned no result on {href}")
-                return None
-
-            if not res.get("success"):
-                logger.warning(f"PDAL Error: {res.get('error')}")
-                return None
-
-            count = res.get("count", 0)
-            logger.debug(f"PDAL executed. Points: {count}")
-
-            if Path(output_filename).exists():
-                with rxr.open_rasterio(output_filename, masked=True) as da_raw:  # type: ignore
-                    if isinstance(da_raw, list):
-                        da = da_raw[0]
-                    elif isinstance(da_raw, xr.Dataset):
-                        da = da_raw.to_array().isel(variable=0)
-                    else:
-                        da = da_raw
-
-                    from typing import cast
-
-                    da = cast(xr.DataArray, da)
-
-                    da = da.rename({"band": "variable"}).squeeze("variable")
-                    da.name = "elevation"
-                    da.attrs = {}
-                    da.rio.write_nodata(-9999.0, inplace=True)
-
-                    if native_epsg:
-                        from contextlib import suppress
-
-                        with suppress(Exception):
-                            da.rio.write_crs(f"EPSG:{native_epsg}", inplace=True)
-
-                    if target_crs and da.rio.crs and da.rio.crs != target_crs:
-                        da = da.rio.reproject(target_crs)
-
-                    da.load()
-
-                Path(output_filename).unlink()
-                # from typing import cast (already imported)
-
-                try:
-                    if "slice_zarr_path" in locals() and not slice_zarr_path.exists():
-                        import hashlib
-
-                        import numpy as np
-
-                        project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 70000
-                        p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
-                        p_source.name = "source_id"
-                        p_source.rio.write_nodata(0, inplace=True)
-                        p_source.attrs["_FillValue"] = 0
-
-                        p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
-                        if da.rio.crs:
-                            p_ds.rio.write_crs(da.rio.crs, inplace=True)
-                        p_ds.rio.write_transform(da.rio.transform(), inplace=True)
-
-                        asset_name = Path(href.split("?")[0]).name
-                        if not asset_name or len(asset_name) > 50:
-                            asset_name = f"Asset {project_uid}"
-
-                        p_ds.attrs["provenance_dict"] = {
-                            project_uid: {
-                                "name": f"Lidar Point Cloud: {asset_name}",
-                                "provider": "usgs_lidar",
-                            }
-                        }
-
-                        # Chunk for Zarr
-                        da_to_cache = p_ds.chunk({"y": 1024, "x": 1024})
-                        da_to_cache.to_zarr(slice_zarr_path, mode="w", consolidated=should_consolidate())
-                        logger.info(f"Cached Streamed Lidar to Zarr: {slice_zarr_path.name}")
-
-                        return cast(xr.Dataset, p_ds)
-
-                except Exception as e:
-                    logger.warning(f"Failed to cache Streamed Lidar Zarr: {e}")
-
-                # If we failed to cache, still return the dataset
-                import hashlib
-
-                import numpy as np
-
-                project_uid = int(hashlib.md5(href.encode()).hexdigest(), 16) % 100000 + 70000
-                p_source = xr.where(da.notnull(), project_uid, 0).astype(np.uint32)
-                p_source.name = "source_id"
-                p_source.rio.write_nodata(0, inplace=True)
-                p_source.attrs["_FillValue"] = 0
-
-                p_ds = xr.Dataset({"elevation": da, "source_id": p_source})
-                if da.rio.crs:
-                    p_ds.rio.write_crs(da.rio.crs, inplace=True)
-                p_ds.rio.write_transform(da.rio.transform(), inplace=True)
-
-                asset_name = Path(href.split("?")[0]).name
-                if not asset_name or len(asset_name) > 50:
-                    asset_name = f"Asset {project_uid}"
-
-                p_ds.attrs["provenance_dict"] = {
-                    project_uid: {
-                        "name": f"Lidar Point Cloud: {asset_name}",
-                        "provider": "usgs_lidar",
-                    }
-                }
-
-                return cast(xr.Dataset, p_ds)
-
-            return None
+            return cast(xr.Dataset, p_ds)
 
         except Exception as e:
             logger.error(f"STAC Fetch Error: {e}", exc_info=True)

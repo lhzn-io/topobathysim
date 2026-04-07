@@ -14,9 +14,9 @@ import xarray as xr
 from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
+from ..config import get_cache_root
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -437,14 +437,17 @@ class NoaaTopobathyProvider(Provider):
                                 current_folder = (pid, folder_name)
                                 new_projects[pid] = folder_name
 
-                        # 2. Find InPort Link
-                        if current_folder and "metadata" in line:
+                        # 2. Find InPort Link — search any line within the current project's
+                        # block, not just lines containing "metadata" (case-sensitive miss).
+                        if current_folder:
                             pid = current_folder[0]
-                            # Check for metadata link in the SAME line (or associated block)
-                            pattern = r'href="(https://www.fisheries.noaa.gov/inport/item/\d+)"'
-                            inport_match = re.search(pattern, line)
-                            if inport_match:
-                                new_metadata_urls[pid] = inport_match.group(1)
+                            if pid not in new_metadata_urls:
+                                inport_match = re.search(
+                                    r'href="(https://www\.fisheries\.noaa\.gov/inport/item/\d+)"',
+                                    line,
+                                )
+                                if inport_match:
+                                    new_metadata_urls[pid] = inport_match.group(1)
 
                     # Update shared class-level dicts
                     NoaaTopobathyProvider._cls_projects.update(new_projects)
@@ -875,7 +878,7 @@ class NoaaTopobathyProvider(Provider):
                             allowed_pids = [str(p) for p in pid_val]
                         else:
                             allowed_pids = [str(pid_val)]
-                        candidates = candidates[candidates["project_id"].isin(allowed_pids)]
+                        candidates = candidates[candidates["project_id"].astype(str).isin(allowed_pids)]
                         if not candidates.empty:
                             logger.info(f"Explicitly filtering to requested project_ids: {allowed_pids}")
 
@@ -1136,8 +1139,9 @@ class NoaaTopobathyProvider(Provider):
         results = []
         for _, row in matches.iterrows():
             fname = None
-            # Extended column search order
-            for col in ["location", "Location", "Name", "name", "URL", "url", "id", "TileName"]:
+            # Extended column search order — prefer URL/url first so full S3 URLs are used
+            # directly (avoids subdir path pollution from internal NAS `location` paths).
+            for col in ["URL", "url", "location", "Location", "Name", "name", "id", "TileName"]:
                 if col in row:
                     val = str(row[col])
                     if val and val.lower() != "nan":

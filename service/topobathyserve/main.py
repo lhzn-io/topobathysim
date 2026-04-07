@@ -15,6 +15,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import contextlib
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +29,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, 
 from fastapi.responses import FileResponse, Response
 
 from topobathysim.config import get_cache_root
+from topobathysim.policy.loader import hash_policy, load_policy, load_policy_from_str
 from topobathysim.runtime import hydrate, run, should_consolidate
 
 from . import job_state
@@ -305,6 +307,11 @@ def fuse(
     fmt = _normalize_output_format(format)
 
     try:
+        _policy = load_policy(str(policy_path))
+        _phash = hash_policy(_policy.model_dump())
+        logger.info(
+            f"GET /fuse policy={policy_path.name} hash={_phash[:8]} " f"bbox={bbox_tuple} res={resolution}m"
+        )
         ds = run(str(policy_path), bbox_tuple, resolution=resolution, use_cache=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -362,6 +369,14 @@ def fuse_post(
         pass
 
     try:
+        _policy = (
+            load_policy_from_str(str(policy_input)) if request.policy_yaml else load_policy(str(policy_input))
+        )
+        _phash = hash_policy(_policy.model_dump())
+        logger.info(
+            f"POST /fuse policy={getattr(_policy, 'name', str(policy_input))} "
+            f"hash={_phash[:8]} bbox={request.bbox} res={request.resolution}m"
+        )
         ds = run(
             policy_input=policy_input,
             bbox=request.bbox,
@@ -1226,6 +1241,7 @@ def get_xyz_tile(
             resolution=res_meters,
             use_cache=True,
             target_zoom=z,
+            source="tile",
         )
         logger.info(f"Tile Fusion Result: res={res_meters} bbox={(req_west, req_south, req_east, req_north)}")
         logger.debug(f"/tiles run() returned ds with attrs: {ds.attrs}")
@@ -1580,6 +1596,7 @@ def _hydrate_subprocess(
             f"Hydration subprocess [{job_id}] started (PID {os.getpid()}) "
             f"for {bbox} @ {resolution}m with {max_workers} workers"
         )
+        _hydrate_start = time.time()
         stats = hydrate(
             policy_input,
             bbox,
@@ -1588,11 +1605,12 @@ def _hydrate_subprocess(
             on_progress=_on_progress,
             target_zoom=target_zoom,
         )
+        _hydrate_elapsed = time.time() - _hydrate_start
         state = job_state.read_state(job_id) or state
         state["status"] = "completed"
         state["stats"] = stats
         job_state.write_state(job_id, state)
-        logger.info(f"Hydration [{job_id}] finished: {stats}")
+        logger.info(f"Hydration [{job_id}] finished in {_hydrate_elapsed:.1f}s: {stats}")
     except Exception as e:
         state = job_state.read_state(job_id) or state
         state["status"] = "failed"
@@ -1634,6 +1652,16 @@ async def trigger_hydrate(
         )
     else:
         effective_resolution = request.resolution
+
+    try:
+        _policy = load_policy_from_str(policy_input) if request.policy_yaml else load_policy(policy_input)
+        _phash = hash_policy(_policy.model_dump())
+        logger.info(
+            f"POST /hydrate policy={getattr(_policy, 'name', policy_input)} "
+            f"hash={_phash[:8]} bbox={request.bbox} res={effective_resolution}m"
+        )
+    except Exception as _log_exc:
+        logger.debug(f"POST /hydrate policy hash logging failed: {_log_exc}")
 
     # Write initial state to disk before spawning
     initial_state: dict[str, Any] = {
@@ -1696,6 +1724,39 @@ async def get_hydration_status(job_id: str) -> dict[str, Any]:
     return state
 
 
+@app.delete("/hydrate/{job_id}")
+async def cancel_hydration_job(job_id: str) -> dict[str, Any]:
+    """Cancel a running hydration job by killing its subprocess."""
+    state = job_state.read_state(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if state.get("status") not in ("running", "pending"):
+        return {"status": state.get("status"), "message": "Job is not running"}
+
+    # Try in-memory process handle first (same server instance)
+    proc = _HYDRATE_PROCESSES.get(job_id)
+    if proc and proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=3)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        del _HYDRATE_PROCESSES[job_id]
+    else:
+        # Fall back to PID from state (e.g. after server restart)
+        pid = state.get("pid")
+        if pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 15)  # SIGTERM
+
+    state["status"] = "cancelled"
+    state["error"] = "Cancelled by user"
+    job_state.write_state(job_id, state)
+    logger.info(f"Hydration job {job_id} cancelled")
+    return {"status": "cancelled", "job_id": job_id}
+
+
 @app.websocket("/hydrate/{job_id}/ws")
 async def hydrate_ws(websocket: WebSocket, job_id: str) -> None:
     """
@@ -1721,7 +1782,7 @@ async def hydrate_ws(websocket: WebSocket, job_id: str) -> None:
                 await websocket.send_json(state)
                 prev_snapshot = snapshot
 
-            if state.get("status") in ("completed", "failed"):
+            if state.get("status") in ("completed", "failed", "cancelled"):
                 break
 
             await asyncio.sleep(1)

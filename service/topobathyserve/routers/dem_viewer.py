@@ -2,13 +2,12 @@
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import xarray as xr
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
 from topobathysim.config import get_cache_root
@@ -109,15 +108,37 @@ def _cluster_cells(
     return [[group[i] for i in indices] for indices in clusters_map.values()]
 
 
+# Hard cap on the mosaic build canvas.  Prevents OOM for large regions at fine
+# resolution (e.g. GBE at 3m yields a ~20kx25k = 2 GB canvas unbuildable in RAM).
+# The cached .bin is always at most this many pixels on its longest side.
+MOSAIC_BUILD_MAX_DIM = 8192
+
+
+def _downsample_nearest(arr: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
+    """Nearest-neighbour downsample a 2-D array (works for float32 and uint32, preserves NaN)."""
+    row_idx = np.round(np.linspace(0, arr.shape[0] - 1, new_h)).astype(np.intp)
+    col_idx = np.round(np.linspace(0, arr.shape[1] - 1, new_w)).astype(np.intp)
+    return arr[np.ix_(row_idx, col_idx)]
+
+
+def _clamp_dims(width: int, height: int, max_dim: int | None) -> tuple[int, int, float]:
+    """Return (new_w, new_h, scale) clamped so max(new_w, new_h) <= max_dim."""
+    if max_dim is None or max(width, height) <= max_dim:
+        return width, height, 1.0
+    scale = max_dim / max(width, height)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale))), scale
+
+
 @router.get("/datasets")
 async def list_datasets(source: str | None = None) -> list[dict[str, Any]]:
     """List fused datasets, grouped by policy hash, resolution, and spatial cluster.
 
     Args:
-        source: Filter by source type ("hydrate" or "tile"). If omitted, returns all.
+        source: Comma-separated source filter, e.g. "hydrate,fuse". If omitted, returns all.
     """
     root = _fused_zarr_root()
-    return _list_datasets_sync(root, source_filter=source)
+    sources = set(source.split(",")) if source else None
+    return _list_datasets_sync(root, source_filter=sources)
 
 
 def _mosaic_to_bin(
@@ -129,17 +150,21 @@ def _mosaic_to_bin(
     x_min: float,
     y_max: float,
     cluster_bbox: list[float] | None = None,
+    build_scale: float = 1.0,
 ) -> np.ndarray:
     """Paint zarr cells into a pre-allocated numpy canvas (north-first, row-major).
 
-    Instead of xr.combine_by_coords (which is slow and fragile with floating-point
-    coordinate misalignment), we allocate a single NaN-filled float32 grid and blit
-    each cell into the correct position using coordinate → index math.  This is
-    O(total_pixels) with zero intermediate copies, and naturally handles overlaps
-    (last-writer-wins, same as combine_first).
+    When *build_scale* < 1 the canvas is smaller than the natural full-resolution
+    grid.  Each cell is nearest-neighbour downsampled to match the coarser canvas
+    pixel size before blitting, and blit offsets are computed using the scaled dx/dy.
+    This avoids ever allocating the full-resolution canvas (which can be >2 GB for
+    large fine-resolution regions).
     """
     canvas = np.full((height, width), np.nan, dtype=np.float32)
     cells_painted = 0
+    # Canvas pixel size (coarser than native when build_scale < 1)
+    cdx = dx / build_scale if build_scale > 0 else dx
+    cdy = dy / build_scale if build_scale > 0 else dy
 
     for cell_path in sorted(policy_dir.glob("*.zarr")):
         try:
@@ -163,14 +188,24 @@ def _mosaic_to_bin(
             elev = ds["elevation"].values.astype(np.float32)
             ds.close()
 
-            # Compute pixel offsets into the canvas
-            # Canvas is north-first: row 0 = y_max
-            col_start = int(round((float(min(x_vals)) - x_min) / dx))
-            row_start = int(round((y_max - float(max(y_vals))) / dy))
+            # Replace nodata sentinels with NaN.  Zarr cells may store the
+            # float32 _FillValue (~-3.4e38) or PDAL nodata (-9999) as real
+            # float values instead of NaN, which would collapse the color scale.
+            elev[(elev < -20000.0) | (elev > 20000.0)] = np.nan
 
             # Ensure elevation is north-first (descending y)
             if len(y_vals) > 1 and y_vals[0] < y_vals[-1]:
                 elev = elev[::-1]
+
+            # Downsample cell to canvas resolution if needed
+            if build_scale < 0.999:
+                new_h = max(1, round(elev.shape[0] * build_scale))
+                new_w = max(1, round(elev.shape[1] * build_scale))
+                elev = _downsample_nearest(elev, new_h, new_w)
+
+            # Compute pixel offsets into the canvas using canvas pixel size
+            col_start = int(round((float(min(x_vals)) - x_min) / cdx))
+            row_start = int(round((y_max - float(max(y_vals))) / cdy))
 
             # Clip to canvas bounds (handles halo overlap)
             src_r0 = max(0, -row_start)
@@ -193,7 +228,9 @@ def _mosaic_to_bin(
         except Exception as e:
             logger.warning(f"Failed to paint cell {cell_path.name}: {e}")
 
-    logger.info(f"Mosaic complete: {cells_painted} cells -> {width}x{height} canvas")
+    logger.info(
+        f"Mosaic complete: {cells_painted} cells -> {width}x{height} canvas (scale={build_scale:.3f})"
+    )
     return canvas
 
 
@@ -206,14 +243,18 @@ def _mosaic_source_to_bin(
     x_min: float,
     y_max: float,
     cluster_bbox: list[float] | None = None,
+    build_scale: float = 1.0,
 ) -> np.ndarray:
     """Paint source_elevation IDs into a pre-allocated uint32 canvas (north-first).
 
     Mirrors _mosaic_to_bin but reads source_elevation instead of elevation.
     Each pixel stores the integer ID of the data provider that contributed it.
+    Supports *build_scale* for the same OOM-safe downsampled build path.
     """
     canvas = np.zeros((height, width), dtype=np.uint32)
     cells_painted = 0
+    cdx = dx / build_scale if build_scale > 0 else dx
+    cdy = dy / build_scale if build_scale > 0 else dy
 
     for cell_path in sorted(policy_dir.glob("*.zarr")):
         try:
@@ -240,11 +281,16 @@ def _mosaic_source_to_bin(
             src = ds["source_elevation"].values.astype(np.uint32)
             ds.close()
 
-            col_start = int(round((float(min(x_vals)) - x_min) / dx))
-            row_start = int(round((y_max - float(max(y_vals))) / dy))
-
             if len(y_vals) > 1 and y_vals[0] < y_vals[-1]:
                 src = src[::-1]
+
+            if build_scale < 0.999:
+                new_h = max(1, round(src.shape[0] * build_scale))
+                new_w = max(1, round(src.shape[1] * build_scale))
+                src = _downsample_nearest(src, new_h, new_w)
+
+            col_start = int(round((float(min(x_vals)) - x_min) / cdx))
+            row_start = int(round((y_max - float(max(y_vals))) / cdy))
 
             src_r0 = max(0, -row_start)
             src_c0 = max(0, -col_start)
@@ -265,7 +311,9 @@ def _mosaic_source_to_bin(
         except Exception as e:
             logger.warning(f"Failed to paint provenance cell {cell_path.name}: {e}")
 
-    logger.info(f"Provenance mosaic complete: {cells_painted} cells -> {width}x{height}")
+    logger.info(
+        f"Provenance mosaic complete: {cells_painted} cells -> {width}x{height} (scale={build_scale:.3f})"
+    )
     return canvas
 
 
@@ -286,8 +334,17 @@ def _cell_in_cluster(attrs: dict[str, Any], cluster_bbox: list[float] | None) ->
 
 
 @router.get("/datasets/{dataset_id}/meta")
-async def get_dataset_meta(dataset_id: str) -> dict[str, Any]:
-    """Return metadata for a fused dataset."""
+async def get_dataset_meta(
+    dataset_id: str,
+    max_dim: int | None = Query(None, ge=64, le=16384, description="Cap grid dimensions for LoD rendering"),
+) -> dict[str, Any]:
+    """Return metadata for a fused dataset.
+
+    When ``max_dim`` is supplied the returned ``width``, ``height``, ``dx``, and ``dy``
+    reflect the *downsampled* grid that ``elevation.bin`` and ``provenance.bin`` will
+    serve for the same ``max_dim`` value.  Pass the same value to all three endpoints
+    so buffer-length checks remain consistent.
+    """
     root = _fused_zarr_root()
     policy_prefix, dx, dy, cluster_bbox = _parse_dataset_id(root, dataset_id)
     policy_dir = _resolve_policy_dir(root, policy_prefix)
@@ -301,6 +358,7 @@ async def get_dataset_meta(dataset_id: str) -> dict[str, Any]:
     geo_bboxes: list[list[float]] = []
     crs = "EPSG:4326"
     legend = ""
+    provenance_dict: dict[str, Any] = {}
 
     for cell_path in cells:
         attrs = _read_cell_attrs(cell_path)
@@ -321,6 +379,9 @@ async def get_dataset_meta(dataset_id: str) -> dict[str, Any]:
             geo_bboxes.append(bb)
         crs = attrs.get("crs", crs)
         legend = attrs.get("policy_legend", legend)
+        cell_prov = attrs.get("provenance_dict", {})
+        if isinstance(cell_prov, dict):
+            provenance_dict.update(cell_prov)
 
     if cell_count == 0:
         raise HTTPException(status_code=404, detail="No cells at this resolution")
@@ -345,25 +406,62 @@ async def get_dataset_meta(dataset_id: str) -> dict[str, Any]:
         geo_dx = dx
         geo_dy = dy
 
+    # Inject tier-level fallback entries from policy_legend into provenance_dict so that
+    # pixels written with provider_id (tier number) don't show as "undefined".
+    # policy_legend is stored as a Python repr string e.g. "{1: 'ncei_bag', 2: 'ncei_cudem'}"
+    if legend:
+        try:
+            import ast
+
+            tier_map = ast.literal_eval(legend) if isinstance(legend, str) else legend
+            if isinstance(tier_map, dict):
+                for tier_id, provider_name in tier_map.items():
+                    key = str(tier_id)
+                    if key not in provenance_dict:
+                        provenance_dict[key] = {"name": provider_name, "provider": provider_name}
+        except Exception:
+            pass
+
+    # Apply hard build cap first (matches what the cached .bin is built at)
+    build_w, build_h, _build_scale = _clamp_dims(width, height, MOSAIC_BUILD_MAX_DIM)
+    build_dx = geo_dx / _build_scale if _build_scale > 0 else geo_dx
+    build_dy = geo_dy / _build_scale if _build_scale > 0 else geo_dy
+
+    # Then apply optional viewer-level LoD on top
+    out_w, out_h, lod_scale = _clamp_dims(build_w, build_h, max_dim)
+    out_dx = build_dx / lod_scale if lod_scale > 0 else build_dx
+    out_dy = build_dy / lod_scale if lod_scale > 0 else build_dy
+
     return {
-        "width": width,
-        "height": height,
+        "width": out_w,
+        "height": out_h,
+        "full_width": build_w,
+        "full_height": build_h,
+        "scale": lod_scale,
         "bounds": bounds,
-        "dx": geo_dx,
-        "dy": geo_dy,
+        "dx": out_dx,
+        "dy": out_dy,
         "crs": crs,
         "cell_count": cell_count,
         "policy_legend": legend,
+        "provenance_dict": provenance_dict,
     }
 
 
 @router.get("/datasets/{dataset_id}/elevation.bin")
-async def get_elevation_binary(dataset_id: str) -> Response:
+async def get_elevation_binary(
+    dataset_id: str,
+    max_dim: int | None = Query(None, ge=64, le=16384, description="Cap grid dimensions for LoD rendering"),
+) -> Response:
     """Return the mosaiced elevation grid as a raw Float32 binary (north-first).
 
     On first request, the mosaic is built by painting cells into a numpy canvas
     (no xr.combine_by_coords) and cached to disk as a .bin file.  Subsequent
     requests serve the cached file directly.
+
+    Pass ``max_dim`` to receive a nearest-neighbour downsampled grid whose longest
+    dimension is at most ``max_dim`` pixels.  The full-resolution ``.bin`` is always
+    cached on disk; downsampling is applied on the fly before sending the response.
     """
     root = _fused_zarr_root()
     policy_prefix, dx, dy, cluster_bbox = _parse_dataset_id(root, dataset_id)
@@ -378,6 +476,10 @@ async def get_elevation_binary(dataset_id: str) -> Response:
         try:
             cached = json.loads(cache_meta_file.read_text())
             current_cells = 0
+            x_min_check = float("inf")
+            x_max_check = float("-inf")
+            y_min_check = float("inf")
+            y_max_check = float("-inf")
             for cp in policy_dir.glob("*.zarr"):
                 a = _read_cell_attrs(cp)
                 if not a:
@@ -387,12 +489,27 @@ async def get_elevation_binary(dataset_id: str) -> Response:
                 if not _cell_in_cluster(a, cluster_bbox):
                     continue
                 current_cells += 1
-            if cached.get("cell_count") == current_cells:
+                x_min_check = min(x_min_check, a.get("_x_min", x_min_check))
+                x_max_check = max(x_max_check, a.get("_x_max", x_max_check))
+                y_min_check = min(y_min_check, a.get("_y_min", y_min_check))
+                y_max_check = max(y_max_check, a.get("_y_max", y_max_check))
+            if current_cells > 0:
+                natural_w = max(1, int(round((x_max_check - x_min_check) / dx)) + 1)
+                natural_h = max(1, int(round((y_max_check - y_min_check) / dy)) + 1)
+                expected_w, expected_h, _ = _clamp_dims(natural_w, natural_h, MOSAIC_BUILD_MAX_DIM)
+            else:
+                expected_w = expected_h = 0
+            if (
+                cached.get("cell_count") == current_cells
+                and cached.get("width") == expected_w
+                and cached.get("height") == expected_h
+            ):
                 cache_valid = True
             else:
                 logger.info(
-                    f"DEM mosaic cache stale: {cached.get('cell_count')} -> "
-                    f"{current_cells} cells, rebuilding"
+                    f"DEM mosaic cache stale: {cached.get('cell_count')} -> {current_cells} cells, "
+                    f"dims {cached.get('width')}x{cached.get('height')} -> "
+                    f"{expected_w}x{expected_h}, rebuilding"
                 )
         except Exception:
             pass
@@ -401,12 +518,13 @@ async def get_elevation_binary(dataset_id: str) -> Response:
         logger.info(f"DEM mosaic cache hit: {cache_bin.name}")
         content = cache_bin.read_bytes()
     else:
-        meta = await get_dataset_meta(dataset_id)
-        width = meta["width"]
-        height = meta["height"]
+        meta = await get_dataset_meta(dataset_id, max_dim=None)
 
+        # Scan cells to get canvas extents and natural (uncapped) pixel count
         x_min = float("inf")
-        y_max = float("-inf")
+        y_max_val = float("-inf")
+        x_max_scan = float("-inf")
+        y_min_scan = float("inf")
         for cell_path in sorted(policy_dir.glob("*.zarr")):
             attrs = _read_cell_attrs(cell_path)
             if attrs is None:
@@ -417,9 +535,23 @@ async def get_elevation_binary(dataset_id: str) -> Response:
             if not _cell_in_cluster(attrs, cluster_bbox):
                 continue
             x_min = min(x_min, attrs.get("_x_min", x_min))
-            y_max = max(y_max, attrs.get("_y_max", y_max))
+            y_max_val = max(y_max_val, attrs.get("_y_max", y_max_val))
+            x_max_scan = max(x_max_scan, attrs.get("_x_max", x_max_scan))
+            y_min_scan = min(y_min_scan, attrs.get("_y_min", y_min_scan))
 
-        canvas = _mosaic_to_bin(policy_dir, dx, dy, width, height, x_min, y_max, cluster_bbox)
+        # Derive natural (full-resolution) canvas dims, then cap at MOSAIC_BUILD_MAX_DIM
+        natural_w = max(1, int(round((x_max_scan - x_min) / dx)) + 1) if x_max_scan > x_min else 1
+        natural_h = max(1, int(round((y_max_val - y_min_scan) / dy)) + 1) if y_max_val > y_min_scan else 1
+        build_w, build_h, build_scale = _clamp_dims(natural_w, natural_h, MOSAIC_BUILD_MAX_DIM)
+
+        logger.info(
+            f"Building mosaic: natural {natural_w}x{natural_h} -> build {build_w}x{build_h} "
+            f"(scale={build_scale:.3f})"
+        )
+
+        canvas = _mosaic_to_bin(
+            policy_dir, dx, dy, build_w, build_h, x_min, y_max_val, cluster_bbox, build_scale
+        )
         content = canvas.tobytes()
 
         try:
@@ -427,29 +559,56 @@ async def get_elevation_binary(dataset_id: str) -> Response:
             cache_meta_file.write_text(
                 json.dumps(
                     {
-                        "width": width,
-                        "height": height,
+                        "width": build_w,
+                        "height": build_h,
                         "cell_count": meta["cell_count"],
                     }
                 )
             )
             logger.info(f"DEM mosaic cached: {cache_bin.name} ({len(content)} bytes)")
+            # Invalidate provenance bin — it shares the same meta file for cache
+            # validation, so after writing a new cell_count it would falsely appear
+            # valid even though it was built from the old (smaller) mosaic.
+            prov_bin = policy_dir / f"_mosaic_{dataset_id}_provenance.bin"
+            if prov_bin.exists():
+                prov_bin.unlink()
+                logger.info(f"Provenance mosaic cache invalidated: {prov_bin.name}")
         except Exception as e:
             logger.warning(f"Failed to cache mosaic: {e}")
+
+    # --- LoD downsampling (viewer-level, applied on top of the build-capped binary) ---
+    meta_for_lod = await get_dataset_meta(dataset_id, max_dim=None)
+    full_w, full_h = meta_for_lod["full_width"], meta_for_lod["full_height"]
+    out_w, out_h, _scale = _clamp_dims(full_w, full_h, max_dim)
+
+    if out_w != full_w or out_h != full_h:
+        canvas = np.frombuffer(content, dtype=np.float32).reshape(full_h, full_w)
+        canvas = _downsample_nearest(canvas, out_h, out_w)
+        content = canvas.tobytes()
+        logger.info(f"Elevation LoD: {full_w}x{full_h} -> {out_w}x{out_h} (max_dim={max_dim})")
 
     return Response(
         content=content,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={dataset_id}_elevation.bin"},
+        headers={
+            "Content-Disposition": f"attachment; filename={dataset_id}_elevation.bin",
+            "X-Grid-Width": str(out_w),
+            "X-Grid-Height": str(out_h),
+        },
     )
 
 
 @router.get("/datasets/{dataset_id}/provenance.bin")
-async def get_provenance_binary(dataset_id: str) -> Response:
+async def get_provenance_binary(
+    dataset_id: str,
+    max_dim: int | None = Query(None, ge=64, le=16384, description="Cap grid dimensions for LoD rendering"),
+) -> Response:
     """Return the mosaiced source_elevation grid as a raw Uint32 binary (north-first).
 
     Each pixel stores a source ID integer that maps to a provider name via the
     policy_legend in the dataset metadata. 0 = no data.
+
+    Pass ``max_dim`` to receive a nearest-neighbour downsampled grid (categorical-safe).
     """
     root = _fused_zarr_root()
     policy_prefix, dx, dy, cluster_bbox = _parse_dataset_id(root, dataset_id)
@@ -463,6 +622,10 @@ async def get_provenance_binary(dataset_id: str) -> Response:
         try:
             cached = json.loads(cache_meta_file.read_text())
             current_cells = 0
+            x_min_check = float("inf")
+            x_max_check = float("-inf")
+            y_min_check = float("inf")
+            y_max_check = float("-inf")
             for cp in policy_dir.glob("*.zarr"):
                 a = _read_cell_attrs(cp)
                 if not a:
@@ -472,7 +635,21 @@ async def get_provenance_binary(dataset_id: str) -> Response:
                 if not _cell_in_cluster(a, cluster_bbox):
                     continue
                 current_cells += 1
-            if cached.get("cell_count") == current_cells:
+                x_min_check = min(x_min_check, a.get("_x_min", x_min_check))
+                x_max_check = max(x_max_check, a.get("_x_max", x_max_check))
+                y_min_check = min(y_min_check, a.get("_y_min", y_min_check))
+                y_max_check = max(y_max_check, a.get("_y_max", y_max_check))
+            if current_cells > 0:
+                natural_w = max(1, int(round((x_max_check - x_min_check) / dx)) + 1)
+                natural_h = max(1, int(round((y_max_check - y_min_check) / dy)) + 1)
+                expected_w, expected_h, _ = _clamp_dims(natural_w, natural_h, MOSAIC_BUILD_MAX_DIM)
+            else:
+                expected_w = expected_h = 0
+            if (
+                cached.get("cell_count") == current_cells
+                and cached.get("width") == expected_w
+                and cached.get("height") == expected_h
+            ):
                 cache_valid = True
         except Exception:
             pass
@@ -481,12 +658,10 @@ async def get_provenance_binary(dataset_id: str) -> Response:
         logger.info(f"Provenance mosaic cache hit: {cache_bin.name}")
         content = cache_bin.read_bytes()
     else:
-        meta = await get_dataset_meta(dataset_id)
-        width = meta["width"]
-        height = meta["height"]
-
         x_min = float("inf")
-        y_max = float("-inf")
+        y_max_val = float("-inf")
+        x_max_scan = float("-inf")
+        y_min_scan = float("inf")
         for cell_path in sorted(policy_dir.glob("*.zarr")):
             attrs = _read_cell_attrs(cell_path)
             if attrs is None:
@@ -497,9 +672,17 @@ async def get_provenance_binary(dataset_id: str) -> Response:
             if not _cell_in_cluster(attrs, cluster_bbox):
                 continue
             x_min = min(x_min, attrs.get("_x_min", x_min))
-            y_max = max(y_max, attrs.get("_y_max", y_max))
+            y_max_val = max(y_max_val, attrs.get("_y_max", y_max_val))
+            x_max_scan = max(x_max_scan, attrs.get("_x_max", x_max_scan))
+            y_min_scan = min(y_min_scan, attrs.get("_y_min", y_min_scan))
 
-        canvas = _mosaic_source_to_bin(policy_dir, dx, dy, width, height, x_min, y_max, cluster_bbox)
+        natural_w = max(1, int(round((x_max_scan - x_min) / dx)) + 1) if x_max_scan > x_min else 1
+        natural_h = max(1, int(round((y_max_val - y_min_scan) / dy)) + 1) if y_max_val > y_min_scan else 1
+        build_w, build_h, build_scale = _clamp_dims(natural_w, natural_h, MOSAIC_BUILD_MAX_DIM)
+
+        canvas = _mosaic_source_to_bin(
+            policy_dir, dx, dy, build_w, build_h, x_min, y_max_val, cluster_bbox, build_scale
+        )
         content = canvas.tobytes()
 
         try:
@@ -508,10 +691,25 @@ async def get_provenance_binary(dataset_id: str) -> Response:
         except Exception as e:
             logger.warning(f"Failed to cache provenance mosaic: {e}")
 
+    # --- LoD downsampling ---
+    meta_for_dims = await get_dataset_meta(dataset_id, max_dim=None)
+    full_w, full_h = meta_for_dims["full_width"], meta_for_dims["full_height"]
+    out_w, out_h, _scale = _clamp_dims(full_w, full_h, max_dim)
+
+    if out_w != full_w or out_h != full_h:
+        canvas_u32 = np.frombuffer(content, dtype=np.uint32).reshape(full_h, full_w)
+        canvas_u32 = _downsample_nearest(canvas_u32, out_h, out_w)
+        content = canvas_u32.tobytes()
+        logger.info(f"Provenance LoD: {full_w}x{full_h} -> {out_w}x{out_h} (max_dim={max_dim})")
+
     return Response(
         content=content,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={dataset_id}_provenance.bin"},
+        headers={
+            "Content-Disposition": f"attachment; filename={dataset_id}_provenance.bin",
+            "X-Grid-Width": str(out_w),
+            "X-Grid-Height": str(out_h),
+        },
     )
 
 
@@ -556,7 +754,7 @@ def _parse_dataset_id(root: Path, dataset_id: str) -> tuple[str, float, float, l
     raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
 
 
-def _list_datasets_sync(root: Path, source_filter: str | None = None) -> list[dict[str, Any]]:
+def _list_datasets_sync(root: Path, source_filter: str | set[str] | None = None) -> list[dict[str, Any]]:
     """Synchronous version of list_datasets for internal use."""
     if not root.exists():
         return []
@@ -577,7 +775,9 @@ def _list_datasets_sync(root: Path, source_filter: str | None = None) -> list[di
             # Filter by source type if specified.
             # Cells without a source attr predate the source tag — treat as hydrate.
             cell_source = attrs.get("source", "hydrate")
-            if source_filter and cell_source != source_filter:
+            if source_filter and cell_source not in (
+                source_filter if isinstance(source_filter, set) else {source_filter}
+            ):
                 continue
             dx = attrs.get("_dx", 0)
             dy = attrs.get("_dy", 0)

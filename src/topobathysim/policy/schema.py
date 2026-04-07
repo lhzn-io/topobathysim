@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from topobathysim.providers.registry import registry
 
@@ -51,13 +51,13 @@ class FilterConfig(BaseModel):
     Configuration for data filtering, cleaning, and constraints.
     """
 
+    # Allow arbitrary extra fields for custom provider logic (like ncei_bag project_id)
+    model_config = ConfigDict(extra="allow")
+
     max_depth_change: float | None = None
     max_deviation: float | None = None
     min_elevation: float | None = None
     max_elevation: float | None = None
-
-    # Allow arbitrary extra fields for custom provider logic (like ncei_bag)
-    model_config = {"extra": "allow"}
 
 
 class CompositionStep(BaseModel):

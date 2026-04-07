@@ -19,9 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from topobathysim.config import get_cache_root
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_jobs_dir() -> Path:
@@ -71,9 +71,8 @@ def list_jobs(max_age_hours: float = 24) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     jobs = []
     for f in _ensure_jobs_dir().glob("*.json"):
-
         try:
-            state = json.loads(p.read_text())
+            state = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
         # Prune old completed/failed jobs
@@ -84,7 +83,7 @@ def list_jobs(max_age_hours: float = 24) -> list[dict[str, Any]]:
                 submitted_dt = submitted_dt.replace(tzinfo=timezone.utc)
             age_hours = (now - submitted_dt).total_seconds() / 3600
             if age_hours > max_age_hours and state.get("status") in ("completed", "failed"):
-                p.unlink(missing_ok=True)
+                f.unlink(missing_ok=True)
                 continue
         except (ValueError, TypeError):
             pass

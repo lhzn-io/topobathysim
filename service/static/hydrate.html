@@ -82,7 +82,7 @@
 <body>
     <div class="container">
         <h1>Hydrate Cache</h1>
-        <p>Select a region and resolution to pre-warm the fusion cache.</p>
+        <p>Select a region and resolution to pre-warm the fusion cache. &nbsp;|&nbsp; <a href="/cache-viewer.html">Cache Manager</a> &nbsp;|&nbsp; <a href="/dem-viewer.html">DEM Viewer</a></p>
 
         <form id="hydrateForm">
             <label>Bounding Box (West, South, East, North)</label>
@@ -180,6 +180,7 @@
 
             <div class="actions">
                 <button type="submit" id="submitBtn">Start Hydration Job</button>
+                <button type="button" id="cancelBtn" style="display:none; background:#c0392b; color:#fff; margin-left:8px;" onclick="cancelJob()">Cancel</button>
                 <div id="status"></div>
             </div>
         </form>
@@ -577,8 +578,29 @@
 
         init();
 
+        let _activeJobId = null;
+
+        function setCancelVisible(visible) {
+            document.getElementById('cancelBtn').style.display = visible ? 'inline-block' : 'none';
+        }
+
+        async function cancelJob() {
+            if (!_activeJobId) return;
+            const btn = document.getElementById('cancelBtn');
+            btn.disabled = true;
+            btn.innerText = 'Cancelling…';
+            try {
+                await fetch(`/hydrate/${_activeJobId}`, { method: 'DELETE' });
+            } catch (e) {
+                console.error('Cancel failed', e);
+            }
+            btn.disabled = false;
+            btn.innerText = 'Cancel';
+        }
+
         function renderJobStatus(data, resultDiv) {
             if (data.status === "completed") {
+                setCancelVisible(false);
                 const stats = data.stats || {};
                 resultDiv.className = "success";
                 resultDiv.innerHTML = `
@@ -588,6 +610,7 @@
                 `;
                 return true;
             } else if (data.status === "failed") {
+                setCancelVisible(false);
                 resultDiv.className = "error";
                 resultDiv.innerHTML = `
                     <strong>Failed</strong><br>
@@ -595,7 +618,13 @@
                     Error: ${data.error || 'Unknown'}
                 `;
                 return true;
+            } else if (data.status === "cancelled") {
+                setCancelVisible(false);
+                resultDiv.className = "error";
+                resultDiv.innerHTML = `<strong>Cancelled</strong> — Job ID: ${data.id}`;
+                return true;
             } else {
+                setCancelVisible(true);
                 const total = data.total_cells || 0;
                 const processed = (data.processed_cells || 0) + (data.cached_cells || 0);
                 const progress = total > 0 ? Math.round((processed / total) * 100) : 0;
@@ -643,6 +672,7 @@
         }
 
         function monitorJob(jobId, wsUrl) {
+            _activeJobId = jobId;
             const resultDiv = document.getElementById("status");
             if (wsUrl) {
                 monitorViaWebSocket(wsUrl, jobId, resultDiv);

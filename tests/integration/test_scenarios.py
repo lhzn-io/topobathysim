@@ -59,6 +59,7 @@ def xyz_to_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
 
 
 @pytest.mark.integration
+@pytest.mark.network
 @pytest.mark.parametrize(
     "z, x, y, expected_source_substr",
     [

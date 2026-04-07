@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import xarray as xr
 from pyproj import Transformer
 
@@ -17,6 +18,8 @@ maxx, maxy = transformer.transform(-73.08, 40.82)
 BOUNDS = (minx, miny, maxx, maxy)
 
 
+@pytest.mark.integration
+@pytest.mark.network
 def test_fetch_lidar_from_ept(persistent_cache_dir: Path) -> None:
     provider = LidarProvider(cache_dir=str(persistent_cache_dir))
     print(f"\nFetching from {EPT_URL}...")

@@ -20,6 +20,7 @@ def temp_cache_dir(tmp_path: Any) -> Any:
 
 
 @pytest.mark.integration
+@pytest.mark.network
 def test_usgs_3dep_clip_caching(temp_cache_dir: Any, caplog: Any) -> None:
     """
     Verify that USGS 3DEP fetches, clips, and caches to Zarr.
@@ -71,6 +72,7 @@ def test_usgs_3dep_clip_caching(temp_cache_dir: Any, caplog: Any) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.network
 def test_usgs_lidar_hybrid_caching(temp_cache_dir: Any, caplog: Any) -> None:
     """
     Verify USGS Lidar Hybrid Caching (LAZ + Zarr).

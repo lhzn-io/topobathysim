@@ -58,12 +58,11 @@ const ProvenanceOverlay = (() => {
                 return { id: 0, provider: 'No data', product: '', color: PALETTE[0] };
             }
             const entry = this.legend[String(id)] || this.legend[id];
-            const provider = entry
-                ? (entry.provider || entry.name || `Source ${id}`)
-                : `Source ${id}`;
-            const product = entry ? (entry.product || '') : '';
+            const name = entry ? (entry.name || entry.provider || `Source ${id}`) : `Source ${id}`;
+            const provider = entry ? (entry.provider || '') : '';
+            const resolution = (entry && entry.resolution && entry.resolution !== 'Unknown') ? entry.resolution : '';
             const color = PALETTE[id % PALETTE.length] || PALETTE[0];
-            return { id, provider, product, color };
+            return { id, name, provider, resolution, color };
         }
 
         /** Get RGB color [r, g, b] (0-1) for a pixel index. */
@@ -102,22 +101,29 @@ const ProvenanceOverlay = (() => {
             }
         }
 
-        /** Get sorted stats array [{id, provider, count, pct}]. */
+        /** Get sorted stats array [{id, provider, count, pct}], deduplicated by name. */
         getStats() {
             const total = this.width * this.height;
-            return Object.entries(this.stats)
-                .map(([id, count]) => {
-                    const info = this.query(parseInt(id));
-                    return {
-                        id: parseInt(id),
-                        provider: info.provider,
-                        product: info.product,
-                        count,
-                        pct: ((count / total) * 100).toFixed(1),
-                        color: info.color,
-                    };
-                })
-                .filter(s => s.id > 0)
+            const byName = new Map();
+            for (const [id, count] of Object.entries(this.stats)) {
+                const intId = parseInt(id);
+                if (intId === 0) continue;
+                // Look up legend directly by source ID — query() takes a pixel index,
+                // not a source ID, so calling query(intId) here was reading a random pixel.
+                const entry = this.legend[String(intId)] || this.legend[intId];
+                const name = entry ? (entry.name || entry.provider || `Source ${intId}`) : `Source ${intId}`;
+                const provider = entry ? (entry.provider || '') : '';
+                const resolution = (entry && entry.resolution && entry.resolution !== 'Unknown') ? entry.resolution : '';
+                const color = PALETTE[intId % PALETTE.length] || PALETTE[0];
+                const key = name;
+                if (byName.has(key)) {
+                    byName.get(key).count += count;
+                } else {
+                    byName.set(key, { id: intId, name, provider, resolution, count, color });
+                }
+            }
+            return Array.from(byName.values())
+                .map(s => ({ ...s, pct: ((s.count / total) * 100).toFixed(1) }))
                 .sort((a, b) => b.count - a.count);
         }
 
@@ -130,9 +136,10 @@ const ProvenanceOverlay = (() => {
             for (const s of stats) {
                 const [r, g, b] = s.color;
                 const css = `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`;
-                html += `<div style="display:flex; align-items:center; gap:5px; margin:2px 0;">`;
+                const label = s.resolution ? `${s.name} (${s.resolution})` : s.name;
+                html += `<div style="display:flex; align-items:center; gap:5px; margin:2px 0;" title="${s.name}">`;
                 html += `<span style="display:inline-block; width:10px; height:10px; background:${css}; border-radius:2px; flex-shrink:0;"></span>`;
-                html += `<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${s.provider}</span>`;
+                html += `<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${label}</span>`;
                 html += `<span style="color:var(--muted,#888); flex-shrink:0;">${s.pct}%</span>`;
                 html += `</div>`;
             }
@@ -146,9 +153,11 @@ const ProvenanceOverlay = (() => {
             if (info.id === 0) return '';
             const [r, g, b] = info.color;
             const css = `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`;
-            let html = `<span style="color:${css}; font-weight:600;">${info.provider}</span>`;
-            if (info.product) {
-                html += `<br><span style="color:var(--muted,#999); font-size:10px;">${info.product}</span>`;
+            let html = `<span style="color:${css}; font-weight:600;">${info.name}</span>`;
+            if (info.provider) {
+                html += `<br><span style="color:#ccc; font-size:10px;">${info.provider}`;
+                if (info.resolution) html += ` · ${info.resolution}`;
+                html += `</span>`;
             }
             return html;
         }

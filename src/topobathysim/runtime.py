@@ -20,8 +20,6 @@ import xarray as xr
 from affine import Affine
 from pyproj import CRS, Transformer
 
-from .config import get_cache_root
-from .operators.blend import metric_feather, overwrite
 from topobathysim.policy.loader import (
     generate_provider_legend,
     hash_policy,
@@ -31,6 +29,9 @@ from topobathysim.policy.loader import (
 from topobathysim.policy.schema import OperatorType
 from topobathysim.providers.base import ProviderNoDataError
 from topobathysim.providers.registry import registry
+
+from .config import get_cache_root
+from .operators.blend import metric_feather, overwrite
 
 logger = logging.getLogger(__name__)
 
@@ -422,7 +423,6 @@ def get_fused_cache_info(
     This centralized function ensures metadata parity across all endpoints.
     """
     import json
-    import os
 
     policy = _resolve_policy(policy_input)
     target_crs = policy.crs
@@ -594,6 +594,18 @@ def hydrate(
                 halo_pct=0.10,
             )
 
+            # Refuse to cache a cell where every elevation pixel is NaN.
+            # This happens when a provider's network fetch fails mid-read (e.g. presigned
+            # URL expiry causing 403s).  An all-NaN zarr would be treated as a valid cache
+            # hit on the next hydrate run, permanently locking in the hole.
+            elev_valid = int(ds_cell["elevation"].notnull().sum()) if "elevation" in ds_cell else 0
+            if elev_valid == 0:
+                logger.warning(
+                    f"Cell {cell_bbox} returned all-NaN elevation — skipping cache write "
+                    f"so it will be retried on next hydrate."
+                )
+                return "failed"
+
             new_attrs: dict[str, object] = {
                 "policy_hash": key_hash,
                 "policy_legend": str(legend),
@@ -702,6 +714,7 @@ def run(
     time: datetime | None = None,
     use_cache: bool = True,
     target_zoom: int | None = None,
+    source: str = "fuse",
 ) -> xr.Dataset:
     """
     Execute a fusion policy to generate a topobathymetric dataset.
@@ -764,7 +777,6 @@ def run(
     cells, grid_cell_size = _get_grid_cells(bbox, target_crs)
 
     # For caching
-    import os
 
     cache_dir = get_cache_root() / "fused_zarr"
 
@@ -830,7 +842,7 @@ def run(
                 "crs": target_crs,
                 "created_at": datetime.utcnow().isoformat(),
                 "cell_bbox": list(cell_bbox),
-                "source": "tile",
+                "source": source,
                 "resolution_m": round(resolution if resolution else 30.0, 4),
             }
             if target_zoom is not None:

@@ -80,11 +80,12 @@ test = "pytest {args:tests}"
 cov = "pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=src/topobathysim --cov=tests {args:tests}"
 
 [tool.pytest.ini_options]
-addopts = "-v"
+addopts = "-v -m 'not network'"
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "integration: mark a test as an integration test",
+    "network: mark a test as requiring heavy external network/API access",
 ]
 filterwarnings = [
     "ignore::pydantic.warnings.PydanticDeprecatedSince20",

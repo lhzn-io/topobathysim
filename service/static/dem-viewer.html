@@ -342,7 +342,7 @@ window.setRenderMode = function(mode) {
 async function populateDatasets() {
     try {
         const showTiles = document.getElementById('show-tiles')?.checked;
-        const url = showTiles ? '/api/v1/dem/datasets' : '/api/v1/dem/datasets?source=hydrate';
+        const url = showTiles ? '/api/v1/dem/datasets' : '/api/v1/dem/datasets?source=hydrate&source=fuse';
         const res = await fetch(url);
         const datasets = await res.json();
         const sel = document.getElementById('dataset-select');
@@ -396,15 +396,23 @@ window.loadDataset = async function() {
     overlay.style.display = 'flex';
 
     try {
+        // Cap the grid to ~2× the screen's longest dimension so the browser
+        // never has to process more pixels than it can actually display.
+        // The server will nearest-neighbour downsample to this size on the fly.
+        const screenMax = Math.max(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
+        const maxDim = Math.min(4096, Math.max(512, Math.round(screenMax * 1.5)));
+        const lodParam = `?max_dim=${maxDim}`;
+
         loadMsg.textContent = 'Fetching metadata...';
-        const metaRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/meta`);
+        const metaRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/meta${lodParam}`);
         if (!metaRes.ok) throw new Error(`Metadata error (${metaRes.status}): ${await metaRes.text()}`);
         const meta = await metaRes.json();
 
         const sizeMB = ((meta.width * meta.height * 4) / 1e6).toFixed(1);
-        loadMsg.textContent = `Mosaicing ${meta.cell_count} cells (${meta.width}x${meta.height}, ~${sizeMB} MB)...`;
+        const lodNote = meta.scale < 0.99 ? ` @ ${(meta.scale * 100).toFixed(0)}% LoD` : '';
+        loadMsg.textContent = `Mosaicing ${meta.cell_count} cells (${meta.width}x${meta.height}${lodNote}, ~${sizeMB} MB)...`;
 
-        const binRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/elevation.bin`);
+        const binRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/elevation.bin${lodParam}`);
         if (!binRes.ok) throw new Error(`DEM error (${binRes.status}): ${await binRes.text()}`);
         const buffer = new Float32Array(await binRes.arrayBuffer());
 
@@ -422,9 +430,12 @@ window.loadDataset = async function() {
             if (buffer[i] > maxZ) maxZ = buffer[i];
         }
 
+        const lodSuffix = meta.scale < 0.99
+            ? ` (LoD ${(meta.scale * 100).toFixed(0)}%, full: ${meta.full_width}x${meta.full_height})`
+            : '';
         document.getElementById('stats').innerHTML =
             `<b>${policyPrefix}</b> (${meta.cell_count} cells)<br>` +
-            `Grid: ${meta.width} x ${meta.height} (${(buffer.length / 1e6).toFixed(1)}M cells)<br>` +
+            `Grid: ${meta.width} x ${meta.height} (${(buffer.length / 1e6).toFixed(1)}M cells)${lodSuffix}<br>` +
             `Bounds: ${meta.bounds[0].toFixed(4)}, ${meta.bounds[1].toFixed(4)} &rarr; ${meta.bounds[2].toFixed(4)}, ${meta.bounds[3].toFixed(4)}<br>` +
             `CRS: ${meta.crs}<br>` +
             `Elevation: ${minZ.toFixed(2)}m to ${maxZ.toFixed(2)}m<br>` +
@@ -438,10 +449,10 @@ window.loadDataset = async function() {
         // Fetch provenance data (non-blocking)
         loadMsg.textContent = 'Loading provenance...';
         try {
-            const provRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/provenance.bin`);
+            const provRes = await fetch(`/api/v1/dem/datasets/${policyPrefix}/provenance.bin${lodParam}`);
             if (provRes.ok) {
                 const provBuf = new Uint32Array(await provRes.arrayBuffer());
-                const legend = meta.policy_legend || {};
+                const legend = meta.provenance_dict || meta.policy_legend || {};
                 provenanceOverlay = new ProvenanceOverlay(provBuf, legend, meta.width, meta.height);
                 document.getElementById('provenance-stats').innerHTML = provenanceOverlay.statsHTML();
             }
@@ -487,9 +498,9 @@ canvas.addEventListener('mousemove', (event) => {
         document.getElementById('tt-elev').textContent = isNaN(z) ? 'NaN (no data)' : `${z.toFixed(3)} m`;
         document.getElementById('tt-coord').textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
 
-        // Show provenance on Shift+hover or in provenance mode
+        // Always show provenance source in tooltip when available
         const srcEl = document.getElementById('tt-source');
-        if (provenanceOverlay && (event.shiftKey || renderMode === 'provenance')) {
+        if (provenanceOverlay) {
             const pi = geo.userData.pixelIndices ? geo.userData.pixelIndices[nearest] : nearest;
             srcEl.innerHTML = provenanceOverlay.tooltipHTML(pi);
         } else {

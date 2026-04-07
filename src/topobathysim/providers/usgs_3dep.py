@@ -7,7 +7,6 @@ and 'nasadem' collections.
 """
 
 import logging
-import os
 import random
 import time
 from pathlib import Path
@@ -19,8 +18,8 @@ import xarray as xr
 from pystac_client import Client
 from rioxarray.merge import merge_arrays
 
-from ..manifest import OfflineManifest
 from ..config import get_cache_root
+from ..manifest import OfflineManifest
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -41,6 +40,7 @@ class Usgs3DepProvider(Provider):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cast(Usgs3DepProvider, cls._instance)
+
     def __init__(self, cache_dir: str | Path | None = None, offline_mode: bool = False) -> None:
         """
         Initialize the 3DEP provider.
@@ -263,6 +263,23 @@ class Usgs3DepProvider(Provider):
             manifest_items = self.manifest.find_items(collection_id, bounds)
 
             if manifest_items:
+                # Planetary Computer SAS tokens (sig=, se=, sv=) expire in ~1 hour.
+                # If any cached href contains a token signature, skip the manifest and
+                # re-query STAC to get fresh signed URLs rather than hitting a guaranteed 403.
+                def _has_signed_token(href: str) -> bool:
+                    return any(p in href for p in ("sig=", "%3D&se=", "se=", "&sv="))
+
+                stale = [m for m in manifest_items if _has_signed_token(m["href"])]
+                if stale:
+                    logger.info(
+                        f"Manifest contains {len(stale)} SAS-signed URL(s) for {collection_id} "
+                        f"— skipping manifest and re-querying STAC for fresh tokens."
+                    )
+                    for s in stale:
+                        self.manifest.remove_item_by_href(s["href"])
+                    manifest_items = [m for m in manifest_items if not _has_signed_token(m["href"])]
+
+            if manifest_items:
                 items = [
                     {"href": m["href"], "bbox": m["bbox"], "properties": m.get("properties")}
                     for m in manifest_items
@@ -286,7 +303,7 @@ class Usgs3DepProvider(Provider):
 
             for item in items:
                 href = item["href"]
-                max_retries = 1
+                max_retries = 3
 
                 for retry in range(max_retries + 1):
                     try:
@@ -311,56 +328,41 @@ class Usgs3DepProvider(Provider):
                             abs_valid_limit=100000.0,
                         )
 
-                        # --- WRITE TO ZARR CACHE ---
-                        # We stream the specific item to a local Zarr to avoid re-streaming
-                        if True:  # Was try/except, but we handle errors internally now
-                            # CRITICAL: Clip to requested bounds BEFORE caching
-                            # Otherwise we download the entire 1x1 degree COG (GBs of data)
-                            # for a tiny request.
-                            try:
-                                from rasterio.warp import transform_bounds
+                        # CRITICAL: Clip to requested bounds before collecting.
+                        # Otherwise we would hold the entire 1x1 degree COG in memory.
+                        try:
+                            from rasterio.warp import transform_bounds
 
-                                source_crs = da.rio.crs
-                                clip_bbox = bounds
-                                clip_crs = "EPSG:4326"
+                            source_crs = da.rio.crs
+                            clip_bbox = bounds
+                            clip_crs = "EPSG:4326"
 
-                                if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
-                                    try:
-                                        clip_bbox = transform_bounds("EPSG:4326", source_crs, *bounds)
-                                        clip_crs = source_crs
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"Failed to reproject bbox to {source_crs}: {e}. "
-                                            f"Retrying with EPSG:4326."
-                                        )
+                            if source_crs and source_crs.to_string() not in ["EPSG:4326", "EPSG:4269"]:
+                                try:
+                                    clip_bbox = transform_bounds("EPSG:4326", source_crs, *bounds)
+                                    clip_crs = source_crs
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to reproject bbox to {source_crs}: {e}. "
+                                        f"Retrying with EPSG:4326."
+                                    )
 
-                                da = da.rio.clip_box(
-                                    *clip_bbox, crs=clip_crs, allow_one_dimensional_raster=True
-                                )
-                            except Exception as e:
-                                # If clip fails (no overlap?), this item is useless for the requested bbox.
-                                # Skip it to avoid downloading huge irrelevant files.
-                                logger.debug(
-                                    f"Clip FAILED for {href} with bounds {bounds}: {e}. Skipping item."
-                                )
-                                continue
+                            da = da.rio.clip_box(*clip_bbox, crs=clip_crs, allow_one_dimensional_raster=True)
+                        except Exception as e:
+                            # No overlap — skip this tile.
+                            logger.debug(f"Clip FAILED for {href} with bounds {bounds}: {e}. Skipping item.")
+                            continue
 
-                            # Check if the result is actually reduced
-                            if da.size > 100_000_000:  # Arbitrary large size
-                                logger.warning(
-                                    f"3DEP Asset {href} is too large {da.size} after clip "
-                                    "(or clip failed). Skipping Zarr cache to avoid stall."
-                                )
-                                # We treat this as a failure to cache.
+                        if da.size > 100_000_000:
+                            logger.warning(
+                                f"3DEP Asset {href} is unexpectedly large ({da.size} pixels) after clip. "
+                                "Skipping to avoid stall."
+                            )
+                            continue
 
-                            # 1. Provide Feedback: Remove stale item
-                            self.manifest.remove_item_by_href(href)
-
-                            # 2. Refresh: Force Query API
-                            # We query the specific item's bbox to get a fresh token for it
-                            item_bbox = tuple(item.get("bbox", bounds))
-
-                            # ... match context ...
+                        items_found.append(item)
+                        das.append(da)
+                        break  # success — exit retry loop, move to next item
 
                     except Exception as e:
                         err_msg = str(e)
@@ -375,7 +377,7 @@ class Usgs3DepProvider(Provider):
                                 f"Network Error streaming {href}: {err_msg.split('Caused by')[-1].strip()}"
                             )
                             if retry < max_retries:
-                                time.sleep(1.0)
+                                time.sleep(2**retry + random.uniform(0.1, 1.0))
                                 continue
                             else:
                                 logger.error(f"Failed to stream {href} after ({max_retries}) retries.")

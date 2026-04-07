@@ -17,6 +17,7 @@ EXECUTION_ROCKS_LON = -73.7369
 
 
 @pytest.mark.integration
+@pytest.mark.network
 def test_bluetopo_real_integration(tmp_path: Path) -> None:
     """Run an integration test against real NOAA BlueTopo APIs."""
 

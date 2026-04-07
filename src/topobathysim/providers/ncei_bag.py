@@ -20,12 +20,11 @@ import requests  # type: ignore
 import rioxarray as rxr
 import xarray as xr
 from filelock import FileLock
-from rioxarray.merge import merge_arrays
 
+from ..config import get_cache_root
 from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumNoDataError, VDatumResolver
-from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
@@ -1099,7 +1098,42 @@ class BAGProvider(Provider):
         # Previous approach accumulated all clipped tiles in a list before merging,
         # which OOM'd for dense survey areas (30+ tiles x ~800MB each = 24GB+).
         # Now each tile is merged into an accumulator immediately and freed.
+        #
+        # The accumulator is pre-initialized to cover the FULL cell bbox at the
+        # target resolution. Without this, the first tile's smaller footprint would
+        # become the accumulator grid and all subsequent tiles would be clipped to it
+        # via reproject_match, silently dropping coverage outside the first tile.
         merged_ds: xr.Dataset | None = None
+        if crs and resolution and "EPSG:4326" not in crs:
+            try:
+                from pyproj import Transformer
+
+                _t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                _x0, _y0 = _t.transform(west, south)
+                _x1, _y1 = _t.transform(east, north)
+                _x0, _x1 = min(_x0, _x1), max(_x0, _x1)
+                _y0, _y1 = min(_y0, _y1), max(_y0, _y1)
+                _nx = max(1, int(round((_x1 - _x0) / resolution)))
+                _ny = max(1, int(round((_y1 - _y0) / resolution)))
+                _xs = np.linspace(_x0 + resolution / 2, _x1 - resolution / 2, _nx)
+                _ys = np.linspace(_y1 - resolution / 2, _y0 + resolution / 2, _ny)  # N→S
+                _empty_elev = xr.DataArray(
+                    np.full((1, _ny, _nx), np.nan, dtype=np.float32),
+                    dims=["band", "y", "x"],
+                    coords={"band": [1], "y": _ys, "x": _xs},
+                )
+                _empty_src = xr.DataArray(
+                    np.zeros((1, _ny, _nx), dtype=np.uint32),
+                    dims=["band", "y", "x"],
+                    coords={"band": [1], "y": _ys, "x": _xs},
+                )
+                _empty_elev.rio.write_crs(crs, inplace=True)
+                _empty_src.rio.write_crs(crs, inplace=True)
+                merged_ds = xr.Dataset({"elevation": _empty_elev, "source_id": _empty_src})
+                logger.debug(f"BAG accumulator pre-initialized: {_nx}x{_ny} @ {resolution}m ({crs})")
+            except Exception as _e:
+                logger.debug(f"BAG accumulator pre-init skipped: {_e}")
+
         provenance_dict: dict[int, dict[str, str]] = {}
         tiles_merged = 0
         _log_mem(f"BAG fetch start ({len(urls)} urls)")
@@ -1194,17 +1228,52 @@ class BAGProvider(Provider):
                 del da_work
 
                 # --- Incremental merge: fold this tile into the accumulator ---
+                # Strategy: reproject each incoming tile onto the accumulator's fixed
+                # coordinate grid, then fill NaN holes via in-place numpy masking.
+                # This avoids merge_arrays(), which allocates a full output copy of
+                # the union extent alongside both inputs — 3x peak memory per merge step.
                 tiles_merged += 1
                 if merged_ds is None:
                     merged_ds = p_ds
                 else:
                     try:
-                        merged_elev = merge_arrays([merged_ds["elevation"], p_ds["elevation"]])
-                        merged_src = merge_arrays([merged_ds["source_id"], p_ds["source_id"]])
-                        merged_ds = xr.Dataset({"elevation": merged_elev, "source_id": merged_src})
-                        del merged_elev, merged_src
+                        import gc
+
+                        from rasterio.enums import Resampling
+
+                        # Align incoming tile to the accumulator grid. reproject_match
+                        # uses the accumulator's exact pixel grid so no union expansion occurs.
+                        p_elev_aligned = p_ds["elevation"].rio.reproject_match(
+                            merged_ds["elevation"],
+                            resampling=Resampling.bilinear,
+                        )
+                        # Pixels where accumulator is NaN and tile has valid data
+                        fill_mask = (
+                            np.isnan(merged_ds["elevation"].values) & np.isfinite(p_elev_aligned.values)
+                        ).squeeze()
+                        merged_ds["elevation"].values.squeeze()[fill_mask] = p_elev_aligned.values.squeeze()[
+                            fill_mask
+                        ]
+                        del p_elev_aligned
+                        gc.collect()
+
+                        # Same for source_id — nearest resampling preserves integer IDs
+                        try:
+                            p_src_aligned = p_ds["source_id"].rio.reproject_match(
+                                merged_ds["source_id"],
+                                resampling=Resampling.nearest,
+                            )
+                            merged_ds["source_id"].values.squeeze()[fill_mask] = (
+                                p_src_aligned.values.squeeze()[fill_mask].astype(np.uint32)
+                            )
+                            del p_src_aligned
+                        except Exception as e_src:
+                            logger.warning(
+                                f"Source ID merge failed for {filename} " f"(elevation merged OK): {e_src}"
+                            )
+                        del fill_mask
                     except Exception as e:
-                        logger.warning(f"Incremental merge failed for {filename}: {e}")
+                        logger.error(f"Incremental merge failed for {filename}, tile skipped: {e}")
                 del p_ds
 
                 if tiles_merged % 10 == 0:
