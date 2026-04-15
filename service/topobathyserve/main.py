@@ -1707,8 +1707,6 @@ async def trigger_hydrate(
         "status": "accepted",
         "message": "Hydration task started in subprocess",
         "job_id": job_id,
-        "ws": f"ws://{os.environ.get('TOPOBATHY_HOST', 'localhost')}:"
-        f"{os.environ.get('TOPOBATHY_PORT', '9595')}/hydrate/{job_id}/ws",
         "bbox": list(request.bbox),
         "resolution": request.resolution,
         "timestamp": start_time.isoformat(),
