@@ -31,7 +31,8 @@
             width: 100%; padding: 6px; background: #2a4a7a; border: none; border-radius: 4px;
             color: #ddd; cursor: pointer; font-size: 13px; margin-top: 4px;
         }
-        button:hover { background: #3a5a9a; }
+        button:hover:not(:disabled) { background: #3a5a9a; }
+        button:disabled { background: #333 !important; color: #555 !important; cursor: not-allowed; opacity: 0.6; }
         #stats { font-size: 11px; color: #666; margin-top: 10px; padding-top: 8px; border-top: 1px solid #222; line-height: 1.5; }
         #error-msg { color: #f55; font-size: 12px; margin-top: 8px; display: none; }
 
@@ -59,8 +60,7 @@
         #loading-overlay .spinner {
             width: 40px; height: 40px; border: 3px solid #333; border-top-color: #5af;
             border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 16px;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        }        #loading-msg { text-align: center; white-space: pre-wrap; line-height: 1.4; }        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -111,6 +111,12 @@
         <div class="toggle-btn" id="btn-prov" onclick="setRenderMode('provenance')">Provenance</div>
     </div>
 
+    <div class="ctrl" style="margin-top:10px;">
+        <label>Quality Diagnostics</label>
+        <button id="btn-quality" disabled onclick="window.runQualityReport()" style="background:#5af; color:#000;">Run Quality Report</button>
+        <div id="quality-stats" style="font-size:11px; color:#5af; margin-top:8px; display:none;"></div>
+    </div>
+
     <div id="provenance-stats"></div>
     <div id="stats">Select a dataset and click Load.</div>
     <div id="error-msg"></div>
@@ -120,6 +126,14 @@
     <div class="elev" id="tt-elev"></div>
     <div class="coord" id="tt-coord"></div>
     <div class="source" id="tt-source" style="font-size:11px; margin-top:2px;"></div>
+</div>
+
+<div id="context-modal" style="display:none; position:absolute; z-index:50; background:rgba(20,20,30,0.95); padding:16px; border:1px solid rgba(255,255,255,0.15); border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,0.8); width:500px; color:#ddd; font-size:12px; pointer-events:auto; overflow:hidden;">
+    <div style="display:flex; justify-content:space-between; margin-bottom:12px; border-bottom:1px solid #333; padding-bottom:8px;">
+        <h3 style="margin:0; font-size:14px; color:#5af;" id="cm-title">Surveys at Point</h3>
+        <button onclick="document.getElementById('context-modal').style.display='none'" style="background:none; border:none; color:#888; cursor:pointer; width:auto; padding:0; font-size:16px; line-height:1;">&times;</button>
+    </div>
+    <div id="cm-content" style="max-height:400px; overflow-y:auto; padding-right:8px;">Loading...</div>
 </div>
 
 <canvas id="canvas"></canvas>
@@ -342,7 +356,7 @@ window.setRenderMode = function(mode) {
 async function populateDatasets() {
     try {
         const showTiles = document.getElementById('show-tiles')?.checked;
-        const url = showTiles ? '/api/v1/dem/datasets' : '/api/v1/dem/datasets?source=hydrate&source=fuse';
+        const url = showTiles ? '/api/v1/dem/datasets' : '/api/v1/dem/datasets?source=hydrate,fuse';
         const res = await fetch(url);
         const datasets = await res.json();
         const sel = document.getElementById('dataset-select');
@@ -460,6 +474,13 @@ window.loadDataset = async function() {
             console.warn('Provenance load failed:', e);
         }
 
+        const btn = document.getElementById('btn-quality');
+        btn.disabled = false;
+        btn.style.background = '#5af';
+        btn.style.color = '#000';
+        document.getElementById('quality-stats').style.display = 'none';
+        if (qualityGroup) scene.remove(qualityGroup);
+
     } catch (err) {
         document.getElementById('error-msg').textContent = err.message;
         document.getElementById('error-msg').style.display = 'block';
@@ -469,7 +490,7 @@ window.loadDataset = async function() {
 };
 
 // ── UI Bindings ──
-document.getElementById('z-exag').addEventListener('input', rebuildMesh);
+document.getElementById('z-exag').addEventListener('input', () => { rebuildMesh(); window.updateQualityScale(); });
 document.getElementById('z-min').addEventListener('change', rebuildMesh);
 document.getElementById('z-max').addEventListener('change', rebuildMesh);
 document.getElementById('decimation').addEventListener('input', rebuildMesh);
@@ -516,6 +537,127 @@ canvas.addEventListener('mousemove', (event) => {
 });
 canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
 
+let rightMouseDownTime = 0;
+canvas.addEventListener('mousedown', (event) => {
+    if (event.button === 2) {
+        rightMouseDownTime = Date.now();
+    }
+});
+
+canvas.addEventListener('contextmenu', async (event) => {
+    event.preventDefault(); // prevent default browser right-click menu
+
+    if (Date.now() - rightMouseDownTime > 500) return; // user was dragging/rotating
+
+    if (!demData) return;
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = solidMesh ? raycaster.intersectObject(solidMesh) : [];
+
+    let lon, lat;
+
+    if (intersects.length > 0) {
+        const hit = intersects[0];
+        const geo = hit.object.geometry;
+        const { lonlats } = geo.userData;
+        const idx = geo.index.array;
+        const a = idx[hit.faceIndex * 3], b = idx[hit.faceIndex * 3 + 1], c = idx[hit.faceIndex * 3 + 2];
+        const pos = geo.attributes.position;
+        let nearest = a, nearestDist = Infinity;
+        for (const vi of [a, b, c]) {
+            const dx = pos.getX(vi) - hit.point.x, dy = pos.getY(vi) - hit.point.y, dz = pos.getZ(vi) - hit.point.z;
+            const d = dx*dx + dy*dy + dz*dz;
+            if (d < nearestDist) { nearestDist = d; nearest = vi; }
+        }
+        lon = lonlats[nearest * 2];
+        lat = lonlats[nearest * 2 + 1];
+    } else {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        const target = new THREE.Vector3();
+        if (!raycaster.ray.intersectPlane(plane, target)) return;
+
+        const { bounds } = demData.meta;
+        const [lonMin, latMin, lonMax, latMax] = bounds;
+        const lonCenter = (lonMin + lonMax) / 2;
+        const latCenter = (latMin + latMax) / 2;
+        const cosLat = Math.cos(latCenter * Math.PI / 180);
+        const degToM = 111320;
+        const sceneScale = 0.01;
+
+        lon = (target.x / (cosLat * degToM * sceneScale)) + lonCenter;
+        lat = latCenter - (target.z / (degToM * sceneScale));
+
+        if (lon < lonMin || lon > lonMax || lat < latMin || lat > latMax) return;
+    }
+
+    const modal = document.getElementById('context-modal');
+        const content = document.getElementById('cm-content');
+        const title = document.getElementById('cm-title');
+
+        // Position modal within screen bounds
+        modal.style.display = 'block';
+        let left = event.clientX + 10;
+        let top = event.clientY + 10;
+        if (left + 500 > window.innerWidth) left = window.innerWidth - 520;
+        if (top + 400 > window.innerHeight) top = window.innerHeight - 420;
+        modal.style.left = left + 'px';
+        modal.style.top = top + 'px';
+
+        title.innerHTML = `Coverage at ${lat.toFixed(5)}, ${lon.toFixed(5)} <span style="font-size:11px;color:#888;margin-left:8px;">Running API...</span>`;
+        content.innerHTML = '<div style="padding:20px;text-align:center;"><div class="spinner" style="margin:0 auto 10px;width:24px;height:24px;border-width:2px;border-top-color:#5af;border-left-color:#333;border-bottom-color:#333;border-right-color:#333;border-radius:50%;animation:spin 0.8s linear infinite;"></div>Querying Providers...</div>';
+
+        try {
+            const eps = 0.0001; // roughly ~10m box
+            const policy_name = document.getElementById('dataset-select').value.split('_')[0]; // eg. 4ab84328 from hash, OR actual name if it's the default wlis
+            // wait we can use demData.meta.policy
+            const activePolicy = demData?.meta?.policy || 'wlis.yaml';
+
+            const res = await fetch('/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    bbox: [lon - eps, lat - eps, lon + eps, lat + eps],
+                    resolution: 30.0,
+                    policy_name: activePolicy.replace('.yaml', '')
+                })
+            });
+
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+
+            let html = '';
+            for (const step of (data.providers || [])) {
+                html += `<div style="margin-bottom:12px;background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;">
+                    <strong style="color:#5af;font-size:13px;text-transform:uppercase;">${step.provider}</strong>
+                    <div style="margin-top:4px;display:flex;flex-direction:column;gap:4px;">`;
+
+                if (!step.items || step.items.length === 0) {
+                    html += `<div style="color:#888;">No intersecting features found.</div>`;
+                } else {
+                    for (const item of step.items) {
+                        const color = item.included ? '#0f0' : '#f55';
+                        const check = item.included ? '&#10003;' : '&#10007;';
+                        html += `<div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px;margin-bottom:4px;">
+                             <div style="flex:1;padding-right:8px;">
+                               <div style="color:${item.included?'#ddd':'#888'};font-weight:600;font-family:monospace;word-break:break-all;">${item.name}</div>
+                               ${!item.included ? `<div style="color:#f55;font-size:10px;margin-top:2px;">Filtered: ${item.reason}</div>` : ''}
+                             </div>
+                             <div style="color:${color};font-weight:bold;margin-left:8px;font-size:14px;">${check}</div>
+                        </div>`;
+                    }
+                }
+                html += `</div></div>`;
+            }
+
+            title.innerHTML = `Coverage at ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+            content.innerHTML = html || 'No data found.';
+
+        } catch (err) {
+            content.innerHTML = `<div style="color:#f55">Failed to load: ${err.message}</div>`;
+        }
+});
+
 // ── WASD Movement ──
 const keysDown = {};
 const MOVE_SPEED = 2.0;
@@ -544,6 +686,112 @@ window.addEventListener('resize', () => { camera.aspect = window.innerWidth / wi
 function animate() { requestAnimationFrame(animate); applyWASD(); controls.update(); renderer.render(scene, camera); }
 animate();
 populateDatasets();
+let qualityGroup = null;
+
+window.runQualityReport = async function() {
+    if (!demData) {
+        alert("Please load a DEM dataset first.");
+        return;
+    }
+    const bounds = demData.meta.bounds;
+    // Calculate exact resolution based on grid.
+    // bounds: minLon, minLat, maxLon, maxLat
+    // width: num pixels x
+    const dx = Math.abs(bounds[2] - bounds[0]) / demData.meta.width;
+    const dy = Math.abs(bounds[3] - bounds[1]) / demData.meta.height;
+
+    // We approximate metric resolution by looking at mid latitude
+    const midLat = (bounds[1] + bounds[3]) / 2.0;
+    const latRad = midLat * Math.PI / 180;
+    const resMetersX = dx * 111320 * Math.cos(latRad);
+    const resMetersY = dy * 111320;
+    const resMeters = Math.max(resMetersX, resMetersY).toFixed(1);
+
+    const btn = document.getElementById('btn-quality');
+    btn.innerText = 'Calculating...';
+    btn.disabled = true;
+
+    const overlay = document.getElementById('loading-overlay');
+    const loadMsg = document.getElementById('loading-msg');
+    loadMsg.innerText = 'Calculating Quality Report...\nThis may take several seconds on large domains.';
+    overlay.style.display = 'flex';
+
+    try {
+        const datasetId = document.getElementById('dataset-select').value;
+        if (!datasetId) throw new Error("No dataset selected");
+
+        const url = `/api/v1/dem/datasets/${datasetId}/quality?resolution=${resMeters}`;
+        const qRes = await fetch(url);
+        if (!qRes.ok) throw new Error(await qRes.text());
+        const data = await qRes.json();
+
+        // Display stats
+        const qStats = document.getElementById('quality-stats');
+        qStats.style.display = 'block';
+        qStats.innerHTML = `
+            <b>Status:</b> ${data.stats.steep_cliffs_count === 0 && data.stats.vdatum_risk_score === 0 ? '<span style="color:#0f0">STABLE</span>' : '<span style="color:#f55">FRAGILITY WARNINGS</span>'}<br>
+            <b>Max Slope:</b> ${data.stats.max_slope_deg}&deg;<br>
+            <b>Steep Cliffs:</b> ${data.stats.steep_cliffs_count}<br>
+            <b>VDatum Seam Risk:</b> ${data.stats.vdatum_risk_score}<br>
+            <b>NaN Gaps:</b> ${data.stats.missing_data_pct}%
+        `;
+
+        // Draw Features
+        if (qualityGroup) scene.remove(qualityGroup);
+        qualityGroup = new THREE.Group();
+        qualityGroup.name = 'quality-markers';
+        qualityGroup.position.copy(solidMesh.position); // Align with terrain group
+
+        const matCliff = new THREE.MeshBasicMaterial({ color: 0xff3333 });
+        const matSeam = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+
+        const sceneScale = 0.01;
+        // Map 1 pixel width (resMeters) into the 0.01 scene scale metric
+        // We'll give it a radius of roughly 1-2 pixels wide to make it visible but not overwhelming
+        const geoSphere = new THREE.SphereGeometry(resMeters * sceneScale * 0.8, 8, 8);
+
+        const [lonMin, latMin, lonMax, latMax] = bounds;
+        const lonCenter = (lonMin + lonMax) / 2;
+        const latCenter = (latMin + latMax) / 2;
+        const mPerDegLat = 111320;
+        const mPerDegLon = 111320 * Math.cos(latCenter * Math.PI / 180);
+
+        const zExag = parseFloat(document.getElementById('z-exag')?.value || 1);
+
+        data.features.features.forEach(feat => {
+            const lon = feat.geometry.coordinates[0];
+            const lat = feat.geometry.coordinates[1];
+
+            // Map lon/lat to local 3D coordinates exactly how `rebuildMesh` does it
+            const x = (lon - lonCenter) * mPerDegLon * sceneScale;
+            const z = -(lat - latCenter) * mPerDegLat * sceneScale;
+
+            const type = feat.properties.type;
+            const elev = feat.properties.elevation * zExag * sceneScale;
+
+            const mesh = new THREE.Mesh(geoSphere, type === 'cliff' ? matCliff : matSeam);
+
+            mesh.position.set(x, elev, z);
+            qualityGroup.add(mesh);
+        });
+
+        scene.add(qualityGroup);
+
+    } catch(e) {
+        alert("Failed: " + e.message);
+    } finally {
+        overlay.style.display = 'none';
+        loadMsg.innerText = 'Loading DEM...';
+        btn.innerText = 'Run Quality Report';
+        btn.disabled = false;
+    }
+};
+
+window.updateQualityScale = function() {
+    if(!qualityGroup) return;
+    const zExag = parseFloat(document.getElementById('z-exag')?.value || 1);
+    qualityGroup.scale.y = zExag;
+};
 </script>
 </body>
 </html>

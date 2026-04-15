@@ -116,7 +116,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const classMap = {
             '/fuse': 'origin-fuse',
             '/tiles': 'origin-tiles',
-            '/hydrate': 'origin-hydrate',
+            'auto-rasterized': 'origin-hydrate',
             'auto-discovery': 'origin-discovery',
             'download': 'origin-download',
         };
@@ -339,7 +339,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="tier2-stat"><span class="tier2-stat-label">Providers</span><span class="tier2-stat-value">${d.providers.length}</span></div>
                 <div class="tier2-stat"><span class="tier2-stat-label">Zarr Stores</span><span class="tier2-stat-value">${totalCount.toLocaleString()}</span></div>
                 <div class="tier2-stat"><span class="tier2-stat-label">Total Size</span><span class="tier2-stat-value">${formatBytes(totalBytes)}</span></div>
-                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('/hydrate')}</span></div>
+                <div class="tier2-stat"><span class="tier2-stat-label">Origin</span><span class="tier2-stat-value" style="font-size:1rem;">${originBadgeHtml('auto-rasterized')}</span></div>
             </div>
             <div class="detail-section"><h4>Providers</h4><table class="detail-table"><thead><tr><th>Name</th><th>Count</th><th>Size</th><th>Newest</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }

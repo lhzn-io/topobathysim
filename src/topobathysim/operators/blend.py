@@ -98,10 +98,17 @@ def metric_feather(base: xr.DataArray, overlay: xr.DataArray, distance_m: float)
     weights_native = weights_native.fillna(0)
 
     # 5. Apply Blending
-    # Patches holes in the base with the overlay where weights > 0.
-    overlay_filled = aligned_overlay.fillna(0)
-    base_filled = base.fillna(0)
+    # We only blend where BOTH base and overlay have valid data.
+    # If base is missing, we use overlay directly.
+    # If overlay is missing, we use base directly.
+    valid_base = base.notnull()
 
-    result = (base_filled * (1 - weights_native)) + (overlay_filled * weights_native)
+    result = base.copy()
+
+    overlap = valid_base & valid_mask
+    blended = (base * (1 - weights_native)) + (aligned_overlay * weights_native)
+
+    result = xr.where(overlap, blended, result)
+    result = xr.where(~valid_base & valid_mask, aligned_overlay, result)
 
     return cast(xr.DataArray, result)

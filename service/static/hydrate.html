@@ -177,18 +177,22 @@
                     <span class="stat-value" id="estArea">-</span>
                 </div>
             </div>
-
-            <div class="actions">
-                <button type="submit" id="submitBtn">Start Hydration Job</button>
-                <button type="button" id="cancelBtn" style="display:none; background:#c0392b; color:#fff; margin-left:8px;" onclick="cancelJob()">Cancel</button>
-                <div id="status"></div>
-            </div>
         </form>
 
         <div id="map"></div>
         <p style="font-size: 0.85rem; margin-top: 10px; color: #888;">
             Tip: Drag the 🔵 top-left handle to move. Drag the ⬜ corner handle to resize. Double-click map to jump box.
         </p>
+
+        <div class="actions" style="display: flex; flex-direction: column; gap: 15px; margin-top: 20px; align-items: stretch;">
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <button type="submit" form="hydrateForm" id="submitBtn" style="flex: 1;">Start Hydration Job</button>
+                <button type="button" id="analyzeBtn" style="flex: 1; background:#27ae60; color:#fff;" onclick="runAnalyze()">Analyze Coverage (Dry Run)</button>
+                <button type="button" id="cancelBtn" style="display:none; background:#c0392b; color:#fff;" onclick="cancelJob()">Cancel</button>
+            </div>
+            <div id="status" style="margin-left: 0; text-align: center;"></div>
+            <div id="analyze-tree" style="width: 100%; max-height: 500px; overflow-y: auto; text-align: left; font-size: 0.9em; background: #fdfdfd; border: 1px solid #ddd; border-radius: 4px; padding: 15px; box-sizing: border-box; display: none;"></div>
+        </div>
     </div>
 
     <script>
@@ -583,6 +587,76 @@
         function setCancelVisible(visible) {
             document.getElementById('cancelBtn').style.display = visible ? 'inline-block' : 'none';
         }
+
+        async function runAnalyze() {
+            const analyzeTree = document.getElementById("analyze-tree");
+            const analyzeBtn = document.getElementById("analyzeBtn");
+            analyzeTree.style.display = "block";
+
+            let startTime = Date.now();
+            let timerInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                analyzeTree.innerHTML = `<em>Analyzing coverage (dry run)... ${elapsed}s elapsed. This may take a minute for external APIs.</em>`;
+            }, 1000);
+
+            analyzeTree.innerHTML = `<em>Analyzing coverage (dry run)... 0s elapsed. This may take a minute for external APIs.</em>`;
+            analyzeBtn.disabled = true;
+
+            const bounds = selectionRect.getBounds();
+            const payload = {
+                bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
+                resolution: getEffectiveResolution()
+            };
+
+            const customY = document.getElementById("policyYamlArea") ? document.getElementById("policyYamlArea").value.trim() : "";
+            if (customY) {
+                payload.policy_yaml = customY;
+            }
+
+            try {
+                const res = await fetch("/analyze", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+
+                clearInterval(timerInterval);
+
+                if (!res.ok) {
+                    const text = await res.text();
+                    analyzeTree.innerHTML = `<span style="color: red;">Error: ${text}</span>`;
+                    return;
+                }
+                const data = await res.json();
+                let html = `<strong>Coverage Analysis Results (Took ${Math.floor((Date.now() - startTime) / 1000)}s)</strong><br/><br/>`;
+                data.providers.forEach(p => {
+                    const total = p.items.length;
+                    const included = p.items.filter(i => i.included).length;
+                    const excluded = total - included;
+                    html += `<details style="margin-bottom: 5px;"><summary style="cursor:pointer; font-weight:bold;">${p.provider} (${included} Included, ${excluded} Excluded)</summary><div style="padding-left: 20px; font-family: monospace;">`;
+                    if (total === 0) {
+                        html += `<em>No coverage found in bbox</em>`;
+                    } else {
+                        p.items.forEach(i => {
+                            const linkHtml = i.url ? ` <a href="${i.url}" target="_blank" style="font-size: 0.8em; text-decoration: none;" title="View Source">🔗 source</a>` : "";
+                            if (i.included) {
+                                html += `<div style="color: #27ae60;">[✓] <span>${i.name}${linkHtml}</span> — Included</div>`;
+                            } else {
+                                html += `<div style="color: #c0392b;" title="${i.reason}">[✗] <span style="text-decoration: line-through;">${i.name}</span>${linkHtml} — Excluded (${i.reason})</div>`;
+                            }
+                        });
+                    }
+                    html += `</div></details>`;
+                });
+                analyzeTree.innerHTML = html;
+            } catch (err) {
+                clearInterval(timerInterval);
+                analyzeTree.innerHTML = `<span style="color: red;">Failed to run analysis: ${err.message}</span>`;
+            } finally {
+                analyzeBtn.disabled = false;
+            }
+        }
+
 
         async function cancelJob() {
             if (!_activeJobId) return;

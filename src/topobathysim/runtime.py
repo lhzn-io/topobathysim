@@ -33,6 +33,9 @@ from topobathysim.providers.registry import registry
 from .config import get_cache_root
 from .operators.blend import metric_feather, overwrite
 
+# Suppress rasterio boto3/dummysession spam
+logging.getLogger("rasterio.session").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -918,9 +921,9 @@ def run(
             if bool(elev.isnull().any()):
                 merged_ds["elevation"] = (
                     elev.sortby("y", ascending=True)
-                    .interpolate_na(dim="y", method="linear")
+                    .interpolate_na(dim="y", method="linear", limit=2)
                     .sortby("y", ascending=False)
-                    .interpolate_na(dim="x", method="linear")
+                    .interpolate_na(dim="x", method="linear", limit=2)
                 )
 
     # Clip to the exact requested bbox, reprojecting bounds to target CRS if needed.

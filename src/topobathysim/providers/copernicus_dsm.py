@@ -20,31 +20,28 @@ from rioxarray.merge import merge_arrays
 
 from ..config import get_cache_root
 from ..manifest import OfflineManifest
-from .base import Provider, ProviderNoDataError, interpolate_small_gaps, sanitize_elevation_nodata
+from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
 
 
-class Usgs3DepProvider(Provider):
+class CopernicusDsmProvider(Provider):
     """
-    Provider for Mid-Resolution Land Topography.
-    Tier 2: USGS 3DEP (10m)
-    Tier 3: NASADEM / Copernicus (30m)
+    Provider for Copernicus DEM (GLO-30) - 30m Global Digital Surface Model.
     """
 
     _instance = None
-    _catalog: Any = None
     _initialized = False
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> "Usgs3DepProvider":
+    def __new__(cls, *args: Any, **kwargs: Any) -> "CopernicusDsmProvider":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-        return cast(Usgs3DepProvider, cls._instance)
+        return cast(CopernicusDsmProvider, cls._instance)
 
     def __init__(self, cache_dir: str | Path | None = None, offline_mode: bool = False) -> None:
         """
-        Initialize the 3DEP provider.
+        Initialize the Copernicus provider.
 
         Args:
             cache_dir: Directory to store cached data files.
@@ -57,7 +54,7 @@ class Usgs3DepProvider(Provider):
             cache_dir = get_cache_root()
 
         base_cache = Path(cache_dir).expanduser()
-        self.cache_dir = base_cache / "usgs_3dep"
+        self.cache_dir = base_cache / "copernicus_dsm"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Metadata Cache Directory
@@ -78,24 +75,17 @@ class Usgs3DepProvider(Provider):
         **kwargs: Any,
     ) -> xr.Dataset:
         """
-        Fetch USGS 3DEP (or fallback) data for the given bounding box.
+        Fetch Copernicus DEM (GLO-30) data for the given bounding box.
         """
-        filter_opts = kwargs.get("filter", {})
-        max_interpolation_gap_m = filter_opts.get("max_interpolation_gap_m")
-
         # Ensure the bbox is in EPSG:4326 for STAC/Manifest queries
         bounds = self._normalize_bbox(bbox, crs)
 
-        # 1. 3DEP Seamless (10m) - Best for US
-        da = self._fetch_collection(bounds, "3dep-seamless")
-
+        da = self._fetch_collection(bounds, "cop-dem-glo-30")
         if da is not None:
-            if max_interpolation_gap_m and resolution:
-                da["elevation"] = interpolate_small_gaps(da["elevation"], max_interpolation_gap_m, resolution)
-            logger.debug("Found USGS 3DEP Coverage")
+            logger.debug("Found Copernicus DEM Coverage")
             return da
 
-        raise ProviderNoDataError(f"No USGS 3DEP/Land coverage found for bbox {bbox}")
+        raise ProviderNoDataError(f"No Copernicus coverage found for bbox {bbox}")
 
     def get_grid(
         self,
@@ -113,16 +103,16 @@ class Usgs3DepProvider(Provider):
 
     def get_metadata(self) -> dict[str, Any]:
         """
-        Return metadata for the 3DEP provider.
+        Return metadata for the Copernicus DSM provider.
 
         Returns:
             Dictionary containing provider name, citation, resolution, and URL.
         """
         return {
-            "name": "USGS 3DEP (Seamless)",
-            "citation": "U.S. Geological Survey.",
-            "resolution": "10m (1/3 arc-second)",
-            "url": "https://www.usgs.gov/core-science-systems/ngp/3dep",
+            "name": "Copernicus DSM (GLO-30)",
+            "citation": "European Space Agency (ESA).",
+            "resolution": "30m",
+            "url": "https://planetarycomputer.microsoft.com/dataset/cop-dem-glo-30",
         }
 
     def _query_stac_api(
@@ -151,17 +141,18 @@ class Usgs3DepProvider(Provider):
         lock_file_path = self.cache_dir / f"stac_query_{query_hash}.lock"
 
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
-        max_retries = 4  # Increased retries for Gateway Timeouts
-
-        # Cache the catalog to avoid fetching the STAC root on every query
-        if not hasattr(self, "_catalog") or self._catalog is None:
-            self._catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        max_retries = 2
 
         try:
             with FileLock(lock_file_path):
                 # Double-Check Negative Cache (in case another worker updated it while we waited)
                 if self.manifest.has_no_coverage(collection_id, bbox):
                     return None
+
+                # Also Double-Check Positive Cache/Manifest?
+                # Ideally yes, but the Manifest is loaded in memory mainly.
+                # If 'manifest.record_search' updates persistent storage, we should reload it.
+                # Assuming manifest handles its own persistence or we rely on the negative cache check.
 
                 for attempt in range(max_retries + 1):
                     try:
@@ -170,7 +161,8 @@ class Usgs3DepProvider(Provider):
                             f"for {bbox} (Attempt {attempt + 1})"
                         )
 
-                        search = self._catalog.search(collections=[collection_id], bbox=bbox, limit=10)
+                        catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+                        search = catalog.search(collections=[collection_id], bbox=bbox, limit=10)
                         items = list(search.items())
 
                         # Record Search Result (Positive or Negative)
@@ -207,12 +199,7 @@ class Usgs3DepProvider(Provider):
                         err_str = str(e)
                         is_network = any(
                             x in err_str
-                            for x in [
-                                "NameResolutionError",
-                                "ConnectionError",
-                                "Max retries exceeded",
-                                "request exceeded the maximum allowed time",
-                            ]
+                            for x in ["NameResolutionError", "ConnectionError", "Max retries exceeded"]
                         )
 
                         if is_network:
@@ -518,4 +505,4 @@ class Usgs3DepProvider(Provider):
 
 
 # Register
-registry.register(Path(__file__).stem, Usgs3DepProvider)
+registry.register(Path(__file__).stem, CopernicusDsmProvider)

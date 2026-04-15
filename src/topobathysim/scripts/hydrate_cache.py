@@ -52,6 +52,18 @@ def _print_fuse_status(status: dict) -> None:
         parts.append(f" | Error: {status['error']}")
     print("".join(parts))
 
+    if status.get("status") in ("completed", "failed") and failed > 0:
+        print("\n" + "=" * 80)
+        print("⚠️  WARNING: Some cells failed to hydrate. This is commonly caused by")
+        print("   Out-Of-Memory (OOM) / ArrayMemoryError exceptions when SciPy interpolates")
+        print("   massive gaps across too many concurrent workers.")
+        print("   ")
+        print("   STRATEGY: The successfully processed cells are already cached! You can")
+        print("   safely re-run the exact same command. Or, to reduce memory pressure,")
+        print("   re-run with a lower worker limit (e.g., `-w 1` or `--workers 1`) to let")
+        print("   the remaining cells process sequentially with full system RAM.")
+        print("=" * 80 + "\n")
+
 
 def _monitor_ws(ws_url: str) -> None:
     import websockets.sync.client  # type: ignore[import-untyped]

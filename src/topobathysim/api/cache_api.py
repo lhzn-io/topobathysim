@@ -93,7 +93,7 @@ def get_cache_summary(cache_bust: bool = False) -> CacheSummary:
     tier_origins = {
         1: "/tiles",
         2: "/fuse",
-        3: "/hydrate",
+        3: "auto-rasterized",
         4: "auto-discovery",
         5: "download",
     }

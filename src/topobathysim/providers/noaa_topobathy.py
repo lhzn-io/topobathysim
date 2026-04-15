@@ -902,8 +902,9 @@ class NoaaTopobathyProvider(Provider):
                 if filter_criteria and filter_criteria.get("project_type") == "topographic":
                     target_type = "topographic"
 
-                # If the index has 'is_topobathy' column
-                if "is_topobathy" in self._spatial_index.columns:
+                is_explicit = filter_criteria and "project_id" in filter_criteria
+                # If the index has .is_topobathy. column and not explicitly requested
+                if not is_explicit and "is_topobathy" in self._spatial_index.columns:
                     if target_type == "topobathy":
                         # Candidates must be True OR have "topobathy"/"bathymetry" in the project name
                         # This fallback is crucial for datasets where XML metadata parsing missed the
@@ -1383,7 +1384,7 @@ class NoaaTopobathyProvider(Provider):
                                 t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
                                 lon, lat = t.transform(cx, cy)
 
-                                offset = self.vdatum.get_ellipsoid_to_navd88_offset(lat, lon)
+                                offset = self.vdatum.get_robust_ellipsoid_to_navd88_offset(lat, lon)
                                 logger.info(f"Applying VDatum Offset {offset:.3f}m to {local_filename}")
                                 da_raw = da_raw + offset
 
@@ -1392,7 +1393,11 @@ class NoaaTopobathyProvider(Provider):
                                 da_raw.attrs["correction_method"] = "VDatum Geoid18"
                                 da_raw.attrs["vdatum_offset"] = offset
                         except Exception as e:
-                            logger.warning(f"VDatum correction failed: {e}")
+                            logger.warning(
+                                f"VDatum correction failed: {e}. "
+                                "Dropping dataset to prevent artificial cliffs."
+                            )
+                            return None
 
                     # 5. Write to Zarr
                     # Ensure good chunks for writing
