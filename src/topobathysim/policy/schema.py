@@ -58,6 +58,9 @@ class FilterConfig(BaseModel):
     max_deviation: float | None = None
     min_elevation: float | None = None
     max_elevation: float | None = None
+    include_patterns: list[str] | None = None
+    exclude_patterns: list[str] | None = None
+    max_interpolation_gap_m: float | None = None
 
 
 class CompositionStep(BaseModel):

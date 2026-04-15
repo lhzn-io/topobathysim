@@ -40,7 +40,7 @@ expensive to rebuild:
      - ``*.bag``, ``*.tiff``, ``*.tif``, ``*.laz`` in provider directories
      - Hours — full re-download
 
-**Tier 4 discovery cache files** (lightweight indices, fast to rebuild):
+**Tier 4 metadata & discovery caches** (lightweight indices, fast to rebuild):
 
 .. list-table::
    :widths: 40 60
@@ -65,6 +65,8 @@ expensive to rebuild:
      - project ID → folder name (S3 index HTML)
    * - ``metadata/noaa_project_extents.geojson``
      - project spatial bbox index (GeoJSON)
+   * - ``vdatum.sqlite``
+     - Local SQLite WAL cache containing NOAA VDatum API vertical offsets
 
 Discovery caches survive server restarts so tile generation is fully offline
 once a region is hydrated.  Invalidate them when you expect newly published
@@ -222,7 +224,7 @@ until the scheme is refreshed:
 .. note::
 
    Purging a tier does **not** purge lower-numbered tiers.  For example, purging
-   tier 4 (discovery caches) does not delete provider zarr or raw source files.
+   tier 4 (metadata & discovery caches) does not delete provider zarr or raw source files.
    If the underlying provider data is still cached, discovery caches will be
    re-populated from that local data on the next tile request — no network calls
    are needed for already-cached survey regions.

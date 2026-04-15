@@ -30,12 +30,14 @@ from fastapi.responses import FileResponse, Response
 
 from topobathysim.config import get_cache_root
 from topobathysim.policy.loader import hash_policy, load_policy, load_policy_from_str
+from topobathysim.quality import calculate_spatial_stats
 from topobathysim.runtime import hydrate, run, should_consolidate
 
 from . import job_state
 
 # from topobathysim.quality import source_report # Removed as not directly supported in runtime yet
 from .models import (
+    DEMQualityReport,
     ElevationResponse,
     FusionRequest,
     HydrateRequest,
@@ -310,7 +312,7 @@ def fuse(
         _policy = load_policy(str(policy_path))
         _phash = hash_policy(_policy.model_dump())
         logger.info(
-            f"GET /fuse policy={policy_path.name} hash={_phash[:8]} " f"bbox={bbox_tuple} res={resolution}m"
+            f"GET /fuse policy={policy_path.name} hash={_phash[:8]} bbox={bbox_tuple} res={resolution}m"
         )
         ds = run(str(policy_path), bbox_tuple, resolution=resolution, use_cache=True)
     except ValueError as exc:
@@ -1647,9 +1649,7 @@ async def trigger_hydrate(
         # res = 156543.03 * cos(center_lat) / 2^z
         center_lat = (request.bbox[1] + request.bbox[3]) / 2.0
         effective_resolution = round(156543.03 * math.cos(math.radians(center_lat)) / (2.0**request.zoom), 8)
-        logger.info(
-            f"Zoom {request.zoom} at lat {center_lat:.4f} -> " f"resolution {effective_resolution:.4f}m"
-        )
+        logger.info(f"Zoom {request.zoom} at lat {center_lat:.4f} -> resolution {effective_resolution:.4f}m")
     else:
         effective_resolution = request.resolution
 
@@ -1796,3 +1796,353 @@ async def hydrate_ws(websocket: WebSocket, job_id: str) -> None:
 async def list_hydration_jobs() -> list[dict[str, Any]]:
     """List recent hydration jobs."""
     return job_state.list_jobs(max_age_hours=24)
+
+
+@app.get("/api/v1/quality/report", response_model=DEMQualityReport)
+async def get_quality_report(
+    north: float,
+    south: float,
+    west: float,
+    east: float,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+    resolution: float = Query(30.0, description="Exact grid resolution in meters to evaluate fragility at"),
+) -> DEMQualityReport:
+    """
+    Evaluates the DEM for numerical and physical stability exactly at the requested simulation resolution.
+    Returns JSON stats and an embedded GeoJSON FeatureCollection of anomalies
+    (cliffs, pits, VDatum mismatches).
+    """
+    try:
+        # We need to fetch and fuse the exact area at metric resolution
+        # Avoid using map tile logic so we don't smear out the precise gradients
+        bbox = (west, south, east, north)
+
+        # Run fusion (returns aligned arrays)
+        ds = run(policy_path, bbox, resolution)
+
+        if "elevation" not in ds:
+            raise HTTPException(status_code=404, detail="No elevation data generated for region")
+
+        elevation = ds["elevation"]
+        source_map = ds.get("source_id")  # Assuming source_id is preserved if generated
+
+        report_data = calculate_spatial_stats(
+            elevation=elevation,
+            source_map=source_map,
+            resolution_m=resolution,
+            steep_threshold_m=3.0,
+            pit_ratio_threshold=3.0,
+        )
+
+        return DEMQualityReport(**report_data)
+
+    except Exception as e:
+        logger.error(f"Quality reporting failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/analyze")
+async def analyze_coverage(
+    request: HydrateRequest,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+) -> dict[str, Any]:
+    """Dry-run coverage analyzer for a bounding box."""
+    from topobathysim.providers.registry import registry
+
+    try:
+        policy_input = request.policy_yaml
+        if not policy_input:
+            if request.policy_name:
+                # If they passed just 'wlis', find it next to the default policy
+                policy_dir = policy_path.parent
+                cand = policy_dir / request.policy_name
+                if not cand.exists() and not cand.suffix:
+                    cand = policy_dir / f"{request.policy_name}.yaml"
+                policy_input = str(cand) if cand.exists() else str(policy_path)
+            else:
+                policy_input = str(policy_path)
+
+        policy = load_policy_from_str(policy_input) if request.policy_yaml else load_policy(policy_input)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid policy: {e}") from e
+
+    results = []
+
+    for step in policy.variables[0].steps:
+        provider_cls = registry.get_provider_class(step.provider)
+        provider = provider_cls()
+
+        # Since we can't easily fetch dry-run without an `inventory()` method,
+        # implement a pseudo-inventory loop here.
+        items = []
+        try:
+            if step.provider == "usgs_3dep":
+                from topobathysim.providers.base import matches_pattern
+
+                raw_items = provider._query_stac_api(request.bbox, collection_id="3dep-seamless") or []  # type: ignore[attr-defined]
+                for i in raw_items:
+                    name = Path(i["href"].split("?")[0]).name
+                    included = True
+                    reason = ""
+
+                    if (
+                        step.filter
+                        and step.filter.include_patterns
+                        and not matches_pattern(name, step.filter.include_patterns)
+                    ):
+                        included = False
+                        reason = "Not in include_patterns"
+                    if (
+                        step.filter
+                        and included
+                        and step.filter.exclude_patterns
+                        and matches_pattern(name, step.filter.exclude_patterns)
+                    ):
+                        included = False
+                        reason = "Matches exclude_pattern"
+                    # min_elevation filtering happens at fetch time; warn if set
+                    if (
+                        step.filter
+                        and included
+                        and step.filter.min_elevation is not None
+                        and step.filter.min_elevation > 0
+                    ):
+                        reason += " (Warn: Filtered dynamically if < min_elevation)"
+
+                    # Add helpful source links
+                    url = "https://planetarycomputer.microsoft.com/dataset/3dep-seamless"
+                    items.append({"name": name, "included": included, "reason": reason.strip(), "url": url})
+
+            elif step.provider == "noaa_bluetopo":
+                from topobathysim.providers.base import matches_pattern
+
+                w, s, east, n = provider._normalize_bbox(request.bbox)  # type: ignore[attr-defined]
+
+                seen_surveys: set[str] = set()
+
+                # If this is a very small bbox (like a point query from the UI),
+                # use the exact coordinate to resolve the specific pixel survey ID
+                if (east - w) < 0.01 and (n - s) < 0.01:
+                    lon, lat = (w + east) / 2.0, (s + n) / 2.0
+                    survey_id = provider.get_source_survey_id(lat, lon)  # type: ignore[attr-defined]
+                    tiles: list[str] = []  # Bypass full tile extraction
+                    if survey_id:
+                        name = survey_id
+                        seen_surveys.add(name)
+                        included = True
+                        reason = ""
+
+                        if (
+                            step.filter
+                            and step.filter.include_patterns
+                            and not matches_pattern(survey_id, step.filter.include_patterns)
+                        ):
+                            included = False
+                            reason = "Not in include_patterns"
+                        if (
+                            step.filter
+                            and step.filter.exclude_patterns
+                            and matches_pattern(survey_id, step.filter.exclude_patterns)
+                        ):
+                            included = False
+                            reason = "Matched exclude_patterns"
+
+                        url = f"https://www.ncei.noaa.gov/maps/bathymetry/?search={survey_id.split('.')[0]}"
+                        items.append({"name": name, "included": included, "reason": reason, "url": url})
+                else:
+                    tiles = provider.resolve_tiles_in_bbox(w, s, east, n)  # type: ignore[attr-defined]
+
+                for tile_id in tiles:
+                    # Extract inner surveys from cached RAT sidecars
+                    surveys = provider.get_all_survey_ids(tile_id)  # type: ignore[attr-defined]
+
+                    if not surveys:
+                        # Fallback if no sidecar available
+                        name = tile_id
+                        if name in seen_surveys:
+                            continue
+                        seen_surveys.add(name)
+
+                        included = True
+                        reason = ""
+                        if step.filter and (step.filter.include_patterns or step.filter.exclude_patterns):
+                            reason = (
+                                "(Dynamic pattern filtering will be applied"
+                                " sequentially to internal survey sources)"
+                            )
+                        url = "https://nauticalcharts.noaa.gov/data/bluetopo.html"
+                        items.append({"name": name, "included": included, "reason": reason, "url": url})
+                        continue
+
+                    # Process each internal survey independently for the UI
+                    for survey_id in surveys:
+                        name = survey_id
+                        if name in seen_surveys:
+                            continue
+                        seen_surveys.add(name)
+
+                        included = True
+                        reason = ""
+
+                        # Filter explicitly exactly as fusion does
+                        if (
+                            step.filter
+                            and step.filter.include_patterns
+                            and not matches_pattern(survey_id, step.filter.include_patterns)
+                        ):
+                            included = False
+                            reason = "Not in include_patterns"
+                        if (
+                            step.filter
+                            and step.filter.exclude_patterns
+                            and matches_pattern(survey_id, step.filter.exclude_patterns)
+                        ):
+                            included = False
+                            reason = "Matched exclude_patterns"
+
+                        url = f"https://www.ncei.noaa.gov/maps/bathymetry/?search={survey_id.split('.')[0]}"
+                        items.append({"name": name, "included": included, "reason": reason, "url": url})
+
+            elif step.provider == "noaa_topobathy":
+                from topobathysim.providers.base import matches_pattern
+
+                w, s, east, n = provider._normalize_bbox(request.bbox)  # type: ignore[attr-defined]
+                projects = provider.find_projects_by_box(w, s, east, n)  # type: ignore[attr-defined]
+                if not projects:
+                    projects = []
+
+                if (east - w) < 0.01 and (n - s) < 0.01:
+                    valid_projects = []
+                    for p in projects:
+                        name = str(p.get("project_id", "Unknown")) if isinstance(p, dict) else str(p)
+                        # Skip heavy tile fetch if the filter excludes it anyway
+                        if (
+                            step.filter
+                            and hasattr(step.filter, "project_id")
+                            and step.filter.project_id
+                            and name not in step.filter.project_id
+                        ):
+                            continue
+
+                        provider.set_active_project(name)  # type: ignore[attr-defined]
+                        tiles = provider.resolve_tiles_in_bbox(w, s, east, n)  # type: ignore[attr-defined]
+                        has_data = False
+                        for t in tiles:
+                            try:
+                                da = provider.fetch_tile(t, request.bbox)  # type: ignore[attr-defined]
+                                if da is not None and int(da.notnull().sum()) > 0:
+                                    has_data = True
+                                    break
+                            except Exception:
+                                pass
+                        if has_data:
+                            valid_projects.append(p)
+                    projects = valid_projects
+
+                for p in projects:
+                    name = str(p.get("project_id", "Unknown")) if isinstance(p, dict) else str(p)
+                    included = True
+                    reason = ""
+
+                    if (
+                        step.filter
+                        and hasattr(step.filter, "project_id")
+                        and step.filter.project_id
+                        and name not in step.filter.project_id
+                    ):
+                        included = False
+                        reason = "Not in project_id list"
+
+                    # Generate URL for NOAA Topobathy Lidar Viewer
+                    url = (
+                        f"https://coast.noaa.gov/dataviewer/#/lidar/search/where:ID={name}"
+                        if name.isdigit()
+                        else "https://coast.noaa.gov/dataviewer/#/lidar/search/"
+                    )
+                    items.append(
+                        {"name": f"Project: {name}", "included": included, "reason": reason, "url": url}
+                    )
+
+            elif step.provider == "ncei_bag":
+                from topobathysim.providers.base import matches_pattern
+                from topobathysim.providers.ncei_bag import BAGDiscovery
+
+                w, s, east, n = provider._normalize_bbox(request.bbox)  # type: ignore[attr-defined]
+                urls = BAGDiscovery.find_bags_by_bbox(w, s, east, n)
+                if not urls:
+                    urls = []
+
+                if (east - w) < 0.01 and (n - s) < 0.01:
+                    valid_urls = []
+                    for target_url in urls:
+                        name = Path(target_url.split("?")[0]).name
+
+                        # Filter before heavy processing
+                        if step.filter:
+                            included_pre = True
+                            if step.filter.include_patterns and not matches_pattern(
+                                name, step.filter.include_patterns
+                            ):
+                                included_pre = False
+                            if (
+                                included_pre
+                                and step.filter.exclude_patterns
+                                and matches_pattern(name, step.filter.exclude_patterns)
+                            ):
+                                included_pre = False
+                            if not included_pre:
+                                continue
+
+                        has_data = False
+                        try:
+                            da = provider.fetch_dataset(target_url, request.bbox)  # type: ignore[attr-defined]
+                            if da is not None and int(da.notnull().sum()) > 0:
+                                has_data = True
+                        except Exception:
+                            pass
+                        if has_data:
+                            valid_urls.append(target_url)
+                    urls = valid_urls
+
+                for target_url in urls:
+                    name = Path(target_url.split("?")[0]).name
+                    included = True
+                    reason = ""
+
+                    if (
+                        step.filter
+                        and step.filter.include_patterns
+                        and not matches_pattern(name, step.filter.include_patterns)
+                    ):
+                        included = False
+                        reason = "Not in include_patterns"
+                    if (
+                        step.filter
+                        and included
+                        and step.filter.exclude_patterns
+                        and matches_pattern(name, step.filter.exclude_patterns)
+                    ):
+                        included = False
+                        reason = "Matches exclude_pattern"
+
+                    import re
+
+                    survey_matches = re.search(r"^[A-Z][0-9]+", name)
+                    url = (
+                        f"https://www.ncei.noaa.gov/maps/bathymetry/?search={survey_matches.group(0)}"
+                        if survey_matches
+                        else "https://www.ncei.noaa.gov/maps/bathymetry/"
+                    )
+                    items.append({"name": name, "included": included, "reason": reason, "url": url})
+
+        except Exception as e:
+            items.append({"name": "Error fetching inventory", "included": False, "reason": str(e)})
+
+        results.append(
+            {
+                "provider": step.provider,
+                "items": items,
+            }
+        )
+
+    return {"providers": results}

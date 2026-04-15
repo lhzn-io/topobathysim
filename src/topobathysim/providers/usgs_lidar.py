@@ -385,6 +385,23 @@ class UsgsLidarProvider(Provider):
                         ds.close()
                         return None
 
+                # Inject source_id if the cache only contains elevation
+                if "source_id" not in ds:
+                    import hashlib
+
+                    project_uid = int(hashlib.md5(local_path.name.encode()).hexdigest(), 16) % 100000 + 70000
+                    p_source = xr.where(ds["elevation"].notnull(), project_uid, 0).astype(np.uint32)
+                    p_source.name = "source_id"
+                    p_source.rio.write_nodata(0, inplace=True)
+                    p_source.attrs["_FillValue"] = 0
+                    ds["source_id"] = p_source
+                    ds.attrs["provenance_dict"] = {
+                        project_uid: {
+                            "name": local_path.name,
+                            "provider": "usgs_lidar",
+                        }
+                    }
+
                 logger.info(f"Lidar Zarr Cache Hit: {zarr_path.name}")
                 return ds
             except Exception as e:

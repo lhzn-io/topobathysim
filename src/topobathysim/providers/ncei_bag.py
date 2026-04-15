@@ -25,7 +25,7 @@ from ..config import get_cache_root
 from ..runtime import should_consolidate
 from ..utils.cache import concurrent_lru_cache
 from ..vdatum import VDatumNoDataError, VDatumResolver
-from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
+from .base import Provider, ProviderNoDataError, interpolate_small_gaps, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -67,66 +67,18 @@ def _parse_survey_id(filename: str) -> str:
     """
     import re
 
-    m = re.match(r"^([A-Z]\d{4,5})", filename)
-    return m.group(1) if m else filename
+    m = re.match(r"^([a-zA-Z]\d{4,5})", filename, flags=re.IGNORECASE)
+    return m.group(1).upper() if m else filename
 
 
 def _dedup_survey_resolutions(urls: list[str], target_resolution: float | None = None) -> list[str]:
-    """Deduplicate multi-resolution exports of the same survey.
+    """NOAA often splits surveys spatially based on depth, generating different resolutions
+    for each depth bin (e.g. 50cm for 0-20m depth, 2m for >40m depth).
 
-    NCEI provides the same survey at multiple resolutions (e.g. H12696 at
-    50cm, 2m, 4m). Each resolution may have multiple spatial parts (1of3,
-    2of3, 3of3) which cover different areas and must all be kept.
-
-    Strategy:
-    1. Group URLs by survey ID (H12696, W00181, etc.)
-    2. For each survey, find the set of distinct resolutions available.
-    3. Pick the best resolution: closest to target without being coarser.
-    4. Keep ALL spatial parts (1of3, 2of3, combined, etc.) at that resolution.
-    5. Prune parts at other resolutions.
+    Attempting to 'deduplicate' them and only picking one resolution will lead to massive
+    spatial holes (NaN gaps). We MUST return all available files.
     """
-    if not target_resolution or target_resolution <= 0:
-        return urls
-
-    # Collect per-survey resolution sets and annotate each URL
-    survey_resolutions: dict[str, set[float]] = {}
-    url_info: list[tuple[str, str, float]] = []
-    for url in urls:
-        filename = url.split("/")[-1].replace(".bag", "")
-        survey_id = _parse_survey_id(filename)
-        res = _parse_bag_resolution(filename)
-        survey_resolutions.setdefault(survey_id, set()).add(res)
-        url_info.append((url, survey_id, res))
-
-    # For each survey with multiple resolutions, pick the best one
-    best_res_for_survey: dict[str, float] = {}
-    for survey_id, resolutions in survey_resolutions.items():
-        if len(resolutions) <= 1:
-            best_res_for_survey[survey_id] = min(resolutions)
-            continue
-
-        # Prefer the coarsest resolution still finer than target
-        finer = [r for r in resolutions if r <= target_resolution]
-        best = max(finer) if finer else min(resolutions)
-
-        best_res_for_survey[survey_id] = best
-        pruned_res = sorted(resolutions - {best})
-        if pruned_res:
-            logger.debug(
-                f"BAG dedup: {survey_id} — keeping {best}m, "
-                f"pruning {pruned_res}m (target={target_resolution}m)"
-            )
-
-    # Filter: keep only URLs at the chosen resolution for their survey
-    kept = [url for url, sid, res in url_info if res == best_res_for_survey.get(sid, res)]
-
-    pruned_count = len(urls) - len(kept)
-    if pruned_count:
-        logger.info(
-            f"BAG dedup: {len(urls)} -> {len(kept)} urls "
-            f"(pruned {pruned_count} redundant multi-resolution exports)"
-        )
-    return kept
+    return urls
 
 
 class _EmptyWindowError(Exception):
@@ -345,7 +297,7 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
 
                             if is_ellipsoid:
                                 # Ellipsoid -> NAVD88
-                                offset = VDatumResolver.get_ellipsoid_to_navd88_offset(  # type: ignore
+                                offset = VDatumResolver.get_robust_ellipsoid_to_navd88_offset(  # type: ignore
                                     lat, lon
                                 )
                                 logger.info(
@@ -354,7 +306,7 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
                                 )
                             else:
                                 # MLLW -> NAVD88
-                                offset = VDatumResolver.get_mllw_to_navd88_offset(  # type: ignore
+                                offset = VDatumResolver.get_robust_mllw_to_navd88_offset(  # type: ignore
                                     lat, lon
                                 )
                                 logger.info(
@@ -377,11 +329,13 @@ def _read_bag_cached(local_path: Path) -> xr.DataArray | None:
                     if not found_offset:
                         msg = (
                             f"Could not determine VDatum offset for {filename} "
-                            f"(tried {len(candidate_points)} points). defaulting to 0.0."
+                            f"(tried {len(candidate_points)} points). "
+                            "Dropping dataset to prevent artificial cliffs."
                         )
                         if last_error:
                             msg += f" Last error: {last_error}"
                         logger.warning(msg)
+                        return None
 
                     # Applying offset to Dask array adds a task to the graph (Lazy).
                     if found_offset:
@@ -864,6 +818,8 @@ class BAGDiscovery:
         cached = cls._get_from_discovery_cache(bbox_key)
         if cached is not None:
             logger.debug(f"BAG Discovery Cache Hit: {bbox_key} ({len(cached)} urls)")
+            if target_resolution and cached:
+                return _dedup_survey_resolutions(cached, target_resolution)
             return cached
 
         # 2. Cache Miss - Synchronization Barrier
@@ -881,6 +837,8 @@ class BAGDiscovery:
                 cached = cls._get_from_discovery_cache(bbox_key)
                 if cached is not None:
                     logger.debug(f"BAG Discovery Cache Hit (Post-Lock): {bbox_key}")
+                    if target_resolution and cached:
+                        return _dedup_survey_resolutions(cached, target_resolution)
                     return cached
 
                 logger.debug(f"BAG Discovery Cache Miss: {bbox_key} — querying NCEI ArcGIS API")
@@ -1074,11 +1032,25 @@ class BAGProvider(Provider):
         """
         Fetches and merges BAG files intersecting the bounding box.
         """
+        from .base import matches_pattern
+
         west, south, east, north = bbox
+
+        filter_opts = kwargs.get("filter", {})
+        include_patterns = filter_opts.get("include_patterns")
+        exclude_patterns = filter_opts.get("exclude_patterns")
+        max_interpolation_gap_m = filter_opts.get("max_interpolation_gap_m")
 
         # 1. Discover BAGs (dedup applied at discovery layer to skip
         # network/filelock for pruned multi-resolution exports)
         urls = BAGDiscovery.find_bags_by_bbox(west, south, east, north, crs=crs, target_resolution=resolution)
+
+        # 1.5 Apply declarative pattern filtering
+        if urls and include_patterns:
+            urls = [u for u in urls if matches_pattern(u.split("/")[-1], include_patterns)]
+        if urls and exclude_patterns:
+            urls = [u for u in urls if not matches_pattern(u.split("/")[-1], exclude_patterns)]
+
         if not urls:
             raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
 
@@ -1104,19 +1076,34 @@ class BAGProvider(Provider):
         # become the accumulator grid and all subsequent tiles would be clipped to it
         # via reproject_match, silently dropping coverage outside the first tile.
         merged_ds: xr.Dataset | None = None
-        if crs and resolution and "EPSG:4326" not in crs:
+        if crs and resolution:
             try:
-                from pyproj import Transformer
+                import math
 
-                _t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-                _x0, _y0 = _t.transform(west, south)
-                _x1, _y1 = _t.transform(east, north)
+                if "EPSG:4326" in crs:
+                    _x0, _y0 = west, south
+                    _x1, _y1 = east, north
+
+                    _center_lat_rad = math.radians((south + north) / 2.0)
+                    _res_deg_y = resolution / 111111.0
+                    _res_deg_x = resolution / (111111.0 * math.cos(_center_lat_rad))
+                else:
+                    from pyproj import Transformer
+
+                    _t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                    _x0, _y0 = _t.transform(west, south)
+                    _x1, _y1 = _t.transform(east, north)
+                    _res_deg_x = resolution
+                    _res_deg_y = resolution
+
                 _x0, _x1 = min(_x0, _x1), max(_x0, _x1)
                 _y0, _y1 = min(_y0, _y1), max(_y0, _y1)
-                _nx = max(1, int(round((_x1 - _x0) / resolution)))
-                _ny = max(1, int(round((_y1 - _y0) / resolution)))
-                _xs = np.linspace(_x0 + resolution / 2, _x1 - resolution / 2, _nx)
-                _ys = np.linspace(_y1 - resolution / 2, _y0 + resolution / 2, _ny)  # N→S
+
+                _nx = max(1, round((_x1 - _x0) / _res_deg_x))
+                _ny = max(1, round((_y1 - _y0) / _res_deg_y))
+                _xs = np.linspace(_x0 + _res_deg_x / 2, _x1 - _res_deg_x / 2, _nx)
+                _ys = np.linspace(_y1 - _res_deg_y / 2, _y0 + _res_deg_y / 2, _ny)  # N→S
+
                 _empty_elev = xr.DataArray(
                     np.full((1, _ny, _nx), np.nan, dtype=np.float32),
                     dims=["band", "y", "x"],
@@ -1318,6 +1305,11 @@ class BAGProvider(Provider):
             )
             merged_ds = xr.Dataset({"elevation": final_elev, "source_id": final_src})
 
+        if max_interpolation_gap_m and resolution:
+            merged_ds["elevation"] = interpolate_small_gaps(
+                merged_ds["elevation"], max_interpolation_gap_m, resolution
+            )
+
         merged_ds.attrs["provenance_dict"] = provenance_dict
         logger.debug(f"Found NCEI BAG Coverage with provenance {provenance_dict}")
         return cast(xr.Dataset, merged_ds)
@@ -1336,6 +1328,16 @@ class BAGProvider(Provider):
             "url": "https://www.ncei.noaa.gov/products/bathymetry",
         }
 
+    def fetch_dataset(self, url: str, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
+        raw_da = self.fetch_bag(url.split("/")[-1].replace(".bag", ""), url)
+        if raw_da is None:
+            return None
+        try:
+            clipped = raw_da.rio.clip_box(*bbox, crs="EPSG:4326")
+            return cast(xr.DataArray, clipped)
+        except Exception:
+            return None
+
     def fetch_bag(self, survey_id: str, download_url: str | list[str] | None = None) -> xr.DataArray | None:
         """
         Fetches and reads a BAG file for a given Survey ID.
@@ -1353,11 +1355,24 @@ class BAGProvider(Provider):
         loaded_arrays = []
 
         for url in urls:
-            local_path = self._ensure_downloaded(url)
-            if local_path:
+            filename = url.split("/")[-1]
+            local_path = self.cache_dir / filename
+
+            # Fast-path cache check: if Zarr exists, we don't need the massive .bag file anymore
+            zarr_dir = local_path.parent / "zarr"
+            zarr_path = zarr_dir / local_path.name.replace(".bag", "_navd88.zarr")
+
+            if zarr_path.exists():
                 da = self._read_bag(local_path)
-                if da is not None:
-                    loaded_arrays.append(da)
+            else:
+                downloaded_path = self._ensure_downloaded(url)
+                if downloaded_path is not None:
+                    da = self._read_bag(downloaded_path)
+                else:
+                    continue
+
+            if da is not None:
+                loaded_arrays.append(da)
 
         if not loaded_arrays:
             return None

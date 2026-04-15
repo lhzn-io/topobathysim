@@ -22,7 +22,7 @@ Cache Tiers
 +---+-------------------------------+------------------------------------------+-------------------------+
 | 3 | Provider zarr                 | {provider}/zarr/*.zarr                   | Minutes-hours           |
 +---+-------------------------------+------------------------------------------+-------------------------+
-| 4 | Discovery caches              | 5 JSON/GeoJSON metadata files            | Seconds-minutes         |
+| 4 | Discovery caches              | 5 JSON/GeoJSON metadata files + sqlite   | Seconds-minutes         |
 +---+-------------------------------+------------------------------------------+-------------------------+
 | 5 | Raw source files              | *.bag, *.tiff, *.tif, *.laz             | Hours (full re-download)|
 +---+-------------------------------+------------------------------------------+-------------------------+
@@ -71,7 +71,6 @@ from rich.text import Text
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
 from topobathysim.config import get_cache_root
 
 CACHE_ROOT = get_cache_root()
@@ -401,6 +400,7 @@ class CacheTier:
                 CACHE_ROOT / "metadata" / "ncei_bag_redirects.json",
                 CACHE_ROOT / "metadata" / "noaa_coastal_lidar.json",
                 CACHE_ROOT / "metadata" / "noaa_project_extents.geojson",
+                CACHE_ROOT / "vdatum.sqlite",
             ]:
                 if p.exists():
                     paths.append(p)
@@ -476,16 +476,17 @@ TIERS: list[CacheTier] = [
     ),
     CacheTier(
         number=4,
-        name="Discovery caches",
-        short_desc="JSON/GeoJSON indices (bbox→URLs, project lists)",
+        name="Metadata & Discovery caches",
+        short_desc="JSON/GeoJSON/SQLite indices (bbox→URLs, API offsets)",
         long_desc=(
-            "Five small metadata files recording which surveys/tiles cover each area.\n"
+            "Six lightweight metadata databases recording URL coverage and API lookups.\n"
             "Populated on-demand; survive restarts for fully offline tile generation.\n\n"
             "  ncei_bag/discovery_cache.json        bbox → BAG download-URL list\n"
             "  noaa_bluetopo/tile_url_cache.json    tile_id → HTTPS asset URL (S3 glob)\n"
             "  metadata/ncei_bag_redirects.json     landing-page URL → .bag file URL\n"
             "  metadata/noaa_coastal_lidar.json     project ID → folder name\n"
-            "  metadata/noaa_project_extents.geojson  project spatial bbox index\n\n"
+            "  metadata/noaa_project_extents.geojson  project spatial bbox index\n"
+            "  vdatum.sqlite                        Local sqlite WAL cache for NOAA API conversions\n\n"
             "Purge when: NCEI published new surveys, NOAA updated BlueTopo tile\n"
             "filenames (cached URLs will 404), or a new topobathy lidar project was added.\n\n"
             "Rebuild cost: seconds to minutes — re-queried from network on next request.\n"
@@ -518,7 +519,7 @@ TIERS: list[CacheTier] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Discovery cache file registry
+# Metadata & Discovery cache file registry
 # ---------------------------------------------------------------------------
 
 _DISCOVERY_FILES: list[tuple[str, Path]] = [
@@ -527,6 +528,7 @@ _DISCOVERY_FILES: list[tuple[str, Path]] = [
     ("metadata/ncei_bag_redirects.json", CACHE_ROOT / "metadata" / "ncei_bag_redirects.json"),
     ("metadata/noaa_coastal_lidar.json", CACHE_ROOT / "metadata" / "noaa_coastal_lidar.json"),
     ("metadata/noaa_project_extents.geojson", CACHE_ROOT / "metadata" / "noaa_project_extents.geojson"),
+    ("vdatum.sqlite", CACHE_ROOT / "vdatum.sqlite"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -698,7 +700,7 @@ def _gather_status_data() -> _StatusData:
 
                     extents_res = _fused_zarr_extents(z_item)
                     if extents_res is not None:
-                        x0, x1, y0, y1, res, res_origin, tgt_zoom, res_m = extents_res
+                        x0, x1, y0, y1, res, res_origin, _tgt_zoom, res_m = extents_res
                         zoom, lon_min, lon_max, lat_min, lat_max = _proj_to_zoom_and_lonlat(
                             x0, x1, y0, y1, resolution=res
                         )
@@ -762,10 +764,19 @@ def _gather_status_data() -> _StatusData:
             d.discovery.append((label, False, 0, 0, 0.0))
             continue
         try:
-            with open(path) as f:
-                data = json.load(f)
-            entries = len(data) if isinstance(data, dict | list) else -1
             stat = path.stat()
+            entries = -1
+            if path.suffix == ".sqlite":
+                import contextlib
+                import sqlite3
+
+                with contextlib.closing(sqlite3.connect(path)) as conn:
+                    cur = conn.execute("SELECT COUNT(*) FROM vdatum_offsets")
+                    entries = cur.fetchone()[0]
+            else:
+                with open(path) as f:
+                    data = json.load(f)
+                entries = len(data) if isinstance(data, dict | list) else -1
             d.discovery.append((label, True, stat.st_size, entries, stat.st_mtime))
         except Exception:
             d.discovery.append((label, False, 0, 0, 0.0))
@@ -1172,7 +1183,12 @@ def cmd_check(clean: bool = False, lock_timeout: int = 3600) -> None:
 
     _scan_global_orphans(clean=clean, lock_timeout=lock_timeout)
 
-    disco_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", title="Discovery Caches")
+    disco_table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold dim",
+        title="Metadata & Discovery Caches",
+    )
     disco_table.add_column("File", min_width=44)
     disco_table.add_column("Size", justify="right", width=10)
     disco_table.add_column("Entries", justify="right", width=8)
@@ -1185,13 +1201,22 @@ def cmd_check(clean: bool = False, lock_timeout: int = 3600) -> None:
             continue
         any_found = True
         try:
-            with open(path) as f:
-                data = json.load(f)
-            ec = len(data) if isinstance(data, dict | list) else "?"
+            ec = "?"
+            if path.suffix == ".sqlite":
+                import contextlib
+                import sqlite3
+
+                with contextlib.closing(sqlite3.connect(path)) as conn:
+                    cur = conn.execute("SELECT COUNT(*) FROM vdatum_offsets")
+                    ec = str(cur.fetchone()[0])
+            else:
+                with open(path) as f:
+                    data = json.load(f)
+                ec = str(len(data)) if isinstance(data, dict | list) else "?"
             disco_table.add_row(
                 label, _fmt_size(path.stat().st_size), str(ec), Text("OK", style="green bold")
             )
-        except json.JSONDecodeError as e:
+        except Exception as e:
             if clean:
                 path.unlink()
                 disco_table.add_row(label, "—", "—", Text("DELETED", style="red bold"))

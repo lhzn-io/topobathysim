@@ -35,6 +35,7 @@ class HydrateRequest(BaseModel):
         ge=0,
         le=22,
     )
+    policy_name: str | None = Field(None, description="Name of a server-side policy (e.g., 'wlis')")
     policy_yaml: str | None = Field(None, description="Optional raw YAML config to override default policy")
     max_workers: int = Field(
         2, description="Number of workers to use for parallel grid fetching", ge=1, le=16
@@ -74,3 +75,15 @@ class TileMetadataResponse(BaseModel):
     cache_status: str
     request_params: str | None = None
     provenance_dict: dict[str, dict[str, Any]] | None = None
+
+
+class DEMQualityStats(BaseModel):
+    max_slope_deg: float
+    missing_data_pct: float
+    vdatum_risk_score: int
+    steep_cliffs_count: int
+
+
+class DEMQualityReport(BaseModel):
+    stats: DEMQualityStats
+    features: dict[str, Any]

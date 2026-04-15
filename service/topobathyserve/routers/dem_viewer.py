@@ -9,8 +9,10 @@ import numpy as np
 import xarray as xr
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
+from topobathyserve.models import DEMQualityReport
 
 from topobathysim.config import get_cache_root
+from topobathysim.quality import calculate_spatial_stats
 
 logger = logging.getLogger(__name__)
 
@@ -711,6 +713,40 @@ async def get_provenance_binary(
             "X-Grid-Height": str(out_h),
         },
     )
+
+
+@router.get("/datasets/{dataset_id}/quality", response_model=DEMQualityReport)
+async def get_dataset_quality(
+    dataset_id: str,
+    resolution: float = Query(30.0, description="Approximate nominal grid resolution in meters"),
+) -> DEMQualityReport:
+    """Return quality report computed over the cached full-mosaic DEM without executing any fusion."""
+    try:
+        # Re-use metadata and trigger mosaic building if missing
+        meta = await get_dataset_meta(dataset_id, max_dim=None)
+        elev_resp = await get_elevation_binary(dataset_id, max_dim=None)
+        prov_resp = await get_provenance_binary(dataset_id, max_dim=None)
+
+        full_h = meta["full_height"]
+        full_w = meta["full_width"]
+
+        elevation = np.frombuffer(elev_resp.body, dtype=np.float32).reshape(full_h, full_w)
+        source_map = np.frombuffer(prov_resp.body, dtype=np.uint32).reshape(full_h, full_w)
+
+        report_data = calculate_spatial_stats(
+            elevation=elevation,
+            source_map=source_map,
+            resolution_m=resolution,
+            bounds=tuple(meta["bounds"]),
+            steep_threshold_m=3.0,
+            pit_ratio_threshold=3.0,
+        )
+
+        return DEMQualityReport(**report_data)
+
+    except Exception as e:
+        logger.error(f"Dataset quality reporting failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.delete("/datasets/{dataset_id}/cache")

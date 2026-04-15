@@ -1,4 +1,6 @@
+import fnmatch
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Any, cast
 
@@ -49,6 +51,80 @@ def sanitize_elevation_nodata(
         cleaned = cleaned.where(cleaned < max_valid)
 
     return cast(xr.DataArray, cleaned)
+
+
+def interpolate_small_gaps(da: xr.DataArray, max_gap_m: float, resolution_m: float) -> xr.DataArray:
+    """
+    Interpolate localized NaNs (data holidays) up to the specified size constraint.
+
+    Uses rasterio's fillnodata (GDAL) to efficiently fill small gaps
+    without massive memory overhead, avoiding SciPy ArrayMemoryError on huge grids.
+    """
+    import scipy.ndimage as ndi
+    from rasterio.fill import fillnodata
+
+    vals = da.values.copy()
+    valid = ~np.isnan(vals)
+
+    # Ensure there's actually missing data to fill and valid data to interpolate from
+    if np.all(valid) or not np.any(valid):
+        return da
+
+    # Find internal holes using binary_fill_holes
+    filled_mask = ndi.binary_fill_holes(valid)
+    holes_mask = filled_mask & ~valid
+
+    if not np.any(holes_mask):
+        return da
+
+    # Distance threshold in pixels (gap width = 2 * distance_to_edge)
+    max_px = (max_gap_m / 2.0) / resolution_m
+
+    if max_px <= 0:
+        return da
+
+    # Use GDAL's highly optimized fillnodata to perform Inverse Distance Weighting
+    # instead of scipy.ndimage.distance_transform_edt which causes 19+ GB RAM spikes.
+    try:
+        from dask.array.core import Array as DaskArray
+
+        if isinstance(vals, DaskArray):
+            # Compute to numpy array before passing to rasterio
+            vals = vals.compute()
+            valid = ~np.isnan(vals)
+            filled_mask = ndi.binary_fill_holes(valid)
+            holes_mask = filled_mask & ~valid
+    except ImportError:
+        pass
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", module="rasterio")
+        filled_vals = fillnodata(vals, mask=valid, max_search_distance=max_px, smoothing_iterations=0)
+
+    # We only want to fill pixels that are within internal holes
+    # and were previously NaN. Revert anything outside the holes_mask.
+    out_of_bounds = (~holes_mask) & (~valid)
+    filled_vals[out_of_bounds] = np.nan
+
+    return cast(xr.DataArray, da.copy(data=filled_vals))
+
+
+def matches_pattern(name: str, patterns: list[str]) -> bool:
+    """Return True if name matches any pattern in the list.
+
+    Supports fnmatch globs (e.g. ``H*``, ``W*``) and inline regex for cases
+    that need case-insensitive or complex matching (prefix with ``(?i)`` or
+    ``^``).  Both are stdlib — no extra dependency needed.
+    """
+    for p in patterns:
+        if p.startswith("(?i)") or p.startswith("^"):
+            if re.match(p, name):
+                return True
+        elif fnmatch.fnmatch(name, p):
+            return True
+    return False
 
 
 class ProviderNoDataError(LookupError):

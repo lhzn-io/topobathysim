@@ -91,6 +91,21 @@ NOAA NCEI - Bathymetric Attributed Grid (BAG)
     *   **Access**: `NCEI Bathymetry Data Viewer <https://www.ncei.noaa.gov/maps/bathymetry/>`_
     *   **Programmatic Access**: `NOAA GeoPlatform Hydrographic Surveys <https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOS_Hydro_Surveys/FeatureServer>`_
 
+Fusion Strategy: Redundancy & Spatial Overwrite
+-----------------------------------------------
+
+A frequent scenario in TopoBathySim is the overlap between **BlueTopo** (Tier 2, Regional) and **NCEI BAG** (Tier 0, High-Res Truth). BlueTopo is distributed as large geographic mosaic tiles (e.g., ``BH5245GP``) which contain compiled data from dozens of underlying surveys. Many of the newer sub-surveys inside these mosaics are also natively available via the NCEI BAG provider at much higher resolutions (e.g., 50cm).
+
+Because BlueTopo macro-tiles aggregate both sparse historic data (which has no BAG equivalent) and modern high-resolution arrays, TopoBathySim **intentionally fetches both layers without attempting to pre-filter redundancies at the network level**.
+
+The engine gracefully resolves this redundancy automatically in memory:
+
+1. **Base Canvas**: The full BlueTopo mosaic (e.g., 4m resolution) is fetched and instantiated, establishing a continuous base elevation canvas that includes the older historical soundings.
+2. **High-Res Overlay**: The engine simultaneously fetches the hyper-resolution 50cm or 1m BAG geometries for the modern surveys inside the bounding box.
+3. **Spatial Overwrite**: Using the policy's defined transition operators (such as ``metric_feather`` blending), the native BAG arrays seamlessly overwrite their exact spatial footprints directly on top of the BlueTopo canvas in VRAM.
+
+This top-to-bottom geographic override guarantees that older, non-BAG surveys inside the BlueTopo macro-tile are preserved, while the modern active swaths are dynamically upgraded to their highest possible fidelity with zero visual seams, duplicated points, or wasted network requests.
+
 NoData Sentinel Evidence Matrix
 -------------------------------
 

@@ -22,11 +22,11 @@ from filelock import FileLock
 from rioxarray.merge import merge_arrays
 from shapely.geometry import Point, box
 
+from ..config import get_cache_root
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from ..config import get_cache_root
-from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
+from .base import Provider, ProviderNoDataError, interpolate_small_gaps, sanitize_elevation_nodata
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -445,8 +445,15 @@ class NoaaBlueTopoProvider(Provider):
         Fetch BlueTopo layer for the given bounding box.
         Resolves, fetches, and merges all intersecting tiles.
         """
+        from .base import matches_pattern
+
         # Ensure the bbox is in EPSG:4326 for tile resolution and metadata checks
         west, south, east, north = self._normalize_bbox(bbox, crs)
+
+        filter_opts = kwargs.get("filter", {})
+        include_patterns = filter_opts.get("include_patterns")
+        exclude_patterns = filter_opts.get("exclude_patterns")
+        max_interpolation_gap_m = filter_opts.get("max_interpolation_gap_m")
 
         # Keep request-CRS bounds for final clipping when the caller asks for
         # a non-4326 output (e.g., web mercator tile requests).
@@ -497,6 +504,18 @@ class NoaaBlueTopoProvider(Provider):
                             # Runtime fusion order resolves final precedence.
                             survey_id = survey_id.strip()
 
+                        # Apply include/exclude pattern masking
+                        if survey_id:
+                            skip = False
+                            if include_patterns and not matches_pattern(survey_id, include_patterns):
+                                skip = True
+                            if exclude_patterns and matches_pattern(survey_id, exclude_patterns):
+                                skip = True
+
+                            if skip:
+                                logger.debug(f"Skipping filtered BlueTopo source: {survey_id}")
+                                continue
+
                         name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}_{pval_int}"
                         digest = hashlib.md5(name.encode()).hexdigest()
                         project_uid = int(digest, 16) % 100000 + 50000
@@ -520,6 +539,18 @@ class NoaaBlueTopoProvider(Provider):
                         # Keep BlueTopo data available as a resilient fallback.
                         # Runtime fusion order resolves final precedence.
                         survey_id = survey_id.strip()
+
+                    # Apply include/exclude pattern masking
+                    if survey_id:
+                        skip = False
+                        if include_patterns and not matches_pattern(survey_id, include_patterns):
+                            skip = True
+                        if exclude_patterns and matches_pattern(survey_id, exclude_patterns):
+                            skip = True
+
+                        if skip:
+                            logger.debug(f"Skipping filtered BlueTopo source: {survey_id}")
+                            continue
 
                     name = f"BlueTopo: {survey_id}" if survey_id else f"BlueTopo: {tid}"
 
@@ -798,6 +829,11 @@ class NoaaBlueTopoProvider(Provider):
             merged = self._ensure_dataset_spatial_ref(merged)
         except Exception as e:
             logger.warning(f"BlueTopo final clip failed: {e}")
+
+        if max_interpolation_gap_m and resolution:
+            merged["elevation"] = interpolate_small_gaps(
+                merged["elevation"], max_interpolation_gap_m, resolution
+            )
 
         merged["elevation"].name = "elevation"
         merged.attrs["provenance_dict"] = provenance_dict
@@ -1284,13 +1320,15 @@ class NoaaBlueTopoProvider(Provider):
                     ds_to_cache.attrs["vdatum_offset"] = offset
                     ds_to_cache.attrs["vertical_datum"] = "NAVD88"
                 else:
-                    logger.warning(f"Suspicious VDatum offset {offset} for {tile_id}. NOT applying.")
+                    logger.warning(f"Suspicious VDatum offset {offset} for {tile_id}, dropping tile.")
+                    return xr.Dataset()
 
             except Exception as e:
                 logger.warning(
                     f"VDatum conversion failed for BlueTopo tile {tile_id}: {e}. "
-                    "Data may be inconsistent with NAVD88."
+                    "Dropping dataset to prevent artificial cliffs."
                 )
+                return xr.Dataset()
 
             ds_to_cache = self._stash_cache_crs(ds_to_cache)
             ds_to_cache = self._ensure_dataset_spatial_ref(ds_to_cache)
@@ -1693,6 +1731,98 @@ class NoaaBlueTopoProvider(Provider):
         except Exception as e:
             logger.warning(f"HSMDB API Query failed: {e}")
         return None
+
+    def get_all_survey_ids(self, tile_id: str) -> list[str]:
+        """
+        Extracts all unique survey IDs present within a given tile's sidecar RAT file.
+        Downloads the sidecar if missing.
+        """
+        self._ensure_scheme_loaded()
+        if self._gdf is None:
+            return []
+
+        try:
+            tile_col = "tile" if "tile" in self._gdf.columns else "Tile_Name"
+            matches = self._gdf[self._gdf[tile_col] == tile_id]
+            if matches.empty:
+                return []
+
+            tile_row = matches.iloc[0]
+            rat_link = tile_row.get("RAT_Link") or tile_row.get("rat_link")
+            if not rat_link:
+                return []
+
+            filename = Path(rat_link).name
+            sidecar_dir = self.cache_dir / "sidecars"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_file = sidecar_dir / filename
+            failed_sentinel = sidecar_file.with_suffix(sidecar_file.suffix + ".failed")
+
+            if failed_sentinel.exists():
+                return []
+
+            if not sidecar_file.exists():
+                r = requests.get(rat_link, timeout=30)
+                if r.status_code == 200:
+                    with open(sidecar_file, "wb") as f:
+                        f.write(r.content)
+                else:
+                    failed_sentinel.touch()
+                    return []
+
+            if sidecar_file.suffix.lower() == ".xml":
+                import xml.etree.ElementTree as Et
+
+                tree = Et.parse(sidecar_file)
+                root = tree.getroot()
+
+                rat_node = None
+                for band in root.findall("PAMRasterBand"):
+                    if band.get("band") == "3":
+                        rat_node = band.find("GDALRasterAttributeTable")
+                        break
+                if rat_node is None:
+                    rat_node = root.find("GDALRasterAttributeTable")
+                if rat_node is None:
+                    return []
+
+                field_map = {}
+                for fd in rat_node.findall("FieldDefn"):
+                    idx_str = fd.get("index")
+                    name_tag = fd.find("Name")
+                    if idx_str and name_tag is not None and name_tag.text:
+                        field_map[int(idx_str)] = name_tag.text.lower()
+
+                survey_idx = next(
+                    (i for i, n in field_map.items() if n in ["survey_id", "source_survey_id", "source_id"]),
+                    None,
+                )
+                if survey_idx is None:
+                    return []
+
+                surveys = set()
+                for row in rat_node.findall("Row"):
+                    fs = row.findall("F")
+                    if len(fs) > survey_idx:
+                        s_txt = fs[survey_idx].text
+                        if s_txt:
+                            surveys.add(str(s_txt).strip())
+                return sorted(list(surveys))
+
+            # For DBF parsing
+            import geopandas as gpd
+
+            df = gpd.read_file(sidecar_file)
+            df.columns = [c.lower() for c in df.columns]
+            survey_col = next(
+                (c for c in df.columns if c in ["survey_id", "source_survey_id", "source_id"]), None
+            )
+            if survey_col:
+                return sorted(list(df[survey_col].dropna().unique()))
+
+        except Exception as e:
+            logger.warning(f"Failed to get_all_survey_ids for {tile_id}: {e}")
+        return []
 
 
 # Register the provider

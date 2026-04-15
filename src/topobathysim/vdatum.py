@@ -1,5 +1,8 @@
 import logging
-from functools import lru_cache
+import sqlite3
+from collections.abc import Callable
+from functools import lru_cache, wraps
+from pathlib import Path
 from typing import Any
 
 import requests  # type: ignore
@@ -7,6 +10,83 @@ from requests.adapters import HTTPAdapter  # type: ignore
 from urllib3.util.retry import Retry  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# Constants for persistent SQLite Cache
+VDATUM_CACHE_DIR = Path("~/").expanduser() / ".cache" / "topobathysim"
+VDATUM_DB_PATH = VDATUM_CACHE_DIR / "vdatum.sqlite"
+
+
+def _init_db() -> None:
+    """Initialize the SQLite WAL database and layout schemas."""
+    VDATUM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vdatum_offsets (
+                offset_type TEXT,
+                lat REAL,
+                lon REAL,
+                offset REAL,
+                PRIMARY KEY (offset_type, lat, lon)
+            )
+            """
+        )
+
+
+# Initialize on module load
+try:
+    _init_db()
+except sqlite3.Error as e:
+    logger.warning(f"Failed to initialize VDatum SQLite cache: {e}")
+
+
+def sqlite_vdatum_cache(offset_type: str) -> Callable:
+    """
+    Decorator for L2 SQLite caching of VDatum API calls.
+    Mitigates completely the file lock contention seen with .lock files
+    by utilizing SQLite WAL-mode concurrency.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(lat: float, lon: float) -> float:
+            try:
+                # 1. Read L2 hit
+                with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
+                    crs = conn.execute(
+                        "SELECT offset FROM vdatum_offsets WHERE offset_type=? AND lat=? AND lon=?",
+                        (offset_type, lat, lon),
+                    )
+                    row = crs.fetchone()
+                    if row is not None:
+                        return float(row[0])
+            except sqlite3.Error as e:
+                logger.debug(f"SQLite read bypassed for ({lat},{lon}): {e}")
+
+            # 2. Fetch value natively through HTTP (this throws VDatumNoDataError gracefully)
+            val = func(lat, lon)
+
+            # 3. Write L2 entry asynchronously capable via WAL
+            try:
+                with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO vdatum_offsets
+                        (offset_type, lat, lon, offset) VALUES (?, ?, ?, ?)
+                        """,
+                        (offset_type, lat, lon, val),
+                    )
+            except sqlite3.Error as e:
+                logger.debug(f"SQLite write bypassed for ({lat},{lon}): {e}")
+
+            return float(val)
+
+        return wrapper
+
+    return decorator
 
 
 class VDatumError(Exception):
@@ -33,6 +113,11 @@ class VDatumResolver:
     def _get_session() -> requests.Session:
         """Creates a session with retries for robust API calls."""
         session = requests.Session()
+        ua = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(HTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        session.headers.update({"User-Agent": ua})
         retry = Retry(
             total=3,
             backoff_factor=1,
@@ -46,6 +131,7 @@ class VDatumResolver:
 
     @staticmethod
     @lru_cache(maxsize=1024)
+    @sqlite_vdatum_cache("navd88_lmsl")
     def get_navd88_to_lmsl_offset(lat: float, lon: float) -> float:
         """
         Calculates the vertical shift to convert NAVD88 elevation to LMSL.
@@ -86,6 +172,7 @@ class VDatumResolver:
 
     @staticmethod
     @lru_cache(maxsize=1024)
+    @sqlite_vdatum_cache("mllw_navd88")
     def get_mllw_to_navd88_offset(lat: float, lon: float) -> float:
         """
         Calculates shift from MLLW to NAVD88.
@@ -128,6 +215,7 @@ class VDatumResolver:
 
     @staticmethod
     @lru_cache(maxsize=1024)
+    @sqlite_vdatum_cache("ellipsoid_navd88")
     def get_ellipsoid_to_navd88_offset(lat: float, lon: float) -> float:
         """
         Calculates shift from NAD83(2011) Ellipsoid to NAVD88 using GEOID18.
@@ -168,6 +256,7 @@ class VDatumResolver:
 
     @staticmethod
     @lru_cache(maxsize=1024)
+    @sqlite_vdatum_cache("egm2008_navd88")
     def get_egm2008_to_navd88_offset(lat: float, lon: float) -> float:
         """
         Calculates shift from EGM2008 to NAVD88.
@@ -206,6 +295,37 @@ class VDatumResolver:
             raise
 
     @staticmethod
+    def get_robust_ellipsoid_to_navd88_offset(
+        lat: float, lon: float, search_radius: float = 0.05, steps: int = 5
+    ) -> float:
+        """
+        Attempts to find a valid Ellipsoid->NAVD88 offset by searching spirally outward.
+        Returns the average of valid points found at the nearest valid radius.
+        """
+        try:
+            return float(VDatumResolver.get_ellipsoid_to_navd88_offset(lat, lon))
+        except VDatumNoDataError:
+            pass
+
+        step_deg = search_radius / steps
+        for r in range(1, steps + 1):
+            curr_dist = r * step_deg
+            offsets = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+            valid_vals = []
+            for dy, dx in offsets:
+                t_lat = lat + (dy * curr_dist)
+                t_lon = lon + (dx * curr_dist)
+                try:
+                    val = VDatumResolver.get_ellipsoid_to_navd88_offset(t_lat, t_lon)
+                    valid_vals.append(val)
+                except VDatumNoDataError:
+                    continue
+            if valid_vals:
+                return float(sum(valid_vals) / len(valid_vals))
+
+        raise VDatumNoDataError(f"VDatum robust search failed within {search_radius} deg of ({lat}, {lon})")
+
+    @staticmethod
     def get_robust_mllw_to_navd88_offset(
         lat: float, lon: float, search_radius: float = 0.05, steps: int = 5
     ) -> float:
@@ -216,8 +336,8 @@ class VDatumResolver:
         """
         # 1. Try exact point first
         try:
-            return VDatumResolver.get_mllw_to_navd88_offset(lat, lon)
-        except (VDatumNoDataError, Exception):
+            return float(VDatumResolver.get_mllw_to_navd88_offset(lat, lon))
+        except VDatumNoDataError:
             pass
 
         # 2. Spiral Search
@@ -243,12 +363,12 @@ class VDatumResolver:
                 try:
                     val = VDatumResolver.get_mllw_to_navd88_offset(t_lat, t_lon)
                     valid_vals.append(val)
-                except (VDatumNoDataError, Exception):
+                except VDatumNoDataError:
                     continue
 
             if valid_vals:
                 # Return average of valid samples at this ring
-                return sum(valid_vals) / len(valid_vals)
+                return float(sum(valid_vals) / len(valid_vals))
 
         # Fallback for very specific cases or raise
         raise VDatumNoDataError(f"VDatum robust search failed within {search_radius} deg of ({lat}, {lon})")
