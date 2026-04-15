@@ -526,7 +526,8 @@
                     statusDiv.innerHTML = `Job submitted: <code>${data.job_id}</code>`;
                     statusDiv.className = 'success';
                     // Build WS URL relative to current page if response provides one
-                    const wsUrl = data.ws || `ws://${location.host}/hydrate/${data.job_id}/ws`;
+                    const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = data.ws || `${wsProtocol}//${location.host}/hydrate/${data.job_id}/ws`;
                     monitorJob(data.job_id, wsUrl);
                 } else {
                     statusDiv.innerHTML = `❌ Error: ${data.detail || 'Unknown error'}`;
