@@ -298,11 +298,10 @@ class NoaaTopobathyProvider(Provider):
 
         # 3. Merge Projects
         # project_layers is ordered [Best, ..., Worst]
-        # merge_arrays puts the LAST element on top.
-        # We want Best on top, so we must pass [Worst, ..., Best]
-        # Reverse the list.
-        elevs = [ds["elevation"] for ds in project_layers[::-1]]
-        sources = [ds["source_id"] for ds in project_layers[::-1]]
+        # rioxarray's merge_arrays defaults to method='first', so the FIRST element takes precedence.
+        # Thus, passing the list directly [Best, ..., Worst] ensures Best is on top.
+        elevs = [ds["elevation"] for ds in project_layers]
+        sources = [ds["source_id"] for ds in project_layers]
 
         final_elev = merge_arrays(elevs)
         final_elev = self._sanitize_nodata_values(final_elev)
@@ -953,6 +952,20 @@ class NoaaTopobathyProvider(Provider):
                     return []
 
                 # --- SCORING & SORTING ---
+                # Check for explicit list ordering
+                allowed_pids = []
+                if filter_criteria and isinstance(filter_criteria.get("project_id"), list):
+                    allowed_pids = [str(p) for p in filter_criteria["project_id"]]
+
+                def explicit_score(pid: object) -> int:
+                    pid_str = str(pid)
+                    if pid_str in allowed_pids:
+                        # Give higher scores to indices earlier in the YAML list
+                        return len(allowed_pids) - allowed_pids.index(pid_str)
+                    return 0
+
+                candidates["explicit_score"] = candidates["project_id"].apply(explicit_score)
+
                 # 1. Datum Priority (Geoid18 > NAVD88 > Ellipsoid)
                 def datum_score(d: object) -> int:
                     """
@@ -986,9 +999,10 @@ class NoaaTopobathyProvider(Provider):
                 # 3. Recency (Year)
                 # candidates["year_computed"] is already there
 
-                # 4. Sort by Name > Year > Datum
+                # 4. Sort by Explicit List > Name > Year > Datum
                 candidates = candidates.sort_values(
-                    by=["name_score", "year_computed", "datum_score"], ascending=[False, False, False]
+                    by=["explicit_score", "name_score", "year_computed", "datum_score"],
+                    ascending=[False, False, False, False],
                 )
 
                 # Return list of IDs
@@ -1205,8 +1219,15 @@ class NoaaTopobathyProvider(Provider):
             # If tile_filename comes in as a full URL (from 'URL' column in index)
             # Use it directly as the download source
             http_url = tile_filename
-            # Extract just the name for local storage
-            tile_filename = tile_filename.split("/")[-1]
+
+            # Preserve path structure for unique cache keys instead of just the basename
+            import urllib.parse
+
+            parsed = urllib.parse.urlparse(http_url)
+            path = parsed.path.lstrip("/")
+            if path.startswith("dem/"):
+                path = path[4:]
+            tile_filename = path
         else:
             # Construct standard URL
             # Clean up leading slashes that cause double slashes in S3 URL string
