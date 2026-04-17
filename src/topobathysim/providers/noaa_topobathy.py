@@ -278,13 +278,13 @@ class NoaaTopobathyProvider(Provider):
                         p_merged.name = "elevation"
                         p_source = xr.where(p_merged.notnull(), project_uid, 0).astype(np.uint32)
                         p_source.name = "source_id"
-                        p_source.rio.write_nodata(0, inplace=True)
+                        p_source = p_source.rio.write_nodata(0)
                         p_source.attrs["_FillValue"] = 0
 
                         p_ds = xr.Dataset({"elevation": p_merged, "source_id": p_source})
                         # carry over spatial attributes
-                        p_ds.rio.write_crs(p_merged.rio.crs, inplace=True)
-                        p_ds.rio.write_transform(p_merged.rio.transform(), inplace=True)
+                        p_ds = p_ds.rio.write_crs(p_merged.rio.crs)
+                        p_ds = p_ds.rio.write_transform(p_merged.rio.transform())
 
                         project_layers.append(p_ds)
                     except Exception as e:
@@ -411,7 +411,7 @@ class NoaaTopobathyProvider(Provider):
                         except Exception as e:
                             logger.warning(f"Corrupt or stale metadata JSON {json_path}: {e}")
                     else:
-                        logger.info(f"NOAA Index cache expired ({age/86400:.1f} days).")
+                        logger.info(f"NOAA Index cache expired ({age / 86400:.1f} days).")
 
                 if not refresh_needed:
                     return
