@@ -1030,6 +1030,26 @@ class NoaaBlueTopoProvider(Provider):
         except Exception as e:
             logger.warning(f"Failed to update BlueTopo tile URL cache: {e}")
 
+    def _invalidate_tile_url_cache(self, tile_id: str) -> None:
+        """Removes a corrupt or stale URL from the cache."""
+        try:
+            import json
+
+            from filelock import FileLock
+
+            if not self.TILE_URL_CACHE_PATH.exists():
+                return
+            lock_path = self.TILE_URL_CACHE_PATH.with_suffix(".json.lock")
+            with FileLock(str(lock_path)):
+                with open(self.TILE_URL_CACHE_PATH) as f:
+                    data = json.load(f)
+                if tile_id in data:
+                    del data[tile_id]
+                    with open(self.TILE_URL_CACHE_PATH, "w") as f:
+                        json.dump(data, f)
+        except Exception:
+            pass
+
     def _resolve_tile_url(self, tile_id: str) -> str | None:
         """
         Resolves the HTTPS URL for a given tile ID by checking S3.
@@ -1227,7 +1247,22 @@ class NoaaBlueTopoProvider(Provider):
         da_raw = None
         try:
             # Open Streaming
-            da_raw = cast(xr.DataArray, rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048}))
+            try:
+                da_raw = cast(xr.DataArray, rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048}))
+            except Exception as e:
+                if "404" in str(e):
+                    logger.warning(
+                        f"BlueTopo 404 for {http_url}. Invalidating cache and retrying S3 resolution."
+                    )
+                    self._invalidate_tile_url_cache(tile_id)
+                    http_url = self._resolve_tile_url(tile_id)
+                    if not http_url:
+                        raise e
+                    da_raw = cast(
+                        xr.DataArray, rioxarray.open_rasterio(http_url, chunks={"x": 2048, "y": 2048})
+                    )
+                else:
+                    raise e
 
             # Log original source geotransform
             orig_crs = da_raw.rio.crs
