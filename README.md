@@ -79,6 +79,26 @@ These layers are typically prioritized *where they exist* and may overwrite comp
 
 See `docs/source/data_sources.rst` for citations and acknowledgements.
 
+## Docker
+
+The service can be built and run in Docker. The `Dockerfile` defaults to `nvidia/cuda:12.6.3-devel-ubuntu24.04` (x86_64). Override `BASE_IMAGE` for other targets:
+
+```bash
+# x86_64 / WSL2 with NVIDIA GPU (default)
+docker build -t topobathysim .
+docker run --rm --gpus all -p 9595:9595 topobathysim
+
+# NVIDIA Jetson AGX Orin (JetPack 6.x)
+docker build --build-arg BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.2.0 -t topobathysim .
+docker run --rm --gpus all -p 9595:9595 topobathysim
+
+# macOS (Apple Silicon or Intel) via OrbStack / Docker Desktop — no GPU
+docker build --build-arg BASE_IMAGE=ubuntu:24.04 -t topobathysim .
+docker run --rm -p 9595:9595 topobathysim
+```
+
+Validated platforms: x86_64 (RTX 5080, CUDA 12.6, Ubuntu 24.04), NVIDIA Jetson AGX Orin (JetPack 6.1 / L4T r36.2), and macOS Apple Silicon (OrbStack).
+
 ## Quick start (library)
 
 Install (editable is recommended for development):
