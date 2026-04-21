@@ -16,10 +16,11 @@ import matplotlib
 matplotlib.use("Agg")
 
 import contextlib
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Annotated, Any
 
 import numpy as np
@@ -27,6 +28,7 @@ import xarray as xr
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 
 from topobathysim.config import get_cache_root
 from topobathysim.policy.loader import hash_policy, load_policy, load_policy_from_str
@@ -325,8 +327,6 @@ def fuse(
         raise HTTPException(status_code=404, detail="Fusion returned no elevation data")
 
     if fmt == "zarr":
-        import zarr.storage
-
         ds_out = ds.copy()
         keep_vars = ["elevation"]
         if "source_elevation" in ds_out:
@@ -334,18 +334,27 @@ def fuse(
         ds_out = ds_out[keep_vars]
         ds_out.attrs = _build_zarr_attrs(ds, bbox_tuple, resolution, policy_path.name)
 
-        with TemporaryDirectory() as tmpdir:
-            zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
-            store = zarr.storage.ZipStore(str(zarr_zip_path), mode="w")
-            try:
-                ds_out.to_zarr(store, mode="w")
-            finally:
-                store.close()
+        # Force fill_value for all arrays to satisfy Zarr.jl
+        encoding = {}
+        for var_name in ds_out.data_vars:
+            encoding[var_name] = {"_FillValue": 0}
+            if var_name == "source_elevation":
+                ds_out[var_name].attrs["_FillValue"] = 0
+                ds_out[var_name].encoding["_FillValue"] = 0
 
-            data = zarr_zip_path.read_bytes()
+        tmpdir = tempfile.mkdtemp()
+        zarr_dir = Path(tmpdir) / "fused.zarr"
+        ds_out.to_zarr(zarr_dir, mode="w", consolidated=True, zarr_format=2)
+        shutil.make_archive(str(Path(tmpdir) / "fused.zarr"), "zip", str(zarr_dir))
+        zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
 
         headers = {"Content-Disposition": "attachment; filename=fused.zarr.zip"}
-        return Response(content=data, media_type="application/zip", headers=headers)
+        return FileResponse(
+            path=zarr_zip_path,
+            media_type="application/zip",
+            headers=headers,
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
 
     buf = BytesIO()
     ds["elevation"].rio.to_raster(buf, driver="GTiff")
@@ -395,8 +404,6 @@ def fuse_post(
         raise HTTPException(status_code=404, detail="Fusion returned no elevation data")
 
     if fmt == "zarr":
-        import zarr.storage
-
         ds_out = ds.copy()
         keep_vars = ["elevation"]
         if "source_elevation" in ds_out:
@@ -412,18 +419,28 @@ def fuse_post(
 
         ds_out.attrs = _build_zarr_attrs(ds, request.bbox, request.resolution, p_name)
 
-        with TemporaryDirectory() as tmpdir:
-            zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
-            store = zarr.storage.ZipStore(str(zarr_zip_path), mode="w")
-            try:
-                ds_out.to_zarr(store, mode="w")
-            finally:
-                store.close()
+        # Force fill_value for all arrays to satisfy Zarr.jl
+        for var_name in ds_out.data_vars:
+            if var_name == "source_elevation":
+                # Do not set in attrs as xarray 2024.x raises ValueError if set in both attrs and encoding
+                # or if it's already an encoding descriptor.
+                if "_FillValue" in ds_out[var_name].attrs:
+                    del ds_out[var_name].attrs["_FillValue"]
+                ds_out[var_name].encoding["_FillValue"] = 0
 
-            data = zarr_zip_path.read_bytes()
+        tmpdir = tempfile.mkdtemp()
+        zarr_dir = Path(tmpdir) / "fused.zarr"
+        ds_out.to_zarr(zarr_dir, mode="w", consolidated=True, zarr_format=2)
+        shutil.make_archive(str(Path(tmpdir) / "fused.zarr"), "zip", str(zarr_dir))
+        zarr_zip_path = Path(tmpdir) / "fused.zarr.zip"
 
         headers = {"Content-Disposition": "attachment; filename=fused.zarr.zip"}
-        return Response(content=data, media_type="application/zip", headers=headers)
+        return FileResponse(
+            path=zarr_zip_path,
+            media_type="application/zip",
+            headers=headers,
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
 
     buf = BytesIO()
     ds["elevation"].rio.to_raster(buf, driver="GTiff")

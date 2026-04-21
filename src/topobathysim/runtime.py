@@ -4,6 +4,7 @@ Core Runtime for TopoBathySim.
 This module executes fusion policies to generate topobathymetric datasets.
 """
 
+import contextlib
 import gc
 import hashlib
 import json
@@ -177,8 +178,13 @@ def _run_cell(
     )
     source_elevation.rio.write_crs(target_crs, inplace=True)
     source_elevation.rio.write_transform(transform, inplace=True)
+    source_elevation.attrs["_FillValue"] = 0
+    source_elevation.encoding["_FillValue"] = 0
 
-    cell_provenance_dict: dict[int, str] = {}
+    base_legend = generate_provider_legend(policy)
+    cell_provenance_dict: dict[int, dict[str, str]] = {
+        k: {"name": f"{v} (Base Terrain)", "provider": v} for k, v in base_legend.items()
+    }
 
     # 5. Execution Loop
     for variable in policy.variables:
@@ -212,6 +218,11 @@ def _run_cell(
             if fetched_data is None:
                 logger.info(f"[PROBE-RUNTIME] Provider {step.provider} returned None.")
                 continue
+
+            # Load the data into memory IMMEDIATELY so we never trigger
+            # complex Dask blockwise warnings when filtering or reprojecting!
+            with contextlib.suppress(AttributeError):
+                fetched_data = fetched_data.compute()
 
             # Extract per-provider source provenance from Dataset
             provider_source_id_da = None
@@ -265,14 +276,14 @@ def _run_cell(
                     ):
                         fetched_data = fetched_data.drop_duplicates(dim=dim)
 
-                aligned_data = fetched_data.rio.reproject_match(elevation)
+                aligned_data = fetched_data.rio.reproject_match(elevation).compute()
 
             except Exception as e:
                 logger.error(f"Reprojection/Index Alignment failed for {step.provider}: {e}")
                 # Try dropping duplicates forcefully again? Or continue
                 continue
 
-            new_data_mask = aligned_data.notnull()
+            new_data_mask = aligned_data.notnull().compute()
 
             aligned_source_id = None
             if provider_source_id_da is not None:
@@ -281,7 +292,7 @@ def _run_cell(
 
                     aligned_source_id = provider_source_id_da.rio.reproject_match(
                         elevation, resampling=Resampling.nearest
-                    )
+                    ).compute()
                     # Squeeze any spurious band dimension introduced by reproject
                     if "band" in aligned_source_id.dims:
                         aligned_source_id = aligned_source_id.squeeze("band", drop=True)
@@ -561,7 +572,7 @@ def hydrate(
         if cache_path.exists():
             try:
                 # Lightweight check: valid Zarr?
-                ds_meta = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+                ds_meta = xr.open_dataset(cache_path, engine="zarr", decode_coords="all")
 
                 valid_grid = ds_meta.attrs.get("grid_cell_size") == grid_cell_size
                 # We trust our hash includes policy content, so a hit is a hit on policy content.
@@ -750,7 +761,7 @@ def run(
         )
         if use_cache and cache_path.exists():
             logger.info(f"Fast Path Cache Hit: {cache_path.name}")
-            ds = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
+            ds = xr.open_dataset(cache_path, engine="zarr", decode_coords="all")
             return cast(xr.Dataset, ds.load())
 
     start_lon, start_lat, end_lon, end_lat = bbox
@@ -801,9 +812,10 @@ def run(
         ds_cell = None
         if use_cache and cache_path.exists():
             try:
-                ds_cell = xr.open_dataset(cache_path, engine="zarr", chunks="auto", decode_coords="all")
-                # Load fully
-                ds_cell = ds_cell.load()
+                # We use chunks="auto" to use dask, but unify it immediately
+                # to prevent Dask task graph explosion during combine_by_coords.
+                ds_cell = xr.open_dataset(cache_path, engine="zarr", decode_coords="all")
+                # Removed chunk re-alignment to dodge Dask entirely
 
                 valid_grid = ds_cell.attrs.get("grid_cell_size") == grid_cell_size
                 # If cached grid size doesn't match current logic, invalidate
@@ -884,27 +896,78 @@ def run(
                 except Exception as e:
                     logger.error(f"Failed to cache cell {cache_path}: {e}")
 
+        # No need to unify chunks since we bypassed Dask combination entirely!
+        ds_cell = ds_cell.assign_coords(x=np.round(ds_cell.x.values, 6), y=np.round(ds_cell.y.values, 6))
         cell_datasets.append(ds_cell)
 
     # Mosaic the cells together
     if len(cell_datasets) == 1:
         merged_ds = cell_datasets[0]
     else:
+        logger.info(
+            f"Mosaicking {len(cell_datasets)} disjoint tiles via preallocated NumPy arrays "
+            "(Avoiding Dask Chunk Explosion)"
+        )
+
         # Sort coordinates to ensure monotonic indexes before combining.
         sorted_cells = [ds.sortby("y", ascending=False).sortby("x", ascending=True) for ds in cell_datasets]
-        # combine_attrs="override" discards per-cell attrs (created_at, cell_bbox); reapplied below.
-        try:
-            merged_ds = cast(xr.Dataset, xr.combine_by_coords(sorted_cells, combine_attrs="override"))
-        except ValueError:
-            # Fallback: chain combine_first so NaN never overrides valid data.
-            # xr.merge(compat="override") uses first-value-wins which lets NaN from a cell that
-            # doesn't cover a coordinate silently mask valid data from another cell.
-            merged_ds = sorted_cells[0]
-            for next_ds in sorted_cells[1:]:
-                merged_ds = cast(xr.Dataset, merged_ds.combine_first(next_ds))
 
-        # combine_by_coords sorts all coords ascending; restore north-up Y ordering.
-        merged_ds = merged_ds.sortby("y", ascending=False).sortby("x", ascending=True)
+        min_x = min(float(ds.x.min()) for ds in sorted_cells)
+        max_x = max(float(ds.x.max()) for ds in sorted_cells)
+        min_y = min(float(ds.y.min()) for ds in sorted_cells)
+        max_y = max(float(ds.y.max()) for ds in sorted_cells)
+
+        # Assert resolution is not None for mypy
+        res = float(resolution) if resolution is not None else 1.0
+
+        x_coords_arr = np.arange(min_x, max_x + res / 2.0, res)
+        y_coords_arr = np.arange(max_y, min_y - res / 2.0, -res)
+
+        logger.info(
+            f"Output grid dimensions: {len(y_coords_arr)}x{len(x_coords_arr)} "
+            f"(Allocating {(len(y_coords_arr) * len(x_coords_arr) * 4) / 1024**2:.2f} MB per array)"
+        )
+        out_elev = np.full((len(y_coords_arr), len(x_coords_arr)), np.nan, dtype=np.float32)
+        out_src = np.zeros((len(y_coords_arr), len(x_coords_arr)), dtype=np.uint32)
+        has_src = any("source_elevation" in ds for ds in sorted_cells)
+
+        cell_datasets.clear()  # Free the original list references immediately
+
+        while sorted_cells:
+            ds = sorted_cells.pop(0).load()  # Load individual tile, popping off list to free RAM immediately
+            elev_data = ds["elevation"].values
+            src_data = ds["source_elevation"].values if "source_elevation" in ds else None
+
+            # Calculate precise insertion boundaries
+            x_start_idx = round((float(ds.x[0]) - min_x) / res)
+            y_start_idx = round((max_y - float(ds.y[0])) / res)
+
+            h, w = elev_data.shape
+            x_end = min(x_start_idx + w, len(x_coords_arr))
+            y_end = min(y_start_idx + h, len(y_coords_arr))
+            slice_w = x_end - x_start_idx
+            slice_h = y_end - y_start_idx
+
+            elev_slice = elev_data[:slice_h, :slice_w]
+            existing_elev = out_elev[y_start_idx:y_end, x_start_idx:x_end]
+
+            mask = ~np.isnan(elev_slice)
+            existing_elev[mask] = elev_slice[mask]
+
+            if has_src and src_data is not None:
+                src_slice = src_data[:slice_h, :slice_w]
+                existing_src = out_src[y_start_idx:y_end, x_start_idx:x_end]
+                existing_src[mask] = src_slice[mask]
+
+            ds.close()  # Free memory immediately for this chunk!
+            import gc
+
+            gc.collect()
+
+        ds_dict: dict[str, tuple[tuple[str, str], np.ndarray]] = {"elevation": (("y", "x"), out_elev)}
+        if has_src:
+            ds_dict["source_elevation"] = (("y", "x"), out_src)
+        merged_ds = xr.Dataset(ds_dict, coords={"x": x_coords_arr, "y": y_coords_arr})
 
         # Drop float duplicate coordinates that can arise at grid cell boundaries to prevent
         # downstream "Reindexing only valid with uniquely valued Index" errors.
@@ -925,6 +988,8 @@ def run(
                     .sortby("y", ascending=False)
                     .interpolate_na(dim="x", method="linear", limit=2)
                 )
+
+        logger.info(f"Mosaic complete. Final combined shape: {merged_ds.dims}")
 
     # Clip to the exact requested bbox, reprojecting bounds to target CRS if needed.
     if target_crs != "EPSG:4326":

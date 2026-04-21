@@ -59,4 +59,9 @@ EXPOSE 9595
 # Set pythonpath so it finds topobathyserve
 ENV PYTHONPATH="/app:/app/src:/app/service"
 
+# Fix ownership so non-root users can write to logs
+ARG UID=1000
+ARG GID=1000
+RUN chown -R ${UID}:${GID} /app
+
 CMD ["uvicorn", "topobathyserve.main:app", "--host", "0.0.0.0", "--port", "9595", "--workers", "2"]
