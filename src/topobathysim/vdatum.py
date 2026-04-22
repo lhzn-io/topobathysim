@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 from collections.abc import Callable
 from functools import lru_cache, wraps
@@ -11,28 +12,43 @@ from urllib3.util.retry import Retry  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-# Constants for persistent SQLite Cache
-VDATUM_CACHE_DIR = Path("~/").expanduser() / ".cache" / "topobathysim"
+# Respects TOPOBATHYSIM_CACHE_DIR so the db lands on the mounted volume in Docker
+VDATUM_CACHE_DIR = Path(os.getenv("TOPOBATHYSIM_CACHE_DIR", "~/.cache/topobathysim")).expanduser()
 VDATUM_DB_PATH = VDATUM_CACHE_DIR / "vdatum.sqlite"
+
+_DDL = """
+    CREATE TABLE IF NOT EXISTS vdatum_offsets (
+        offset_type TEXT,
+        lat REAL,
+        lon REAL,
+        offset REAL,
+        PRIMARY KEY (offset_type, lat, lon)
+    )
+"""
+
+
+def _connect_and_create(timeout: float) -> None:
+    with sqlite3.connect(VDATUM_DB_PATH, timeout=timeout) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(_DDL)
 
 
 def _init_db() -> None:
     """Initialize the SQLite WAL database and layout schemas."""
     VDATUM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vdatum_offsets (
-                offset_type TEXT,
-                lat REAL,
-                lon REAL,
-                offset REAL,
-                PRIMARY KEY (offset_type, lat, lon)
-            )
-            """
-        )
+    try:
+        _connect_and_create(timeout=30.0)
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            raise
+        # Stale WAL/SHM files from a killed container; safe to remove since the
+        # previous process is gone and the kernel has already released its locks.
+        for suffix in ("-shm", "-wal"):
+            stale = Path(str(VDATUM_DB_PATH) + suffix)
+            if stale.exists():
+                stale.unlink(missing_ok=True)
+        _connect_and_create(timeout=30.0)
 
 
 # Initialize on module load
@@ -54,7 +70,7 @@ def sqlite_vdatum_cache(offset_type: str) -> Callable:
         def wrapper(lat: float, lon: float) -> float:
             try:
                 # 1. Read L2 hit
-                with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
+                with sqlite3.connect(VDATUM_DB_PATH, timeout=30.0) as conn:
                     crs = conn.execute(
                         "SELECT offset FROM vdatum_offsets WHERE offset_type=? AND lat=? AND lon=?",
                         (offset_type, lat, lon),
@@ -70,7 +86,7 @@ def sqlite_vdatum_cache(offset_type: str) -> Callable:
 
             # 3. Write L2 entry asynchronously capable via WAL
             try:
-                with sqlite3.connect(VDATUM_DB_PATH, timeout=5.0) as conn:
+                with sqlite3.connect(VDATUM_DB_PATH, timeout=30.0) as conn:
                     conn.execute("PRAGMA journal_mode=WAL")
                     conn.execute(
                         """
