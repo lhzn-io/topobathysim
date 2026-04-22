@@ -6,6 +6,7 @@ It uses 'bmi-topography' or OPeNDAP access to fetch data, managing caching local
 """
 
 import logging
+import threading
 from collections import namedtuple
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -13,8 +14,8 @@ from typing import Any, ClassVar, cast
 import xarray as xr
 from rioxarray.merge import merge_arrays
 
-from ..runtime import should_consolidate
 from ..config import get_cache_root
+from ..runtime import should_consolidate
 from .base import Provider, sanitize_elevation_nodata
 from .registry import registry
 
@@ -40,8 +41,8 @@ class GEBCO2025Provider(Provider):
     RESOLUTION_ARCSEC = 15
     HALF_PIXEL_OFFSET = (15 / 3600) * 0.5  # Degrees
 
-    _locks: ClassVar[dict[str, Any]] = {}
-    _locks_lock: ClassVar[Any] = None
+    _locks: ClassVar[dict[str, threading.Lock]] = {}
+    _locks_lock: ClassVar[threading.Lock] = threading.Lock()  # eagerly initialized — never None
     _ds_remote: ClassVar[xr.Dataset | None] = None
     _tid_remote: ClassVar[xr.Dataset | None] = None
     _initialized: bool
@@ -207,14 +208,7 @@ class GEBCO2025Provider(Provider):
 
                 # B. Fetch from OPeNDAP if missing
                 if da_tile is None:
-                    import threading
-
                     from filelock import FileLock
-
-                    # Class level thread lock for deduplication
-                    if GEBCO2025Provider._locks_lock is None:
-                        GEBCO2025Provider._locks = {}
-                        GEBCO2025Provider._locks_lock = threading.Lock()
 
                     with GEBCO2025Provider._locks_lock:
                         if tile_key not in GEBCO2025Provider._locks:
@@ -248,18 +242,24 @@ class GEBCO2025Provider(Provider):
                             logger.info(f"GEBCO Zarr Cache Miss: {tile_key}")
                             try:
                                 if GEBCO2025Provider._ds_remote is None:
-                                    try:
-                                        logger.info("Initializing global GEBCO OPeNDAP Connection...")
-                                        GEBCO2025Provider._ds_remote = xr.open_dataset(
-                                            self.OPENDAP_URL, engine="pydap"
-                                        )
-                                        # Also initialize TID dataset connection
-                                        GEBCO2025Provider._tid_remote = xr.open_dataset(
-                                            self.TID_URL, engine="pydap"
-                                        )
-                                    except Exception as connection_err:
-                                        logger.error(f"Failed to connect to GEBCO OPeNDAP: {connection_err}")
-                                        raise
+                                    # Protect OPeNDAP connection init with _locks_lock so concurrent
+                                    # fetches of *different* tiles (different thread_lock) don't each
+                                    # race to open a redundant pydap connection.
+                                    with GEBCO2025Provider._locks_lock:
+                                        if GEBCO2025Provider._ds_remote is None:
+                                            try:
+                                                logger.info("Initializing global GEBCO OPeNDAP Connection...")
+                                                GEBCO2025Provider._ds_remote = xr.open_dataset(
+                                                    self.OPENDAP_URL, engine="pydap"
+                                                )
+                                                GEBCO2025Provider._tid_remote = xr.open_dataset(
+                                                    self.TID_URL, engine="pydap"
+                                                )
+                                            except Exception as connection_err:
+                                                logger.error(
+                                                    f"Failed to connect to GEBCO OPeNDAP: {connection_err}"
+                                                )
+                                                raise
 
                                 ds_remote = GEBCO2025Provider._ds_remote
                                 tid_remote = GEBCO2025Provider._tid_remote

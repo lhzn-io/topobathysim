@@ -37,14 +37,13 @@ def test_memoize_lru_eviction() -> None:
     # Check cache size is capped at 10
     assert len(memoizer.cache) == 10, f"Cache size should be 10, but is {len(memoizer.cache)}"
 
-    # Check that the first 10 items (0-9) are evicted and closed
-    # The last 10 items (10-19) should remain in cache
+    # Eviction must NOT close the evicted resource — other threads may hold a live reference
+    # to it and be mid-read (e.g. a zarr store). Python's reference counting will close the
+    # underlying file handle naturally once the last reference drops.
     for i in range(10):
-        # Evicted items should be closed
-        assert resources[i].closed is True, f"Resource {i} should be closed"
+        assert resources[i].closed is False, f"Resource {i} must not be closed on eviction"
 
     for i in range(10, 20):
-        # Recent items should be open
-        assert resources[i].closed is False, f"Resource {i} should be open"
+        assert resources[i].closed is False, f"Resource {i} should still be open"
 
-    print("LRU eviction and resource cleanup verified.")
+    print("LRU eviction does not close evicted resources — verified.")

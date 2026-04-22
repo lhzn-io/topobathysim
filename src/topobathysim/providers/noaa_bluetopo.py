@@ -897,6 +897,10 @@ class NoaaBlueTopoProvider(Provider):
         lock_path = self.scheme_path.with_suffix(".lock")
 
         with FileLock(lock_path):
+            # Re-check inside lock: another thread may have loaded _gdf while we waited.
+            if self._gdf is not None:
+                return
+
             if not self.scheme_path.exists():
                 try:
                     # Ensure directory exists (it might have been cleared runtime)
@@ -915,13 +919,13 @@ class NoaaBlueTopoProvider(Provider):
                     logger.warning(f"Failed to download BlueTopo Tile Scheme: {e}")
                     return
 
-        try:
-            self._gdf = gpd.read_file(self.scheme_path)
-            if self._gdf is not None and hasattr(self._gdf, "sindex"):
-                _ = self._gdf.sindex
-        except Exception as e:
-            logger.error(f"Failed to load Tile Scheme GPKG: {e}")
-            self._gdf = None
+            try:
+                self._gdf = gpd.read_file(self.scheme_path)
+                if self._gdf is not None and hasattr(self._gdf, "sindex"):
+                    _ = self._gdf.sindex
+            except Exception as e:
+                logger.error(f"Failed to load Tile Scheme GPKG: {e}")
+                self._gdf = None
 
     def resolve_tile_id(self, lat: float, lon: float) -> str | None:
         """
