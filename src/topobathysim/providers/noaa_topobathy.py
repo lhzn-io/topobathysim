@@ -194,7 +194,7 @@ class NoaaTopobathyProvider(Provider):
                 for t in tiles:
                     try:
                         # Optimization: Pass bbox to fetch_tile to enable "Clip-then-Cache"
-                        da_fetched = self.fetch_tile(t, bbox=bbox)
+                        da_fetched = self.fetch_tile(t, bbox=bbox, project_id=pid)
                         if da_fetched is None:
                             continue
 
@@ -1191,7 +1191,10 @@ class NoaaTopobathyProvider(Provider):
         return list(set(results))
 
     def fetch_tile(
-        self, tile_filename: str, bbox: tuple[float, float, float, float] | None = None
+        self,
+        tile_filename: str,
+        bbox: tuple[float, float, float, float] | None = None,
+        project_id: str | None = None,
     ) -> xr.DataArray | None:
         """
         Fetches the specific COG, applies VDatum corrections, and caches as Zarr.
@@ -1203,15 +1206,18 @@ class NoaaTopobathyProvider(Provider):
 
         This avoids downloading 2GB+ files for a small request.
         """
-        if not self._active_project_id:
+        # Use caller-supplied project_id so concurrent threads on the singleton don't
+        # clobber each other's _active_project_id state mid-fetch.
+        pid = project_id if project_id is not None else self._active_project_id
+        if not pid:
             return None
 
         # Resolve Project Folder Name
-        if self._active_project_id not in self._projects:
+        if pid not in self._projects:
             self._ensure_project_list()
 
-        if self._active_project_id not in self._projects:
-            logger.error(f"Cannot resolve folder for Project ID {self._active_project_id}")
+        if pid not in self._projects:
+            logger.error(f"Cannot resolve folder for Project ID {pid}")
             return None
 
         # Construct Remote and Local paths
@@ -1233,13 +1239,13 @@ class NoaaTopobathyProvider(Provider):
             # Clean up leading slashes that cause double slashes in S3 URL string
             clean_tile_filename = tile_filename.lstrip("/")
 
-            folder_name = self._projects.get(self._active_project_id)
+            folder_name = self._projects.get(pid)
             if folder_name and not clean_tile_filename.startswith(folder_name):
                 clean_tile_filename = f"{folder_name}/{clean_tile_filename}"
 
             http_url = f"https://{self.BUCKET_BASE}.s3.amazonaws.com/dem/{clean_tile_filename}"
 
-        local_filename = f"{self._active_project_id}_{tile_filename}"
+        local_filename = f"{pid}_{tile_filename}"
 
         # --- CACHE KEY GENERATION ---
         # Legacy/Full file cache name (without bbox slice)
@@ -1292,7 +1298,13 @@ class NoaaTopobathyProvider(Provider):
                 shutil.rmtree(zarr_path, ignore_errors=True)
 
         # 2. Cache Miss - Acquire Lock
-        import fcntl
+        # filelock.FileLock is used instead of fcntl.flock for two reasons:
+        # (a) flock + manual lock-file deletion creates a TOCTOU race: a thread
+        #     blocked on flock wakes up on the old inode while a new thread creates
+        #     a fresh inode, so both acquire "exclusive" locks simultaneously.
+        # (b) FileLock is cross-platform and correctly handles the within-process
+        #     thread case without relying on POSIX advisory lock semantics.
+        from filelock import FileLock
 
         lock_path = self.cache_dir / "zarr" / (zarr_name + ".lock")
 
@@ -1300,9 +1312,7 @@ class NoaaTopobathyProvider(Provider):
         zarr_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            with open(lock_path, "w") as lock_file:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-
+            with FileLock(str(lock_path)):
                 # Double Check inside lock
                 if zarr_path.exists():
                     try:
@@ -1368,13 +1378,13 @@ class NoaaTopobathyProvider(Provider):
                         return None
 
                     # Metadata & VDatum Logic
-                    meta = self.fetch_inport_metadata(self._active_project_id) or {}
+                    meta = self.fetch_inport_metadata(pid) or {}
 
                     # --- PROVENANCE METADATA ---
                     import datetime
 
                     # Core identity
-                    da_raw.attrs["survey_source"] = self._active_project_id
+                    da_raw.attrs["survey_source"] = pid
                     da_raw.attrs["source_url"] = http_url
 
                     # Time
@@ -1388,7 +1398,7 @@ class NoaaTopobathyProvider(Provider):
                     da_raw.attrs["vertical_datum"] = vdatum  # Current state
 
                     # Links
-                    info_url = self._projects_metadata_urls.get(self._active_project_id)
+                    info_url = self._projects_metadata_urls.get(pid)
                     if info_url:
                         da_raw.attrs["metadata_url"] = info_url
 
@@ -1448,10 +1458,10 @@ class NoaaTopobathyProvider(Provider):
             else:
                 logger.error(f"Zarr lock/process failed: {e}")
             return None
-        finally:
-            if lock_path.exists():
-                with contextlib.suppress(OSError):
-                    lock_path.unlink()
+        # Note: lock file (.lock) is intentionally NOT deleted here. Deleting it creates a
+        # TOCTOU race: a thread blocked on FileLock wakes up holding the old inode while a
+        # new thread creates a fresh inode, letting both proceed simultaneously. The FileLock
+        # releases the OS lock on context-manager exit; the empty file is harmless on disk.
 
     def get_grid(
         self, west: float, south: float, east: float, north: float, project_id: str | None = None

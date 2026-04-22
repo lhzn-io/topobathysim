@@ -1054,7 +1054,35 @@ class BAGProvider(Provider):
         if not urls:
             raise ProviderNoDataError(f"No BAG files found for bbox {bbox}")
 
-        logger.info(f"BAG fetch: Found {len(urls)} files to process.")
+        # 1.6 Re-sort by (resolution ASC, survey_id DESC) before processing.
+        # The discovery cache may store URLs in NCEI API order (arbitrary) if
+        # populated before sorting was introduced, or on a cache hit which bypasses
+        # the sort at write time. Since the merge is first-in-list-wins (fill-NaN-only),
+        # sort order here determines which survey wins overlapping pixels — finest
+        # resolution must come first. Survey filename DESC is a reliable recency proxy
+        # within the same resolution (higher NOAA survey numbers are more recent).
+        import re as _re
+
+        def _resolution_from_url(u: str) -> float:
+            fname = u.split("/")[-1].lower()
+            m = _re.search(r"[._-](\d+(?:\.\d+)?)cm[._-]", fname)
+            if m:
+                return float(m.group(1)) / 100.0
+            m = _re.search(r"[._-](\d+(?:\.\d+)?)m[._-]", fname)
+            if m:
+                return float(m.group(1))
+            return 100.0  # unknown resolution → lowest priority
+
+        # Two-pass stable sort: secondary key first, then primary (Python stable sort preserves order).
+        urls = sorted(urls, key=lambda u: u.split("/")[-1].lower(), reverse=True)  # survey id DESC
+        # resolution ASC (stable: preserves secondary within ties)
+        urls = sorted(urls, key=_resolution_from_url)
+
+        logger.info(
+            f"BAG fetch: {len(urls)} files (sorted finest-first): "
+            + ", ".join(u.split("/")[-1] for u in urls[:5])
+            + ("..." if len(urls) > 5 else "")
+        )
 
         def _log_mem(label: str) -> None:
             """Log current process RSS for memory debugging."""

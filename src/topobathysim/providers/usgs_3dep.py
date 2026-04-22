@@ -8,9 +8,10 @@ and 'nasadem' collections.
 
 import logging
 import random
+import threading
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import planetary_computer
 import rioxarray
@@ -35,6 +36,7 @@ class Usgs3DepProvider(Provider):
 
     _instance = None
     _catalog: Any = None
+    _catalog_lock: ClassVar[threading.Lock] = threading.Lock()
     _initialized = False
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "Usgs3DepProvider":
@@ -153,9 +155,13 @@ class Usgs3DepProvider(Provider):
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
         max_retries = 4  # Increased retries for Gateway Timeouts
 
-        # Cache the catalog to avoid fetching the STAC root on every query
-        if not hasattr(self, "_catalog") or self._catalog is None:
-            self._catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        # Cache the catalog to avoid fetching the STAC root on every query.
+        # Double-checked locking: outer check avoids lock contention once initialized;
+        # inner check prevents redundant Client.open() from concurrent threads.
+        if self._catalog is None:
+            with Usgs3DepProvider._catalog_lock:
+                if self._catalog is None:
+                    self._catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
 
         try:
             with FileLock(lock_file_path):

@@ -67,12 +67,15 @@ class MemoizeWithLocks:
                     # Eviction logic
                     while len(self.cache) > self.maxsize:
                         _, evicted_val = self.cache.popitem(last=False)
-                        # Explicit cleanup for objects with file handles (e.g. xarray Datasets)
-                        if hasattr(evicted_val, "close") and callable(evicted_val.close):
-                            try:
-                                evicted_val.close()
-                            except Exception as e:
-                                logger.warning(f"Error closing evicted cache item: {e}")
+                        # Do NOT call .close() here. Other threads may hold a reference to
+                        # the evicted value and be actively reading from it (e.g. a zarr-backed
+                        # xarray DataArray mid-.load()). Calling .close() while another thread
+                        # is reading closes the underlying zarr store, causing that thread's
+                        # windowed read to fail with a closed-store error — the whole ncei_bag
+                        # provider step then raises ProviderNoDataError and the tile falls back
+                        # to BlueTopo. Python's reference counting will close file handles
+                        # naturally once the last reference drops.
+                        del evicted_val
 
                 # We could delete the lock here, but keeping it is fine for memory until cache clears
             return result
