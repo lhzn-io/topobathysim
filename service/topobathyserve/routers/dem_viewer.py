@@ -199,15 +199,21 @@ def _mosaic_to_bin(
             if len(y_vals) > 1 and y_vals[0] < y_vals[-1]:
                 elev = elev[::-1]
 
-            # Downsample cell to canvas resolution if needed
-            if build_scale < 0.999:
-                new_h = max(1, round(elev.shape[0] * build_scale))
-                new_w = max(1, round(elev.shape[1] * build_scale))
-                elev = _downsample_nearest(elev, new_h, new_w)
-
-            # Compute pixel offsets into the canvas using canvas pixel size
+            # Derive canvas pixel slot from coordinates first — these are the
+            # authoritative positions this cell must fill.  Computing col_start
+            # and col_end from the same formula guarantees adjacent cells share
+            # exactly one boundary pixel (no 1-column NaN gap caused by rounding
+            # round(native_w * scale) vs round(offset / cdx) disagreeing by 1).
             col_start = int(round((float(min(x_vals)) - x_min) / cdx))
+            col_end_c = int(round((float(max(x_vals)) - x_min) / cdx))
             row_start = int(round((y_max - float(max(y_vals))) / cdy))
+            row_end_c = int(round((y_max - float(min(y_vals))) / cdy))
+
+            # Downsample cell to match its coordinate-derived canvas slot.
+            if build_scale < 0.999:
+                new_w = max(1, col_end_c - col_start + 1)
+                new_h = max(1, row_end_c - row_start + 1)
+                elev = _downsample_nearest(elev, new_h, new_w)
 
             # Clip to canvas bounds (handles halo overlap)
             src_r0 = max(0, -row_start)
@@ -286,13 +292,15 @@ def _mosaic_source_to_bin(
             if len(y_vals) > 1 and y_vals[0] < y_vals[-1]:
                 src = src[::-1]
 
-            if build_scale < 0.999:
-                new_h = max(1, round(src.shape[0] * build_scale))
-                new_w = max(1, round(src.shape[1] * build_scale))
-                src = _downsample_nearest(src, new_h, new_w)
-
             col_start = int(round((float(min(x_vals)) - x_min) / cdx))
+            col_end_c = int(round((float(max(x_vals)) - x_min) / cdx))
             row_start = int(round((y_max - float(max(y_vals))) / cdy))
+            row_end_c = int(round((y_max - float(min(y_vals))) / cdy))
+
+            if build_scale < 0.999:
+                new_w = max(1, col_end_c - col_start + 1)
+                new_h = max(1, row_end_c - row_start + 1)
+                src = _downsample_nearest(src, new_h, new_w)
 
             src_r0 = max(0, -row_start)
             src_c0 = max(0, -col_start)
@@ -747,6 +755,35 @@ async def get_dataset_quality(
     except Exception as e:
         logger.error(f"Dataset quality reporting failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/datasets/{dataset_id}/cell_at")
+async def get_cell_at(
+    dataset_id: str,
+    lat: float = Query(..., description="Latitude (EPSG:4326)"),
+    lon: float = Query(..., description="Longitude (EPSG:4326)"),
+) -> dict[str, Any]:
+    """Return the zarr cell filename whose cell_bbox contains the given lat/lon."""
+    root = _fused_zarr_root()
+    policy_prefix, dx, _dy, cluster_bbox = _parse_dataset_id(root, dataset_id)
+    policy_dir = _resolve_policy_dir(root, policy_prefix)
+
+    for cell_path in sorted(policy_dir.glob("*.zarr")):
+        attrs = _read_cell_attrs(cell_path)
+        if attrs is None:
+            continue
+        if abs(attrs.get("_dx", 0) - dx) / max(dx, 1e-10) > _RES_TOLERANCE:
+            continue
+        if not _cell_in_cluster(attrs, cluster_bbox):
+            continue
+        bb = _parse_cell_bbox(attrs)
+        if bb is None:
+            continue
+        # bb = [west, south, east, north]
+        if bb[0] <= lon <= bb[2] and bb[1] <= lat <= bb[3]:
+            return {"cell": cell_path.name, "bbox": bb}
+
+    raise HTTPException(status_code=404, detail="No cell covers this location")
 
 
 @router.delete("/datasets/{dataset_id}/cache")

@@ -44,6 +44,7 @@
         }
         #tooltip .elev { color: #5af; font-weight: 600; font-size: 14px; }
         #tooltip .coord { color: #888; font-size: 11px; }
+        #tooltip .cell-file { color: #555; font-size: 10px; margin-top: 2px; font-family: monospace; }
 
         .toggle-row { display: flex; gap: 6px; margin-bottom: 6px; }
         .toggle-btn {
@@ -126,6 +127,7 @@
     <div class="elev" id="tt-elev"></div>
     <div class="coord" id="tt-coord"></div>
     <div class="source" id="tt-source" style="font-size:11px; margin-top:2px;"></div>
+    <div class="cell-file" id="tt-cell"></div>
 </div>
 
 <div id="context-modal" style="display:none; position:absolute; z-index:50; background:rgba(20,20,30,0.95); padding:16px; border:1px solid rgba(255,255,255,0.15); border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,0.8); width:500px; color:#ddd; font-size:12px; pointer-events:auto; overflow:hidden;">
@@ -159,6 +161,8 @@ let wireMesh = null;
 let renderMode = 'solid';
 let provenanceOverlay = null;
 let savedElevColors = null;  // cached elevation vertex colors for toggling back
+let currentDatasetId = null;
+let _cellAtLat = null, _cellAtLon = null;  // last fetched cell_at coordinates
 
 // ── Three.js Setup ──
 const canvas = document.getElementById('canvas');
@@ -404,6 +408,9 @@ window.clearCache = async function() {
 window.loadDataset = async function() {
     const policyPrefix = document.getElementById('dataset-select').value;
     if (!policyPrefix) return;
+    currentDatasetId = policyPrefix;
+    _cellAtLat = null; _cellAtLon = null;
+    document.getElementById('tt-cell').textContent = '';
 
     const overlay = document.getElementById('loading-overlay');
     const loadMsg = document.getElementById('loading-msg');
@@ -528,6 +535,20 @@ canvas.addEventListener('mousemove', (event) => {
             srcEl.innerHTML = '';
         }
 
+        // Fetch zarr cell filename when cursor moves to a new cell (> ~500m from last fetch)
+        const cellEl = document.getElementById('tt-cell');
+        if (currentDatasetId && (
+            _cellAtLat === null ||
+            Math.abs(lat - _cellAtLat) > 0.005 ||
+            Math.abs(lon - _cellAtLon) > 0.005
+        )) {
+            _cellAtLat = lat; _cellAtLon = lon;
+            fetch(`/api/v1/dem/datasets/${currentDatasetId}/cell_at?lat=${lat.toFixed(7)}&lon=${lon.toFixed(7)}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(d => { cellEl.textContent = d ? d.cell : ''; })
+                .catch(() => { cellEl.textContent = ''; });
+        }
+
         tooltip.style.display = 'block';
         tooltip.style.left = (event.clientX + 16) + 'px';
         tooltip.style.top = (event.clientY - 10) + 'px';
@@ -535,7 +556,7 @@ canvas.addEventListener('mousemove', (event) => {
         tooltip.style.display = 'none';
     }
 });
-canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; _cellAtLat = null; _cellAtLon = null; });
 
 let rightMouseDownTime = 0;
 canvas.addEventListener('mousedown', (event) => {
