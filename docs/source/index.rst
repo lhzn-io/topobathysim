@@ -5,15 +5,18 @@ TopoBathySim
 
 **TopoBathySim** is a policy-driven fusion runtime for seamless topobathymetric data products.
 
-.. image:: _static/topobathyscreenshot.png
+.. figure:: _static/dem-viewer.png
    :alt: TopoBathySim Screenshot
    :align: center
+
+   *High-fidelity 3D perspective of fused topobathymetric surfaces.*
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
    vision
+   gallery
    policy_dsl
    policy_walkthrough
    runtime_architecture

@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-![TopoBathySim Screenshot](docs/source/_static/topobathyscreenshot.png)
+![TopoBathySim 3D DEM Viewer](docs/source/_static/dem-viewer.png)
 
 **Policy-driven topobathymetric fusion runtime for data-first digital worlds.**
 
