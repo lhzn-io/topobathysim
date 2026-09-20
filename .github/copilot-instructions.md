@@ -53,6 +53,13 @@
 - **Lint/Format**: `pre-commit run --all-files` or `ruff check .`
 - **Clean Cache**: `rm -rf ~/.cache/topobathysim` (Useful when debugging bad downloads).
 
+### 5. Git Operations
+
+- **Commit Messages**: Conventional commits (`feat:`, `fix:`, `docs:`, `chore:`). No emoji.
+- **Staging**: Stage files explicitly (`git add <file>`). Never `git add .`.
+- **Approval**: Present the change set and commit message and wait for explicit user approval before any `git commit`. Never `git push` without the user's direct go-ahead.
+- **Attribution**: Author and committer are always the human contributor (`dfry-lhzn <dfry@lhzn.io>`, from `git config`), so the log shows who was behind each change. No `Co-Authored-By:` trailers or non-human identities: GitHub parses those into the Contributors list, which is reserved for people. Noting the agent harness or model that collaborated is welcome as plain text in the commit body. Verify with `git var GIT_AUTHOR_IDENT` before the first commit in a shell.
+
 ## ⚠️ Gotchas & Edge Cases
 
 - **Vertical Datums**: Data comes in varying datums. We strive for **LMSL** or **NAVD88**. Transformations happen via VDatum logic (`vdatum.py`).
