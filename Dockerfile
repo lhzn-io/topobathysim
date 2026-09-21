@@ -16,13 +16,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bzip2 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Alias python to python3
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # Install micromamba
-RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | \
+RUN curl -Ls "https://micro.mamba.pm/api/micromamba/$(uname -m | sed 's/x86_64/linux-64/;s/aarch64/linux-aarch64/;s/arm64/linux-aarch64/')/latest" | \
     tar -xvj -C /usr/local/bin/ --strip-components=1 bin/micromamba
 
 # Create the Python environment via micromamba. Includes:
