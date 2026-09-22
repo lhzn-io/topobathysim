@@ -109,7 +109,18 @@
             </div>
 
             <div style="margin-top: 10px;">
+                <label for="basemap-select" style="font-size: 14px; font-weight: bold;">Basemap:</label>
+                <select id="basemap-select" style="width: 100%; padding: 5px; margin-top: 5px;">
+                    <option value="ocean" selected>Ocean Basemap (Esri)</option>
+                    <option value="satellite">Satellite (Esri)</option>
+                </select>
+            </div>
+
+            <div style="margin-top: 10px;">
                 <label><input type="checkbox" id="contour-toggle"> Show Contours (Debug)</label>
+            </div>
+            <div style="margin-top: 5px;">
+                <label><input type="checkbox" id="bathymetry-toggle" checked> Show Fused Elevation</label>
             </div>
 
             <!-- Default Legend -->
@@ -220,14 +231,13 @@
         updateDebug();
         // Don't call updateUrl immediately to avoid overwriting init params if they existed
 
-        var osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 19,
-            attribution: '© OpenStreetMap'
-        }).addTo(map);
-
         var satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            attribution: 'Tiles &copy; Esri'
+            attribution: 'Tiles &copy; Esri World Imagery'
         });
+
+        var ocean = L.tileLayer('https://server.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri, GEBCO, Garmin, DeLorme, National Geographic'
+        }).addTo(map);
 
         // TopoBathyServe Tile Layer
         // format=png triggers server-side rendering
@@ -264,6 +274,8 @@
 
         // Contours Toggle Logic
         var contourToggle = document.getElementById('contour-toggle');
+        var bathyToggle = document.getElementById('bathymetry-toggle');
+        var basemapSelect = document.getElementById('basemap-select');
 
         contourToggle.addEventListener('change', function () {
             if (this.checked) {
@@ -271,6 +283,23 @@
             } else {
                 map.removeLayer(contourLayer);
             }
+        });
+
+        bathyToggle.addEventListener('change', function () {
+            if (this.checked) {
+                bathyLayer.addTo(map);
+            } else {
+                map.removeLayer(bathyLayer);
+            }
+        });
+
+        basemapSelect.addEventListener('change', function () {
+            var val = this.value;
+            map.removeLayer(satellite);
+            map.removeLayer(ocean);
+
+            if (val === 'satellite') satellite.addTo(map);
+            else if (val === 'ocean') ocean.addTo(map);
         });
 
         // Style Selector Logic
@@ -355,7 +384,7 @@
         });
 
         var baseMaps = {
-            "OpenStreetMap": osm,
+            "Ocean": ocean,
             "Satellite": satellite
         };
 

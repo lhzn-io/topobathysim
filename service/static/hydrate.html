@@ -26,7 +26,19 @@
         .toggle-opt { font-weight: normal; margin: 0; cursor: pointer; display: flex; align-items: center; gap: 6px; }
 
         /* Map */
-        #map { height: 400px; margin-top: 20px; border: 1px solid #ddd; border-radius: 4px; }
+        #map { height: 400px; margin-top: 20px; border: 1px solid #ddd; border-radius: 4px; position: relative; }
+        #map-controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 5px 8px;
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+            font-size: 12px;
+            border: 1px solid #ccc;
+        }
 
         /* Markers */
         .resize-handle {
@@ -155,6 +167,22 @@
             </div>
             <!-- End Custom Policy Injection -->
 
+            <!-- Policy Curation UI (Hidden until analysis) -->
+            <div id="curation-panel" style="display: none; margin-top: 20px; padding: 15px; background: #fffde7; border: 1px solid #fbc02d; border-radius: 6px;">
+                <h4 style="margin: 0 0 10px 0; font-size: 0.95rem; color: #7f5f00;">Policy Curation</h4>
+                <p style="font-size: 0.8rem; margin: 0 0 15px 0;">Select/unselect sources below to refine your policy. Then save it to the server.</p>
+
+                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+                    <input type="text" id="customPolicyName" placeholder="New policy name (e.g. west_is_v2)"
+                           style="flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;">
+                    <button type="button" id="savePolicyBtn" onclick="saveCustomPolicy()"
+                            style="padding: 8px 16px; font-size: 13px; background: #fbc02d; color: #333; border: 1px solid #f9a825;">
+                        Save Custom Policy
+                    </button>
+                </div>
+                <div id="save-policy-status" style="font-size: 0.8rem; font-weight: bold;"></div>
+            </div>
+
             <div id="estimates">
                 <div class="stat-item">
                     <span class="stat-label">Effective Res</span>
@@ -179,7 +207,14 @@
             </div>
         </form>
 
-        <div id="map"></div>
+        <div id="map">
+            <div id="map-controls">
+                <select id="basemap-select" style="padding: 2px 4px; font-size: 12px; border: 1px solid #ccc; border-radius: 3px;">
+                    <option value="ocean" selected>Ocean (Esri)</option>
+                    <option value="satellite">Satellite (Esri)</option>
+                </select>
+            </div>
+        </div>
         <p style="font-size: 0.85rem; margin-top: 10px; color: #888;">
             Tip: Drag the 🔵 top-left handle to move. Drag the ⬜ corner handle to resize. Double-click map to jump box.
         </p>
@@ -206,10 +241,22 @@
             scrollWheelZoom: 'center'
         }).setView([40.7, -73.9], 10);
 
-        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap'
+        const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri World Imagery'
+        });
+
+        const ocean = L.tileLayer('https://server.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri, GEBCO, Garmin, DeLorme, National Geographic'
         }).addTo(map);
+
+        document.getElementById('basemap-select').addEventListener('change', function(e) {
+            const val = e.target.value;
+            map.removeLayer(satellite);
+            map.removeLayer(ocean);
+
+            if (val === 'satellite') satellite.addTo(map);
+            else if (val === 'ocean') ocean.addTo(map);
+        });
 
         // --- UI Initialization ---
         const zoomSelect = document.getElementById('zoomLevel');
@@ -231,6 +278,9 @@
         let moveHandle = null;
         let resizeHandle = null;
         let dragAnchor = null;
+
+        let lastAnalyzeData = null; // Store results for curation
+        let lastBasePolicyYaml = null;
 
         // --- Core Logic ---
 
@@ -629,22 +679,38 @@
                     return;
                 }
                 const data = await res.json();
+                lastAnalyzeData = data;
+                lastBasePolicyYaml = data.policy_yaml;
+
+                // Show curation panel
+                document.getElementById('curation-panel').style.display = 'block';
+                // Suggested name
+                if (!document.getElementById('customPolicyName').value) {
+                    const ts = new Date().toISOString().slice(5, 16).replace(/[:T]/g, '-');
+                    document.getElementById('customPolicyName').value = `hydrated-${ts}`;
+                }
+
                 let html = `<strong>Coverage Analysis Results (Took ${Math.floor((Date.now() - startTime) / 1000)}s)</strong><br/><br/>`;
-                data.providers.forEach(p => {
+                data.providers.forEach((p, pIdx) => {
                     const total = p.items.length;
                     const included = p.items.filter(i => i.included).length;
                     const excluded = total - included;
-                    html += `<details style="margin-bottom: 5px;"><summary style="cursor:pointer; font-weight:bold;">${p.provider} (${included} Included, ${excluded} Excluded)</summary><div style="padding-left: 20px; font-family: monospace;">`;
+                    html += `<details open style="margin-bottom: 5px;"><summary style="cursor:pointer; font-weight:bold;">${p.provider} (${included} Included, ${excluded} Excluded)</summary><div style="padding-left: 20px; font-family: monospace;">`;
                     if (total === 0) {
                         html += `<em>No coverage found in bbox</em>`;
                     } else {
-                        p.items.forEach(i => {
+                        p.items.forEach((i, iIdx) => {
                             const linkHtml = i.url ? ` <a href="${i.url}" target="_blank" style="font-size: 0.8em; text-decoration: none;" title="View Source">🔗 source</a>` : "";
+                            const checkId = `source-check-${pIdx}-${iIdx}`;
+                            const checked = i.included ? 'checked' : '';
+                            html += `<div style="display:flex; align-items:center; gap:8px; margin: 2px 0;">`;
+                            html += `<input type="checkbox" id="${checkId}" ${checked} data-provider="${p.provider}" data-p-idx="${pIdx}" data-name="${i.name}" style="margin:0;">`;
                             if (i.included) {
-                                html += `<div style="color: #27ae60;">[✓] <span>${i.name}${linkHtml}</span> — Included</div>`;
+                                html += `<label for="${checkId}" style="color: #27ae60; cursor:pointer; margin:0;"><span>${i.name}${linkHtml}</span> — Included</label>`;
                             } else {
-                                html += `<div style="color: #c0392b;" title="${i.reason}">[✗] <span style="text-decoration: line-through;">${i.name}</span>${linkHtml} — Excluded (${i.reason})</div>`;
+                                html += `<label for="${checkId}" style="color: #c0392b; cursor:pointer; margin:0;" title="${i.reason}"><span style="text-decoration: line-through;">${i.name}</span>${linkHtml} — Excluded (${i.reason})</label>`;
                             }
+                            html += `</div>`;
                         });
                     }
                     html += `</div></details>`;
@@ -658,6 +724,62 @@
             }
         }
 
+
+        async function saveCustomPolicy() {
+            if (!lastAnalyzeData) return;
+            const saveBtn = document.getElementById('savePolicyBtn');
+            const saveStatus = document.getElementById('save-policy-status');
+            const name = document.getElementById('customPolicyName').value.trim();
+
+            if (!name) {
+                saveStatus.innerHTML = '<span style="color:red">Please enter a policy name</span>';
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveStatus.innerText = 'Saving...';
+
+            // 1. Collect curation choices
+            // Simple approach: we take the full analyzed YAML and modify the 'exclude_patterns'
+            // for each provider step based on the UNCHECKED items.
+            // Note: YAML parsing in pure JS is hard without a library.
+            // Since we know the structure (it's what came from the server), and we only want to modify
+            // specific filter lines, we'll send the changes to the server to handle the YAML surgery would be better,
+            // BUT we can actually just generate a "derived" YAML by adding to exclude_patterns.
+
+            const exclusionsByStep = {}; // step_idx -> [patterns]
+            const checkboxes = document.querySelectorAll('#analyze-tree input[type="checkbox"]');
+            checkboxes.forEach(cb => {
+                const pIdx = parseInt(cb.getAttribute('data-p-idx'));
+                const stepIdx = lastAnalyzeData.providers[pIdx].step_index;
+                const sourceName = cb.getAttribute('data-name');
+                if (!cb.checked) {
+                    if (!exclusionsByStep[stepIdx]) exclusionsByStep[stepIdx] = [];
+                    exclusionsByStep[stepIdx].push(sourceName);
+                }
+            });
+
+            try {
+                // Unified endpoint handles the curation logic server-side
+                const res = await fetch('/policy/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: name,
+                        base_yaml: lastBasePolicyYaml,
+                        curations: exclusionsByStep
+                    })
+                });
+
+                if (!res.ok) throw new Error(await res.text());
+                const result = await res.json();
+                saveStatus.innerHTML = `<span style="color:green">Saved! Use policy: ${result.name}</span>`;
+            } catch (err) {
+                saveStatus.innerHTML = `<span style="color:red">Error: ${err.message}</span>`;
+            } finally {
+                saveBtn.disabled = false;
+            }
+        }
 
         async function cancelJob() {
             if (!_activeJobId) return;

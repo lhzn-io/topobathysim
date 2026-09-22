@@ -42,6 +42,15 @@ class HydrateRequest(BaseModel):
     )
 
 
+class PolicyUpdateRequest(BaseModel):
+    name: str = Field(..., description="Target name for the saved policy file")
+    policy_yaml: str | None = Field(None, description="Full YAML content to save directly")
+    base_yaml: str | None = Field(None, description="Base YAML to use when applying curations")
+    curations: dict[int, list[str]] | None = Field(
+        None, description="Step index to list of source names to EXCLUDE (requires base_yaml)"
+    )
+
+
 class FusionRequest(BaseModel):
     bbox: tuple[float, float, float, float] = Field(
         ...,

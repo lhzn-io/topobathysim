@@ -25,6 +25,7 @@ from typing import Annotated, Any
 
 import numpy as np
 import xarray as xr
+import yaml
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
@@ -43,6 +44,7 @@ from .models import (
     ElevationResponse,
     FusionRequest,
     HydrateRequest,
+    PolicyUpdateRequest,
     TIDReportResponse,
     TileMetadataResponse,
 )
@@ -291,6 +293,65 @@ def get_policy_path() -> Path:
     if POLICY_PATH is None or not POLICY_PATH.exists():
         raise HTTPException(status_code=503, detail="Policy path not initialized")
     return POLICY_PATH
+
+
+@app.post("/policy/update")
+async def update_policy(
+    request: PolicyUpdateRequest,
+    policy_path: Annotated[Path, Depends(get_policy_path)],
+) -> dict[str, str]:
+    """Unified endpoint to save a policy. Handles full YAML or 'grounded fragments' (curations)."""
+    # 1. Sanitize Name
+    safe_name = "".join([c for c in request.name if c.isalnum() or c in ("-", "_")])
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid policy name")
+
+    final_yaml = request.policy_yaml
+
+    # 2. Handle Curation (Grounded Fragment)
+    if request.curations is not None:
+        if not request.base_yaml:
+            raise HTTPException(status_code=400, detail="curations require base_yaml")
+
+        try:
+            from topobathysim.policy.schema import FilterConfig
+
+            policy = load_policy_from_str(request.base_yaml)
+
+            for step_idx_str, source_names in request.curations.items():
+                step_idx = int(step_idx_str)
+                if step_idx < len(policy.variables[0].steps):
+                    step = policy.variables[0].steps[step_idx]
+                    if step.filter is None:
+                        step.filter = FilterConfig()
+                    if step.filter.exclude_patterns is None:
+                        step.filter.exclude_patterns = []
+
+                    for name in source_names:
+                        if name not in step.filter.exclude_patterns:
+                            step.filter.exclude_patterns.append(name)
+
+            final_yaml = yaml.dump(policy.model_dump(), sort_keys=False)
+        except Exception as e:
+            logger.error(f"Curation application failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to apply curation: {e}") from e
+
+    if not final_yaml:
+        raise HTTPException(status_code=400, detail="Provide either policy_yaml or base_yaml+curations")
+
+    # 3. Final Validation & Save
+    try:
+        load_policy_from_str(final_yaml)  # Ensure it's valid policy YAML
+        dest_path = policy_path.parent / f"{safe_name}.yaml"
+
+        with open(dest_path, "w") as f:
+            f.write(final_yaml)
+
+        logger.info(f"Updated policy saved to {dest_path}")
+        return {"status": "success", "name": safe_name, "path": str(dest_path)}
+    except Exception as e:
+        logger.error(f"Policy save failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Policy update failed: {e}") from e
 
 
 @app.get("/fuse")
@@ -2156,8 +2217,9 @@ async def analyze_coverage(
         results.append(
             {
                 "provider": step.provider,
+                "step_index": policy.variables[0].steps.index(step),
                 "items": items,
             }
         )
 
-    return {"providers": results}
+    return {"providers": results, "policy_yaml": yaml.dump(policy.model_dump(), sort_keys=False)}
