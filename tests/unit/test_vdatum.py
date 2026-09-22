@@ -1,8 +1,22 @@
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from topobathysim.vdatum import VDatumNoDataError, VDatumResolver
+
+
+@pytest.fixture(autouse=True)
+def isolated_vdatum_cache(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the L2 SQLite cache at an empty per-test file.
+
+    The resolver checks the on-disk cache before making the HTTP request these
+    tests mock. Without isolation, the first (valid) test writes (43.0, -70.0)
+    to the real cache and the error-path tests then hit that row instead of the
+    mock, so the expected exceptions are never raised. The row also persists on
+    disk across runs, which made the failure machine-dependent.
+    """
+    monkeypatch.setattr("topobathysim.vdatum.VDATUM_DB_PATH", tmp_path / "vdatum.sqlite")
 
 
 def test_vdatum_valid_response() -> None:

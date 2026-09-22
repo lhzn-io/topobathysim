@@ -51,6 +51,7 @@
 
 - **Start Server**: `python service/run_server.py`
 - **Lint/Format**: `pre-commit run --all-files` or `ruff check .`
+- **Tests**: `python -m pytest tests/unit` (offline, about 70 s) and `python -m pytest tests/integration` (live NOAA/USGS endpoints, 10 to 12 minutes; `test_wlis_fusion` also needs a built NOAA spatial index). `tests/conftest.py` puts `service/` on `sys.path`, so no `PYTHONPATH` export is needed. Use the `topobathysim` micromamba env.
 - **Clean Cache**: `rm -rf ~/.cache/topobathysim` (Useful when debugging bad downloads).
 
 ### 5. Git Operations

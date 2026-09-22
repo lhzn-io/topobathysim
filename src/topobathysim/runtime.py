@@ -917,11 +917,25 @@ def run(
         min_y = min(float(ds.y.min()) for ds in sorted_cells)
         max_y = max(float(ds.y.max()) for ds in sorted_cells)
 
-        # Assert resolution is not None for mypy
-        res = float(resolution) if resolution is not None else 1.0
+        # Derive the mosaic step from the cells' own pixel spacing rather than the
+        # `resolution` argument. Cells are emitted on a uniform grid in the policy
+        # CRS, so in production this equals `resolution`. But `resolution` is
+        # expressed in metres while the coordinates are in CRS units (degrees for
+        # a geographic CRS); using it directly as a coordinate step collapses the
+        # target grid to a handful of pixels. x and y are derived separately.
+        def _pixel_spacing(vals: np.ndarray) -> float | None:
+            d = np.abs(np.diff(np.asarray(vals, dtype=np.float64)))
+            d = d[d > 0]
+            return float(np.median(d)) if d.size else None
 
-        x_coords_arr = np.arange(min_x, max_x + res / 2.0, res)
-        y_coords_arr = np.arange(max_y, min_y - res / 2.0, -res)
+        fallback_res = float(resolution) if resolution is not None else 1.0
+        x_spacings = [s for s in (_pixel_spacing(ds.x.values) for ds in sorted_cells) if s]
+        y_spacings = [s for s in (_pixel_spacing(ds.y.values) for ds in sorted_cells) if s]
+        res_x = float(np.median(x_spacings)) if x_spacings else fallback_res
+        res_y = float(np.median(y_spacings)) if y_spacings else fallback_res
+
+        x_coords_arr = np.arange(min_x, max_x + res_x / 2.0, res_x)
+        y_coords_arr = np.arange(max_y, min_y - res_y / 2.0, -res_y)
 
         logger.info(
             f"Output grid dimensions: {len(y_coords_arr)}x{len(x_coords_arr)} "
@@ -939,8 +953,8 @@ def run(
             src_data = ds["source_elevation"].values if "source_elevation" in ds else None
 
             # Calculate precise insertion boundaries
-            x_start_idx = round((float(ds.x[0]) - min_x) / res)
-            y_start_idx = round((max_y - float(ds.y[0])) / res)
+            x_start_idx = round((float(ds.x[0]) - min_x) / res_x)
+            y_start_idx = round((max_y - float(ds.y[0])) / res_y)
 
             h, w = elev_data.shape
             x_end = min(x_start_idx + w, len(x_coords_arr))
@@ -1044,9 +1058,11 @@ def run(
         "mosaiced_from_cells": len(cells),
         "provenance_dict": global_provenance,
     }
-    # PROBE FINAL RESULT
+    # Final mosaic diagnostics. Guard the percentage: an empty merged grid
+    # (size 0) is a legitimate outcome for some cell sets and must not raise.
     m_elev = merged_ds["elevation"]
     m_nans = int(np.isnan(m_elev).sum())
     m_total = m_elev.size
-    logger.info(f"[PROBE] Final: Shape={m_elev.shape}, NaNs={m_nans}/{m_total} ({100.0*m_nans/m_total:.1f}%)")
+    nan_pct = (100.0 * m_nans / m_total) if m_total else 0.0
+    logger.info(f"Final mosaic: shape={m_elev.shape}, NaNs={m_nans}/{m_total} ({nan_pct:.1f}%)")
     return cast(xr.Dataset, merged_ds)

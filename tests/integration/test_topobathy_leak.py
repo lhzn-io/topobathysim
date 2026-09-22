@@ -40,7 +40,11 @@ def test_topobathy_index_cache_hit_prevents_network(
     2. Does NOT attempt to list S3 buckets.
     3. Does NOT attempt to download the index.
     """
-    caplog.set_level(logging.DEBUG)
+    # Scope to the package logger, not just root: importing the FastAPI app
+    # (service/topobathyserve/main.py) pins the "topobathysim" logger to INFO at
+    # import time, which drops the provider's DEBUG cache-hit records before
+    # they reach caplog when this test runs after test_api_caching.
+    caplog.set_level(logging.DEBUG, logger="topobathysim")
 
     project_id = "TEST_PROJECT_1234"
     folder_name = "test_folder_1234"
@@ -94,14 +98,14 @@ def test_topobathy_index_cache_hit_prevents_network(
 
     # 6. Verify Logs & Behavior
     # We expect:
-    # - "Loading cached index from ZIP"
+    # - the disk cache-hit record for this project
     # We DO NOT expect:
     # - "Fetching NOAA Coastal Lidar PDS Index" (prevented by _cls_projects injection)
     # - "S3 List Objects" or filesystem calls (prevented by ZIP check logic)
 
     log_text = caplog.text
 
-    assert "Loading cached index from ZIP" in log_text
+    assert f"Topobathy Tile Index Cache Hit (Disk): {project_id}" in log_text
     assert "Fetching NOAA Coastal Lidar PDS Index" not in log_text
 
     # Ensure no network calls were made (caplog is good, but we can also assert on specific mocked methods)
@@ -109,6 +113,20 @@ def test_topobathy_index_cache_hit_prevents_network(
     # the test inevitably fails or hangs or logs errors if credentials/network are real.
     # The absence of "Listing S3" logs is our key indicator if we added logging there,
     # but the provider currently uses fsspec.
+
+    # --- Second scenario: a real GPKG index, read by the real geopandas. ---
+    # Undo the read_file mock (it asserts the path is the zip) and remove the
+    # zip so the provider's glob finds only the GPKG; clear the log buffer so
+    # the assertions below reflect this scenario alone.
+    monkeypatch.undo()
+    zip_path.unlink()
+    caplog.clear()
+
+    # Use a distinct project id. The first scenario left TEST_PROJECT_1234 as the
+    # provider's active project with a loaded index, and set_active_project
+    # returns early for an already-active project, which would skip the disk
+    # lookup this scenario is meant to exercise.
+    gpkg_project_id = "TEST_PROJECT_GPKG_1234"
 
     # 1. Setup Cache Structure
     metadata_dir = temp_cache_dir / "metadata" / "tile_index"
@@ -119,23 +137,23 @@ def test_topobathy_index_cache_hit_prevents_network(
     geometry = [box(-74.0, 40.0, -73.0, 41.0)]
     df = gpd.GeoDataFrame({"filename": ["test_tile_1.laz"]}, geometry=geometry, crs="EPSG:4326")
 
-    index_path = metadata_dir / f"{project_id}.gpkg"
+    index_path = metadata_dir / f"{gpkg_project_id}.gpkg"
     df.to_file(index_path, driver="GPKG")
 
     # 3. Instantiate Provider
     provider = NoaaTopobathyProvider(cache_dir=str(temp_cache_dir))
 
     # Pre-seed the project list so it doesn't try to fetch index.html or fail validation
-    provider._projects = {project_id: "Test_Project_Folder"}
+    provider._projects = {gpkg_project_id: "Test_Project_Folder"}
 
     # 4. Trigger set_active_project
     # This should find the local gpkg and return early
-    provider.set_active_project(project_id)
+    provider.set_active_project(gpkg_project_id)
 
     # 5. Verify Behavior via Logs
 
     # Positive Assertions
-    assert f"Topobathy Tile Index Cache Hit (Disk): {project_id}" in caplog.text
+    assert f"Topobathy Tile Index Cache Hit (Disk): {gpkg_project_id}" in caplog.text
 
     # Negative Assertions (Proof of Fix)
     # The provider should NOT attempt S3 operations if cache is hit
@@ -145,7 +163,7 @@ def test_topobathy_index_cache_hit_prevents_network(
     # Verify the index was actually loaded
     assert provider._tile_index is not None
     assert len(provider._tile_index) == 1
-    assert provider._active_project_id == project_id
+    assert provider._active_project_id == gpkg_project_id
 
 
 @pytest.mark.integration
@@ -154,7 +172,9 @@ def test_topobathy_index_cache_hit_zip(temp_cache_dir: Path, caplog: Any) -> Non
     Verify that NoaaTopobathyProvider correctly handles .zip files in the cache.
     (This was the specific failure mode where geopandas.read_file() was needed)
     """
-    caplog.set_level(logging.DEBUG)
+    # See note in test_topobathy_index_cache_hit_prevents_network: scope to the
+    # package logger so an earlier app import cannot suppress DEBUG records.
+    caplog.set_level(logging.DEBUG, logger="topobathysim")
 
     project_id = "TEST_ZIP_PROJECT_5678"
 
