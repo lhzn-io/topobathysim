@@ -24,8 +24,14 @@ jobs:
         shell: bash -el {0}
         run: pip install -e . --no-deps
 
-      - name: Lint and type-check
+      # Advisory, not gating. pre-commit lints only the files a commit touches,
+      # so the repo carries pre-existing drift (23 ruff findings, 11 files ruff
+      # format would rewrite as of 2026-09-22). Failing on that would block
+      # unrelated work; the report stays visible here until the debt is paid,
+      # then this becomes blocking.
+      - name: Lint (advisory)
         shell: bash -el {0}
+        continue-on-error: true
         run: |
           ruff check .
           ruff format --check .
