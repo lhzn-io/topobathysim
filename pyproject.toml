@@ -82,7 +82,11 @@ cov = "pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=src/to
 [tool.pytest.ini_options]
 addopts = "-v -m 'not network'"
 testpaths = ["tests"]
-pythonpath = ["src"]
+# service/ carries the FastAPI app, whose modules import each other absolutely
+# (`from topobathyserve.models import ...`), matching WORKDIR=service in the
+# container and run_server.py. Tests import it as `service.topobathyserve.main`
+# from the repo root, so both roots must be importable.
+pythonpath = ["src", "service"]
 markers = [
     "integration: mark a test as an integration test",
     "network: mark a test as requiring heavy external network/API access",

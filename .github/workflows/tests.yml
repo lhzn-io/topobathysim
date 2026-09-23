@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    # The geospatial stack (pdal, gdal via rasterio/pyogrio) needs conda-forge
+    # binaries, so the environment comes from environment.yml rather than pip.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Install the package itself
+        shell: bash -el {0}
+        run: pip install -e . --no-deps
+
+      - name: Lint and type-check
+        shell: bash -el {0}
+        run: |
+          ruff check .
+          ruff format --check .
+
+      # Integration tests are excluded: they hit live NOAA, USGS and Planetary
+      # Computer endpoints, take 10 to 12 minutes, and depend on a prebuilt
+      # NOAA spatial index. Run them locally or via workflow_dispatch.
+      - name: Unit tests
+        shell: bash -el {0}
+        run: python -m pytest tests/unit -m "not integration" --durations=10

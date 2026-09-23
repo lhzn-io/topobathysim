@@ -59,7 +59,13 @@ debug_mode = int(os.environ.get("TOPOBATHYSIM_DEBUG", "0"))
 log_level = logging.DEBUG if debug_mode >= 1 else logging.INFO
 
 # We need to aggressively configure logging because Uvicorn may have already set up handlers
-# and basicConfig does nothing if handlers exist.
+# and basicConfig does nothing if handlers exist. This runs at import deliberately:
+# run_server.py sets TOPOBATHYSIM_DEBUG before uvicorn imports this module, and each
+# worker process imports it afresh, so there is no earlier hook to use.
+# Test implication: importing this module pins the "topobathysim" and "topobathyserve"
+# loggers to the level above for the rest of the process. Tests that assert on DEBUG
+# records must scope caplog to the package logger, for example
+# `caplog.set_level(logging.DEBUG, logger="topobathysim")`, rather than relying on root.
 root_logger = logging.getLogger()
 root_logger.setLevel(log_level)
 

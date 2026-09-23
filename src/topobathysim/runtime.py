@@ -11,6 +11,7 @@ import json
 import logging
 import multiprocessing
 import os
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -721,6 +722,28 @@ def hydrate(
     return stats
 
 
+def _collect_provenance(datasets: Iterable[xr.Dataset]) -> dict[int, dict[str, str]]:
+    """Merge the per-cell provenance maps into one id -> source-info mapping.
+
+    Zarr attributes cannot hold a dict, so cells written to cache carry the map
+    serialised as `provenance_dict_json`; freshly computed cells carry the dict
+    directly as `provenance_dict`. Accept either form.
+    """
+    merged: dict[int, dict[str, str]] = {}
+    for ds in datasets:
+        raw = ds.attrs.get("provenance_dict")
+        if raw is None and "provenance_dict_json" in ds.attrs:
+            try:
+                raw = json.loads(ds.attrs["provenance_dict_json"])
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Could not parse cached provenance: {e}")
+                continue
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                merged[int(k)] = v
+    return merged
+
+
 def run(
     policy_input: str | Path,
     bbox: tuple[float, float, float, float],
@@ -761,8 +784,12 @@ def run(
         )
         if use_cache and cache_path.exists():
             logger.info(f"Fast Path Cache Hit: {cache_path.name}")
-            ds = xr.open_dataset(cache_path, engine="zarr", decode_coords="all")
-            return cast(xr.Dataset, ds.load())
+            ds = cast(xr.Dataset, xr.open_dataset(cache_path, engine="zarr", decode_coords="all").load())
+            # Restore `provenance_dict` from its serialised form so a cache hit
+            # exposes the same attributes as a freshly computed result.
+            if "provenance_dict" not in ds.attrs:
+                ds.attrs["provenance_dict"] = _collect_provenance([ds])
+            return ds
 
     start_lon, start_lat, end_lon, end_lat = bbox
 
@@ -899,6 +926,10 @@ def run(
         # No need to unify chunks since we bypassed Dask combination entirely!
         ds_cell = ds_cell.assign_coords(x=np.round(ds_cell.x.values, 6), y=np.round(ds_cell.y.values, 6))
         cell_datasets.append(ds_cell)
+
+    # Collect provenance up front: the mosaic branch below clears
+    # `cell_datasets` to free memory, so this cannot be deferred to the end.
+    global_provenance = _collect_provenance(cell_datasets)
 
     # Mosaic the cells together
     if len(cell_datasets) == 1:
@@ -1040,17 +1071,8 @@ def run(
     else:
         merged_ds = merged_ds.sel(y=slice(req_min_y - epsilon, req_max_y + epsilon))
 
-    # Add combined attributes
-    global_provenance: dict[int, dict[str, str]] = {}
-    for cell_ds in cell_datasets:
-        if "provenance_dict" in cell_ds.attrs:
-            for k, v in cell_ds.attrs["provenance_dict"].items():
-                global_provenance[int(k)] = v
-        elif "provenance_dict_json" in cell_ds.attrs:
-            loaded_dict = json.loads(cell_ds.attrs["provenance_dict_json"])
-            for k, v in loaded_dict.items():
-                global_provenance[int(k)] = v
-
+    # Add combined attributes (provenance was collected before the mosaic freed
+    # the cell list).
     merged_ds.attrs = {
         "policy_hash": hash_policy(policy.model_dump()),  # type: ignore
         "policy_legend": str(legend),
