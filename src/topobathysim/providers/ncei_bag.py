@@ -1284,7 +1284,7 @@ class BAGProvider(Provider):
                             del p_src_aligned
                         except Exception as e_src:
                             logger.warning(
-                                f"Source ID merge failed for {filename} " f"(elevation merged OK): {e_src}"
+                                f"Source ID merge failed for {filename} (elevation merged OK): {e_src}"
                             )
                         del fill_mask
                     except Exception as e:

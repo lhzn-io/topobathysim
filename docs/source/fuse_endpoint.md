@@ -156,21 +156,26 @@ import requests, yaml
 policy = {
     "name": "Simple GEBCO+CUDEM",
     "crs": "EPSG:4326",
-    "variables": [{
-        "name": "elevation",
-        "steps": [
-            {"provider": "gebco_2025", "operator": "overwrite"},
-            {"provider": "ncei_cudem", "operator": "overwrite"},
-        ]
-    }]
+    "variables": [
+        {
+            "name": "elevation",
+            "steps": [
+                {"provider": "gebco_2025", "operator": "overwrite"},
+                {"provider": "ncei_cudem", "operator": "overwrite"},
+            ],
+        }
+    ],
 }
 
-resp = requests.post("http://localhost:9595/fuse", json={
-    "bbox": [-73.85, 40.78, -73.72, 40.82],
-    "resolution": 30,
-    "format": "zarr",
-    "policy_yaml": yaml.dump(policy),
-})
+resp = requests.post(
+    "http://localhost:9595/fuse",
+    json={
+        "bbox": [-73.85, 40.78, -73.72, 40.82],
+        "resolution": 30,
+        "format": "zarr",
+        "policy_yaml": yaml.dump(policy),
+    },
+)
 ```
 
 ### Cache behavior

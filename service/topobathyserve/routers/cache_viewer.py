@@ -62,7 +62,7 @@ async def purge_cache(request: PurgeRequest) -> PurgeResult:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                "Destructive operations are disabled on this server. " "Set CACHE_UI_ENABLE_DESTRUCTIVE=true."
+                "Destructive operations are disabled on this server. Set CACHE_UI_ENABLE_DESTRUCTIVE=true."
             ),
         )
 

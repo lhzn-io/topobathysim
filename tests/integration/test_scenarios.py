@@ -112,9 +112,9 @@ def test_real_world_tile_scenarios(
         found = any(sub in sources_text for sub in expected_source_substr)
         assert found, f"Expected one of {expected_source_substr} in sources, got: {sources_text}"
     else:
-        assert (
-            expected_source_substr.upper() in sources_text
-        ), f"Expected {expected_source_substr} in sources, got: {sources_text}"
+        assert expected_source_substr.upper() in sources_text, (
+            f"Expected {expected_source_substr} in sources, got: {sources_text}"
+        )
 
     # Data content validation
     valid_data = da.values[~np.isnan(da.values)]

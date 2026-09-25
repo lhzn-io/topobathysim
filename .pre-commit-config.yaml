@@ -9,10 +9,13 @@ repos:
         args: ["--maxkb=500000"]
       - id: check-toml
 
+  # Pinned deliberately. This rev is the authoritative linter version for the
+  # repo; CI runs these same hooks so there is one standard everywhere. Bump it
+  # as its own reviewed change, never implicitly.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.4
+    rev: v0.16.9
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 

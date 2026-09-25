@@ -19,10 +19,10 @@ import xarray as xr
 from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 
+from ..config import get_cache_root
 from ..quality import QualityClass
 from ..runtime import should_consolidate
 from ..vdatum import VDatumResolver
-from ..config import get_cache_root
 from .base import Provider, ProviderNoDataError, sanitize_elevation_nodata
 from .registry import registry
 

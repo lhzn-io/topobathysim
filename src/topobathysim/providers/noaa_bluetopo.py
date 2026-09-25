@@ -228,7 +228,7 @@ class NoaaBlueTopoProvider(Provider):
                 # Check CRS match
                 if ds.rio.crs != ref_crs:
                     logger.warning(
-                        f"{label} Tile {i} CRS mismatch: " f"{ds.rio.crs} != {ref_crs}. Will reproject."
+                        f"{label} Tile {i} CRS mismatch: {ds.rio.crs} != {ref_crs}. Will reproject."
                     )
                     return False
 
@@ -236,7 +236,7 @@ class NoaaBlueTopoProvider(Provider):
                 ds_transform = ds.rio.transform()
                 if ds_transform != ref_transform:
                     logger.warning(
-                        f"{label} Tile {i} geotransform mismatch: " f"{ds_transform} != {ref_transform}"
+                        f"{label} Tile {i} geotransform mismatch: {ds_transform} != {ref_transform}"
                     )
                     # Small pixel-size differences OK, but warn on major differences
                     if (
@@ -1421,7 +1421,7 @@ class NoaaBlueTopoProvider(Provider):
                     )
                     if not is_valid:
                         logger.error(
-                            "Post-Zarr validation failed: %s. " "Invalidating cache and using memory copy.",
+                            "Post-Zarr validation failed: %s. Invalidating cache and using memory copy.",
                             msg,
                         )
                         with contextlib.suppress(Exception):

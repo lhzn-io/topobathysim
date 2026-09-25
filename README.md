@@ -130,6 +130,7 @@ Write a GeoTIFF (elevation only):
 
 ```python
 import rioxarray  # noqa: F401  (ensures .rio accessor)
+
 ds["elevation"].rio.to_raster("fused_elevation.tif")
 ```
 

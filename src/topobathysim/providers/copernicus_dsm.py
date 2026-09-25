@@ -157,8 +157,7 @@ class CopernicusDsmProvider(Provider):
                 for attempt in range(max_retries + 1):
                     try:
                         logger.debug(
-                            f"Usgs3DepProvider querying {collection_id} "
-                            f"for {bbox} (Attempt {attempt + 1})"
+                            f"Usgs3DepProvider querying {collection_id} for {bbox} (Attempt {attempt + 1})"
                         )
 
                         catalog = Client.open(stac_url, modifier=planetary_computer.sign_inplace)

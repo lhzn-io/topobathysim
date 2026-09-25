@@ -172,8 +172,7 @@ class Usgs3DepProvider(Provider):
                 for attempt in range(max_retries + 1):
                     try:
                         logger.debug(
-                            f"Usgs3DepProvider querying {collection_id} "
-                            f"for {bbox} (Attempt {attempt + 1})"
+                            f"Usgs3DepProvider querying {collection_id} for {bbox} (Attempt {attempt + 1})"
                         )
 
                         search = self._catalog.search(collections=[collection_id], bbox=bbox, limit=10)

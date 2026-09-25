@@ -63,9 +63,9 @@ def test_fetch_tile_uses_explicit_project_id_not_active_project_id(
 
     assert captured_urls, "open_rasterio was never called"
     assert "10274" in captured_urls[0], f"URL should reference project 10274, got: {captured_urls[0]}"
-    assert (
-        "IMPOSTOR" not in captured_urls[0]
-    ), f"URL must not reference IMPOSTOR project, got: {captured_urls[0]}"
+    assert "IMPOSTOR" not in captured_urls[0], (
+        f"URL must not reference IMPOSTOR project, got: {captured_urls[0]}"
+    )
 
 
 def test_fetch_layer_passes_project_id_to_fetch_tile(topobathy_provider: Any) -> None:
@@ -106,9 +106,9 @@ def test_fetch_layer_passes_project_id_to_fetch_tile(topobathy_provider: Any) ->
 
     assert tile_fetch_kwargs, "fetch_tile was never called"
     for call_kw in tile_fetch_kwargs:
-        assert (
-            call_kw.get("project_id") == "10274"
-        ), f"Expected project_id=10274 in fetch_tile kwargs, got: {call_kw}"
+        assert call_kw.get("project_id") == "10274", (
+            f"Expected project_id=10274 in fetch_tile kwargs, got: {call_kw}"
+        )
 
 
 def test_concurrent_fetch_tile_calls_use_correct_project_ids(
@@ -203,9 +203,9 @@ def test_bluetopo_scheme_loaded_only_once_concurrently(tmp_path: Path) -> None:
         for f in futs:
             f.result()
 
-    assert (
-        read_count[0] == 1
-    ), f"gpd.read_file should be called exactly once, was called {read_count[0]} times"
+    assert read_count[0] == 1, (
+        f"gpd.read_file should be called exactly once, was called {read_count[0]} times"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +265,9 @@ def test_gebco_locks_lock_is_never_none(tmp_path: Path) -> None:
     from topobathysim.providers.gebco_2025 import GEBCO2025Provider
 
     lock_type = type(threading.Lock())
-    assert isinstance(
-        GEBCO2025Provider._locks_lock, lock_type
-    ), "_locks_lock must be an eagerly initialized threading.Lock, not None or a lazy init"
+    assert isinstance(GEBCO2025Provider._locks_lock, lock_type), (
+        "_locks_lock must be an eagerly initialized threading.Lock, not None or a lazy init"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +313,9 @@ def test_ncei_bag_fetch_layer_processes_finest_resolution_first(tmp_path: Path) 
 
     assert fetch_order, "fetch_bag was never called"
     first_url = fetch_order[0]
-    assert (
-        "50cm" in first_url or "H13386" in first_url
-    ), f"finest-resolution H-survey (50cm) must be fetched first, got: {first_url}"
+    assert "50cm" in first_url or "H13386" in first_url, (
+        f"finest-resolution H-survey (50cm) must be fetched first, got: {first_url}"
+    )
     assert "4m" not in first_url, f"coarse W-survey (4m) must NOT be fetched first, got: {first_url}"
 
 
@@ -362,5 +362,5 @@ def test_memoize_lru_eviction_does_not_close_evicted_resources() -> None:
     # All resources — including evicted ones — must still be open
     for i, r in enumerate(resources):
         assert r.closed is False, (
-            f"Resource {i} (val={r.val}) was closed on eviction — " "eviction must not call .close()"
+            f"Resource {i} (val={r.val}) was closed on eviction — eviction must not call .close()"
         )

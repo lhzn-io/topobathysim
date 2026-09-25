@@ -45,9 +45,7 @@ def _discover_3dep_surveys(bbox: tuple[float, float, float, float]) -> list[dict
     cache_path = get_cache_root() / "usgs_lidar" / "stac_discovery_cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    bbox_key = (
-        f"surveys_v2_{round(bbox[0], 6)}_{round(bbox[1], 6)}" f"_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
-    )
+    bbox_key = f"surveys_v2_{round(bbox[0], 6)}_{round(bbox[1], 6)}_{round(bbox[2], 6)}_{round(bbox[3], 6)}"
 
     from filelock import FileLock
 

@@ -111,7 +111,18 @@ select = [
     "SIM", # flake8-simplify
     "RUF", # ruff-specific rules
 ]
-ignore = []
+ignore = [
+    # RUF046 (unnecessary-cast-to-int) fires 20 times on int(round(...)) in
+    # service/topobathyserve/routers/dem_viewer.py. Those casts are deliberate:
+    # the operands are numpy scalars, whose __round__ returns a numpy type
+    # rather than a Python int, so dropping the cast silently changes the type
+    # flowing into slice indices and mosaic extent arithmetic. Ruff classifies
+    # every one of these fixes as unsafe and its own documentation lists
+    # round() over such values as a known false positive. The rounding is also
+    # load-bearing: it is what makes adjacent cells share exactly one boundary
+    # pixel instead of leaving a one-column NaN seam.
+    "RUF046",
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["topobathysim"]

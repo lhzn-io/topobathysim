@@ -24,17 +24,13 @@ jobs:
         shell: bash -el {0}
         run: pip install -e . --no-deps
 
-      # Advisory, not gating. pre-commit lints only the files a commit touches,
-      # so the repo carries pre-existing drift (23 ruff findings, 11 files ruff
-      # format would rewrite as of 2026-09-22). Failing on that would block
-      # unrelated work; the report stays visible here until the debt is paid,
-      # then this becomes blocking.
-      - name: Lint (advisory)
+      # Gating. Runs the pinned hooks from .pre-commit-config.yaml rather than
+      # whatever ruff happens to be on PATH, so CI and a local commit apply the
+      # same version and the same rule selection. Grading against ambient-latest
+      # is what made the first run of this workflow fail on untouched code.
+      - name: Lint
         shell: bash -el {0}
-        continue-on-error: true
-        run: |
-          ruff check .
-          ruff format --check .
+        run: pre-commit run --all-files --show-diff-on-failure
 
       # Integration tests are excluded: they hit live NOAA, USGS and Planetary
       # Computer endpoints, take 10 to 12 minutes, and depend on a prebuilt

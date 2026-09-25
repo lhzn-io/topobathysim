@@ -595,7 +595,7 @@ def hydrate(
 
         policy_display_name = getattr(policy, "name", "Unnamed") or "Unnamed"
         logger.info(
-            f"Hydrating cell {i}/{len(cells)} [{policy_display_name}]: " f"{cell_bbox} -> {cache_path.name}"
+            f"Hydrating cell {i}/{len(cells)} [{policy_display_name}]: {cell_bbox} -> {cache_path.name}"
         )
 
         # Process and Cache
